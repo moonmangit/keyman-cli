@@ -71,3 +71,7 @@ printf '.env\n' >> ~/.config/git/ignore
 ```
 
 Existing tracked `.env` files must be removed from Git separately.
+
+## Releases
+
+Update the version in `Cargo.toml` and `npm/package.json` together, commit and push, then push a `vX.Y.Z` tag. The [release workflow](.github/workflows/release.yml) tests the Rust CLI, builds binaries for five targets, smoke tests the npm package on Linux and Windows, creates a GitHub release, and publishes the npm package through a configured npm trusted publisher. The package's version must match the tag.

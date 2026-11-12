@@ -68,6 +68,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            package_version="$(node -p "require('./npm/package.json').version")"
+            test "v$package_version" = "$GITHUB_REF_NAME"
+          fi
           test -f npm/bin/native/x86_64-unknown-linux-gnu/keyman
           test -f npm/bin/native/aarch64-unknown-linux-gnu/keyman
           test -f npm/bin/native/x86_64-pc-windows-msvc/keyman.exe
