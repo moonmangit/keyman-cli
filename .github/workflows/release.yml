@@ -13,7 +13,7 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup update stable
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --check
@@ -38,16 +38,16 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             extension: ''
-          - os: macos-15
+          - os: macos-15-intel
             target: aarch64-apple-darwin
             extension: ''
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup update stable
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --locked --release --target ${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.target }}
           path: target/${{ matrix.target }}/release/keyman${{ matrix.extension }}
@@ -57,11 +57,11 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: npm/bin/native
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
       - name: Verify and package npm release
@@ -82,7 +82,7 @@ jobs:
           HOME="$RUNNER_TEMP/keyman-home" "$RUNNER_TEMP/keyman-install/node_modules/.bin/keyman" load "$RUNNER_TEMP/keyman-master.yml"
           HOME="$RUNNER_TEMP/keyman-home" "$RUNNER_TEMP/keyman-install/node_modules/.bin/keyman" inject smoke "$RUNNER_TEMP/keyman-project"
           grep -Fx 'KEY="ok"' "$RUNNER_TEMP/keyman-project/.env"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: npm-package
           path: dist/*.tgz
@@ -95,11 +95,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: npm-package
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: '*-*-*'
           path: dist/native
@@ -133,11 +133,11 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: npm-package
           path: dist
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
