@@ -1,0 +1,26 @@
+{
+  "name": "keyman-cli",
+  "version": "0.1.0",
+  "description": "Manage project .env files from one private YAML file",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moonmangit/keyman-cli.git"
+  },
+  "homepage": "https://github.com/moonmangit/keyman-cli#readme",
+  "bugs": "https://github.com/moonmangit/keyman-cli/issues",
+  "bin": {
+    "keyman": "bin/keyman.cjs"
+  },
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

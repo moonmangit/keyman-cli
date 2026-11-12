@@ -1,0 +1,153 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            extension: ''
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            extension: ''
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            extension: '.exe'
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            extension: ''
+          - os: macos-15
+            target: aarch64-apple-darwin
+            extension: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/keyman${{ matrix.extension }}
+          if-no-files-found: error
+
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: npm/bin/native
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify and package npm release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f npm/bin/native/x86_64-unknown-linux-gnu/keyman
+          test -f npm/bin/native/aarch64-unknown-linux-gnu/keyman
+          test -f npm/bin/native/x86_64-pc-windows-msvc/keyman.exe
+          test -f npm/bin/native/x86_64-apple-darwin/keyman
+          test -f npm/bin/native/aarch64-apple-darwin/keyman
+          chmod +x npm/bin/native/*/keyman
+          mkdir -p dist
+          npm pack ./npm --pack-destination dist
+          mkdir -p "$RUNNER_TEMP/keyman-home" "$RUNNER_TEMP/keyman-project"
+          npm install --prefix "$RUNNER_TEMP/keyman-install" dist/*.tgz
+          printf 'smoke:\n  KEY: "ok"\n' > "$RUNNER_TEMP/keyman-master.yml"
+          HOME="$RUNNER_TEMP/keyman-home" "$RUNNER_TEMP/keyman-install/node_modules/.bin/keyman" load "$RUNNER_TEMP/keyman-master.yml"
+          HOME="$RUNNER_TEMP/keyman-home" "$RUNNER_TEMP/keyman-install/node_modules/.bin/keyman" inject smoke "$RUNNER_TEMP/keyman-project"
+          grep -Fx 'KEY="ok"' "$RUNNER_TEMP/keyman-project/.env"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: dist/*.tgz
+          if-no-files-found: error
+
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-*-*'
+          path: dist/native
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/assets
+          for binary_dir in dist/native/*; do
+            target="${binary_dir##*/}"
+            if test -f "$binary_dir/keyman.exe"; then
+              cp "$binary_dir/keyman.exe" "dist/assets/keyman-$target.exe"
+            else
+              cp "$binary_dir/keyman" "dist/assets/keyman-$target"
+            fi
+          done
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tgz dist/assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.tgz dist/assets/* --generate-notes
+          fi
+
+  npm-publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package, github-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - name: Publish with npm trusted publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if npm view "keyman-cli@$version" version >/dev/null 2>&1; then
+            echo "keyman-cli@$version is already published"
+          else
+            npm publish dist/*.tgz --access public
+          fi

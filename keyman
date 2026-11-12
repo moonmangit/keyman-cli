@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf 'Usage:\n  ./keyman load <file_path>\n  ./keyman inject <project_name> <target_directory>\n' >&2
+  exit 1
+}
+
+if ! command -v wsl.exe >/dev/null 2>&1; then
+  printf 'Error: WSL is required for this Git Bash launcher.\n' >&2
+  exit 1
+fi
+
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+linux_binary="$repo_dir/target/release/keyman"
+if [[ ! -f "$linux_binary" ]]; then
+  printf 'Error: Rust binary is missing. Build it in Ubuntu WSL with cargo build --release.\n' >&2
+  exit 1
+fi
+
+to_wsl_path() {
+  local windows_path
+  windows_path="$(cygpath -m -- "$1")"
+  MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- wslpath -u "$windows_path" | tr -d '\r'
+}
+
+wsl_binary="$(to_wsl_path "$linux_binary")"
+wsl_home="$(to_wsl_path "$HOME")"
+
+case "${1-}" in
+  load)
+    [[ $# -eq 2 ]] || usage
+    wsl_file="$(to_wsl_path "$2")"
+    MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- env "HOME=$wsl_home" "$wsl_binary" load "$wsl_file"
+    ;;
+  inject)
+    [[ $# -eq 3 ]] || usage
+    wsl_target="$(to_wsl_path "$3")"
+    MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- env "HOME=$wsl_home" "$wsl_binary" inject "$2" "$wsl_target"
+    ;;
+  *) usage ;;
+esac

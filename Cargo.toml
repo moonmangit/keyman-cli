@@ -1,0 +1,13 @@
+[package]
+name = "keyman-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Load project environment variables from a master YAML file"
+license = "MIT"
+
+[[bin]]
+name = "keyman"
+path = "src/main.rs"
+
+[dependencies]
+yaml-rust2 = "=0.13.0"

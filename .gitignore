@@ -1,0 +1,6 @@
+/target/
+.env
+/npm/bin/native/
+/npm/dist/
+*.tgz
+.npmrc
