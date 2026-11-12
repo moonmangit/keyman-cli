@@ -1,6 +1,6 @@
 {
   "name": "keyman-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Manage project .env files from one private YAML file",
   "license": "MIT",
   "repository": {
@@ -10,7 +10,8 @@
   "homepage": "https://github.com/moonmangit/keyman-cli#readme",
   "bugs": "https://github.com/moonmangit/keyman-cli/issues",
   "bin": {
-    "keyman": "bin/keyman.cjs"
+    "keyman": "bin/keyman.cjs",
+    "keyman-cli": "bin/keyman.cjs"
   },
   "files": [
     "bin/",

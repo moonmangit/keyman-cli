@@ -8,8 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use yaml_rust2::{Yaml, YamlLoader};
 
 fn main() {
+    const USAGE: &str =
+        "Usage:\n  keyman load <file_path>\n  keyman inject <project_name> <target_directory>";
     let args: Vec<_> = env::args_os().collect();
     let result = match args.get(1).and_then(|arg| arg.to_str()) {
+        Some("--help" | "-h" | "help") if args.len() == 2 => Ok(USAGE.to_owned()),
+        Some("--version" | "-V") if args.len() == 2 => {
+            Ok(format!("keyman {}", env!("CARGO_PKG_VERSION")))
+        }
         Some("load") if args.len() == 3 => {
             let home = home_dir();
             home.and_then(|home| load(Path::new(&args[2]), &home))
@@ -20,10 +26,7 @@ fn main() {
             home.and_then(|home| inject(&args[2].to_string_lossy(), Path::new(&args[3]), &home))
                 .map(|path| format!("Created {}", path.display()))
         }
-        _ => Err(
-            "Usage:\n  keyman load <file_path>\n  keyman inject <project_name> <target_directory>"
-                .to_owned(),
-        ),
+        _ => Err(USAGE.to_owned()),
     };
 
     match result {

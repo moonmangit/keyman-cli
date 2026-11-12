@@ -8,7 +8,7 @@ Keyman reads project variables from one master `.yml` file and writes a `.env` f
 npm install -g keyman-cli
 ```
 
-The npm package includes binaries for Windows x64, macOS Intel and Apple Silicon, and Linux x64 and ARM64. It does not require Rust or WSL. The `keyman` command is then available in any terminal.
+The npm package includes binaries for Windows x64, macOS Intel and Apple Silicon, and Linux x64 and ARM64. It does not require Rust. On Windows systems that block the native executable, it can fall back to WSL if installed. The command is available as `keyman` or `keyman-cli`.
 
 ## Build
 

@@ -23,4 +23,4 @@ keyman inject my-app /path/to/existing/project
 
 `load` remembers the master file path. `inject` replaces the project's `.env` file. Keep the master file private and ignore `.env` in Git.
 
-Prebuilt binaries are included for Windows x64, macOS Intel and Apple Silicon, and Linux x64 and ARM64. No Rust installation is needed. [Source and full documentation](https://github.com/moonmangit/keyman-cli).
+Prebuilt binaries are included for Windows x64, macOS Intel and Apple Silicon, and Linux x64 and ARM64. No Rust installation is needed. On Windows systems that block the native executable, the command can use WSL if it is installed. The executable is available as both `keyman` and `keyman-cli`. [Source and full documentation](https://github.com/moonmangit/keyman-cli).
