@@ -53,9 +53,9 @@ function runWithWsl(args) {
   }
 
   const linuxArgs = [...args];
-  if (linuxArgs[0] === 'load' && linuxArgs.length === 2) {
+  if (['load', 'init'].includes(linuxArgs[0]) && linuxArgs.length === 2 && !linuxArgs[1].startsWith('-')) {
     linuxArgs[1] = toWslPath(linuxArgs[1]);
-  } else if (linuxArgs[0] === 'inject' && linuxArgs.length === 3) {
+  } else if (['inject', 'save', 'diff'].includes(linuxArgs[0]) && linuxArgs.length === 3 && !linuxArgs[2].startsWith('-')) {
     linuxArgs[2] = toWslPath(linuxArgs[2]);
   }
 

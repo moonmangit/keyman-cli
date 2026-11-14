@@ -2,7 +2,8 @@
 set -euo pipefail
 
 usage() {
-  printf 'Usage:\n  ./keyman load <file_path>\n  ./keyman inject <project_name> <target_directory>\n' >&2
+  printf 'Usage: ./keyman <command> [arguments]. Run ./keyman --help for commands.
+' >&2
   exit 1
 }
 
@@ -27,16 +28,16 @@ to_wsl_path() {
 wsl_binary="$(to_wsl_path "$linux_binary")"
 wsl_home="$(to_wsl_path "$HOME")"
 
-case "${1-}" in
-  load)
-    [[ $# -eq 2 ]] || usage
-    wsl_file="$(to_wsl_path "$2")"
-    MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- env "HOME=$wsl_home" "$wsl_binary" load "$wsl_file"
+[[ $# -ge 1 ]] || usage
+args=("$@")
+# Translate the path arguments; other commands pass through unchanged and
+# run in the current directory, which WSL maps automatically.
+case "$1" in
+  load|init)
+    [[ $# -eq 2 && "$2" != -* ]] && args[1]="$(to_wsl_path "$2")"
     ;;
-  inject)
-    [[ $# -eq 3 ]] || usage
-    wsl_target="$(to_wsl_path "$3")"
-    MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- env "HOME=$wsl_home" "$wsl_binary" inject "$2" "$wsl_target"
+  inject|save|diff)
+    [[ $# -eq 3 && "$3" != -* ]] && args[2]="$(to_wsl_path "$3")"
     ;;
-  *) usage ;;
 esac
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- env "HOME=$wsl_home" "$wsl_binary" "${args[@]}"
