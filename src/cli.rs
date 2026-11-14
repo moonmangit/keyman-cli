@@ -2,13 +2,15 @@
 
 use std::ffi::OsString;
 
-use crate::ui::{accent, bold, did_you_mean, dim, heading, highlight, Stream};
+use crate::ui::{self, accent, bold, did_you_mean, dim, heading, highlight, Stream};
 
 #[derive(Debug)]
 pub struct Spec {
     pub name: &'static str,
     group: &'static str,
     pub args: &'static str,
+    /// Positional arguments: `<name>` is required, `[name]` is optional.
+    arguments: &'static [(&'static str, &'static str)],
     pub summary: &'static str,
     pub details: &'static str,
     pub flags: &'static [(&'static str, &'static str)],
@@ -21,6 +23,8 @@ pub const SHELLS: &[&str] = &["bash", "zsh", "fish", "powershell"];
 /// Commands that take a project name as their first argument.
 pub const PROJECT_COMMANDS: &[&str] = &["show", "inject", "save", "diff", "export", "run"];
 
+const PROJECT: &str = "Project name in the master file. Default: the current folder name";
+
 const GROUPS: &[&str] = &["Set up", "Projects", "In a project folder", "More"];
 
 pub const COMMANDS: &[Spec] = &[
@@ -28,6 +32,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "init",
         group: "Set up",
         args: "[file]",
+        arguments: &[("[file]", "Where to create the master file. Default: ~/.keyman.yml")],
         summary: "Create a starter master file and load it",
         details: "Creates FILE (default: ~/.keyman.yml) with an example project, then loads it.\nOn Unix the file gets 600 permissions. Keyman never overwrites an existing file.",
         flags: &[],
@@ -38,6 +43,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "load",
         group: "Set up",
         args: "<file>",
+        arguments: &[("<file>", "Your existing master file, ending in .yml or .yaml")],
         summary: "Use an existing master file",
         details: "Checks that FILE is valid, then records its absolute path in ~/.keyman_config.\nThe file must end in .yml or .yaml. On Unix its permissions are set to 600.",
         flags: &[],
@@ -48,6 +54,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "edit",
         group: "Set up",
         args: "",
+        arguments: &[],
         summary: "Open the master file in your editor",
         details: "Opens the master file in $VISUAL, $EDITOR, or the system default\n(Notepad on Windows, vi elsewhere), then checks it when the editor closes.\nFor editors that return at once, use the wait option, for example: EDITOR=\"code --wait\"",
         flags: &[],
@@ -58,6 +65,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "status",
         group: "Projects",
         args: "",
+        arguments: &[],
         summary: "Show the master file and check every project",
         details: "Shows the master file, then each project with its variable count or the\nproblem that stops it from loading. The project for the current folder is marked.",
         flags: &[],
@@ -68,6 +76,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "list",
         group: "Projects",
         args: "",
+        arguments: &[],
         summary: "List project names, one per line",
         details: "Prints only the project names, so the output works in scripts.",
         flags: &[],
@@ -78,6 +87,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "show",
         group: "Projects",
         args: "[project] [--reveal]",
+        arguments: &[("[project]", PROJECT)],
         summary: "Show a project's variables, with values masked",
         details: "Shows each variable name. Values stay masked unless you add --reveal.",
         flags: &[("--reveal", "Show the real values")],
@@ -88,6 +98,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "inject",
         group: "In a project folder",
         args: "[project] [directory]",
+        arguments: &[("[project]", PROJECT), ("[directory]", "Folder to write .env into. Default: the current directory")],
         summary: "Write a project's variables to .env",
         details: "Writes DIRECTORY/.env (default: the current directory). An existing .env is\nreplaced. On Unix the file gets 600 permissions. Keyman warns you when the\ndirectory is in a Git repository that does not ignore .env.",
         flags: &[],
@@ -98,6 +109,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "save",
         group: "In a project folder",
         args: "[project] [directory] [--dry-run] [--replace] [--new]",
+        arguments: &[("[project]", PROJECT), ("[directory]", "Folder whose .env is saved. Default: the current directory")],
         summary: "Save a folder's .env back into the master file",
         details: "Reads DIRECTORY/.env (default: the current directory) and updates the project\nin the master file: new variables are added and changed values are updated.\nVariables that are only in the master file are kept unless you add --replace.\nA project that does not exist yet is created.\n\nKeyman edits only the project's own lines, so comments and the rest of the\nfile stay as they are. It checks the result before writing, and stops if any\nother project would change.",
         flags: &[
@@ -112,6 +124,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "diff",
         group: "In a project folder",
         args: "[project] [directory] [--reveal]",
+        arguments: &[("[project]", PROJECT), ("[directory]", "Folder whose .env is compared. Default: the current directory")],
         summary: "Compare a folder's .env with the master file",
         details: "Shows how DIRECTORY/.env (default: the current directory) differs from the\nproject in the master file, like git diff: red - lines are the master file,\ngreen + lines are .env, and dim lines are the same in both.\nValues stay masked unless you add --reveal.\n\nThen run 'keyman save' to copy .env into the master file, or\n'keyman inject' to overwrite .env from the master file.",
         flags: &[("--reveal", "Show the real values")],
@@ -122,6 +135,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "export",
         group: "In a project folder",
         args: "[project]",
+        arguments: &[("[project]", PROJECT)],
         summary: "Print export lines for your shell",
         details: "Prints export NAME=\"value\" lines for bash, zsh, and other POSIX shells.\nTo load them into the current shell:\n\n  eval \"$(keyman export my-app)\"",
         flags: &[],
@@ -132,6 +146,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "run",
         group: "In a project folder",
         args: "[project] [--] <command>...",
+        arguments: &[("[project]", PROJECT), ("<command>...", "The command to run, with its own arguments")],
         summary: "Run a command with a project's variables",
         details: "Runs COMMAND with the project's variables in its environment. No .env file is\nwritten. Keyman exits with the command's exit code. Put -- before the command\nwhen you omit the project or when the command starts with a dash.\n\n  keyman run my-app -- npm start\n  keyman run -- python manage.py runserver\n\nOn Windows, run .cmd and .bat scripts through cmd /c:\n\n  keyman run my-app -- cmd /c npm start",
         flags: &[],
@@ -142,6 +157,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "completions",
         group: "More",
         args: "<shell>",
+        arguments: &[("<shell>", "One of: bash, zsh, fish, powershell")],
         summary: "Print a shell completion script",
         details: "Completes commands, options, and project names. Add one line to your shell\nstartup file:\n\n  bash        eval \"$(keyman completions bash)\"\n  zsh         source <(keyman completions zsh)\n  fish        keyman completions fish | source\n  powershell  keyman completions powershell | Out-String | Invoke-Expression",
         flags: &[],
@@ -152,6 +168,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "help",
         group: "More",
         args: "[command]",
+        arguments: &[("[command]", "The command to explain. Default: list every command")],
         summary: "Show help for Keyman or for one command",
         details: "",
         flags: &[],
@@ -180,11 +197,38 @@ fn title() -> String {
     )
 }
 
+/// `<required>` arguments are bold, `[optional]` ones are dim.
+fn paint_argument(name: &str) -> String {
+    if name.starts_with('<') {
+        bold(name)
+    } else {
+        dim(name)
+    }
+}
+
+/// The command name followed by its positional arguments, plus its width
+/// without color codes.
+fn signature(spec: &Spec) -> (String, usize) {
+    let mut plain = spec.name.to_owned();
+    let mut painted = accent(spec.name);
+    for (name, _) in spec.arguments {
+        plain.push(' ');
+        plain.push_str(name);
+        painted.push(' ');
+        painted.push_str(&paint_argument(name));
+    }
+    (painted, plain.chars().count())
+}
+
+fn padded((painted, width): (String, usize), column: usize) -> String {
+    format!("{painted}{}", " ".repeat(column.saturating_sub(width)))
+}
+
 pub fn help() -> String {
     // One column width for commands and options, so descriptions line up.
-    let width = COMMANDS
+    let column = COMMANDS
         .iter()
-        .map(|spec| spec.name.len())
+        .map(|spec| signature(spec).1)
         .chain(["-V, --version".len()])
         .max()
         .unwrap_or(0);
@@ -198,16 +242,20 @@ pub fn help() -> String {
         for spec in COMMANDS.iter().filter(|spec| spec.group == *group) {
             text.push_str(&format!(
                 "\n  {}  {}",
-                accent(&format!("{:<width$}", spec.name)),
+                padded(signature(spec), column),
                 spec.summary
             ));
         }
     }
     text.push_str(&format!(
-        "\n\n{}\n  {}  Show help\n  {}  Show the version\n\n{}\n{}",
+        "\n\n{}\n  {}  Show help\n  {}  Show the version\n\n{}\n{}\n{}",
         heading("Options"),
-        accent(&format!("{:<width$}", "-h, --help")),
-        accent(&format!("{:<width$}", "-V, --version")),
+        accent(&format!("{:<column$}", "-h, --help")),
+        accent(&format!("{:<column$}", "-V, --version")),
+        dim(&highlight(
+            Stream::Out,
+            "<argument> is required. [argument] is optional."
+        )),
         dim("Leave out [project] to use the current folder name."),
         dim(&highlight(
             Stream::Out,
@@ -231,6 +279,27 @@ pub fn command_help(spec: &Spec) -> String {
         heading("Usage"),
         usage(spec)
     );
+    if !spec.arguments.is_empty() {
+        let width = spec
+            .arguments
+            .iter()
+            .map(|(name, _)| name.len())
+            .max()
+            .unwrap_or(0);
+        text.push_str(&format!("\n\n{}", heading("Arguments")));
+        for (name, description) in spec.arguments {
+            let label = if name.starts_with('<') {
+                ui::yellow("required")
+            } else {
+                dim("optional")
+            };
+            text.push_str(&format!(
+                "\n  {}{}  {label}  {description}",
+                paint_argument(name),
+                " ".repeat(width - name.len())
+            ));
+        }
+    }
     if !spec.details.is_empty() {
         text.push_str("\n\n");
         text.push_str(spec.details);
@@ -256,10 +325,22 @@ pub fn command_help(spec: &Spec) -> String {
     text
 }
 
-fn wrong_arguments(spec: &Spec) -> String {
+/// Names the missing required argument, or says there are too many.
+fn wrong_arguments(spec: &Spec, given: usize) -> String {
+    let headline = if given < spec.min {
+        let (name, description) = spec.arguments[given];
+        format!(
+            "missing {name} for 'keyman {}'\n\n{name}: {description}",
+            spec.name
+        )
+    } else {
+        format!(
+            "too many arguments for 'keyman {}' (it takes at most {})",
+            spec.name, spec.max
+        )
+    };
     format!(
-        "wrong arguments for 'keyman {}'\n\nUsage: {}\nRun 'keyman help {}' for details.",
-        spec.name,
+        "{headline}\n\nUsage: {}\nRun 'keyman help {}' for details.",
         usage(spec),
         spec.name
     )
@@ -308,7 +389,7 @@ pub fn parse<'a>(spec: &Spec, args: &'a [OsString]) -> Result<Parsed<'a>, String
         positional.push(arg);
     }
     if positional.len() < spec.min || positional.len() > spec.max {
-        return Err(wrong_arguments(spec));
+        return Err(wrong_arguments(spec, positional.len()));
     }
     Ok(Parsed::Args { positional, flags })
 }
@@ -356,8 +437,36 @@ mod tests {
         assert!(parse(show, &args(&["--revel"]))
             .unwrap_err()
             .contains("Did you mean '--reveal'"));
-        assert!(parse(show, &args(&["a", "b"])).is_err());
+        assert!(parse(show, &args(&["a", "b"]))
+            .unwrap_err()
+            .contains("too many arguments"));
+        let missing = parse(find("load").unwrap(), &[]).unwrap_err();
+        assert!(missing.starts_with("missing <file> for 'keyman load'"));
         assert!(find("injct").unwrap_err().contains("Did you mean 'inject'"));
+    }
+
+    #[test]
+    fn arguments_match_usage() {
+        for spec in COMMANDS {
+            let required = spec
+                .arguments
+                .iter()
+                .take_while(|(name, _)| name.starts_with('<'))
+                .count();
+            for (name, _) in spec.arguments {
+                assert!(spec.args.contains(name), "{} {name}", spec.name);
+            }
+            if spec.name != "run" {
+                assert_eq!(spec.min, required, "{}", spec.name);
+                assert_eq!(spec.max, spec.arguments.len(), "{}", spec.name);
+            }
+        }
+        let help = command_help(find("load").unwrap());
+        assert!(help.contains(
+            "Arguments
+  <file>  required  Your existing master file"
+        ));
+        assert!(super::help().contains("  load <file>"));
     }
 
     #[test]
