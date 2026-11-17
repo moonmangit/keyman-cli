@@ -310,6 +310,18 @@ cargo build --release
 cargo install --path .    # put keyman on your PATH
 ```
 
+### Tests
+
+`cargo test` runs the unit tests and needs no network. The cloud end-to-end tests in `tests/cloud_e2e.rs` are ignored by default, so they never count as passed by mistake. They need Docker and a local Supabase stack, and they refuse to run against a server that is not on `127.0.0.1` or `localhost`:
+
+```sh
+SUPABASE_AUTH_EMAIL_ENABLED=true supabase start
+set -a; eval "$(supabase status -o env)"; set +a   # API_URL, ANON_KEY, SERVICE_ROLE_KEY
+KEYMAN_E2E=1 cargo test --test cloud_e2e -- --ignored --test-threads=1
+```
+
+The database tests run with `supabase test db` (file `supabase/tests/rls_test.sql`).
+
 ### Try in Git Bash on Windows
 
 The `keyman` shell script in this repository runs the Linux binary in Ubuntu WSL and keeps the configuration in your Windows home directory. Build the binary in Ubuntu first with `~/.cargo/bin/cargo build --release`, then from Git Bash:

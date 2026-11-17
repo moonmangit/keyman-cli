@@ -1,30 +1,38 @@
 //! End-to-end tests of Keyman Cloud against a local Supabase stack.
 //!
-//! They need Docker, so each test returns at once unless `KEYMAN_E2E=1`.
-//! The local stack must allow email and password sign-in for these tests
-//! (the hosted project does not). Run from the repository root:
+//! They need Docker, so every test is `#[ignore]`: a plain `cargo test`
+//! reports them as ignored, never as passed. Run them on purpose with
+//! `--ignored` and `KEYMAN_E2E=1`. The local stack must allow email and
+//! password sign-in for these tests (the hosted project does not). Run from
+//! the repository root:
 //!
 //! ```sh
 //! SUPABASE_AUTH_EMAIL_ENABLED=true supabase start
 //! set -a; eval "$(supabase status -o env)"; set +a   # API_URL, ANON_KEY, SERVICE_ROLE_KEY
-//! KEYMAN_E2E=1 cargo test --test cloud_e2e -- --test-threads=1
+//! KEYMAN_E2E=1 cargo test --test cloud_e2e -- --ignored --test-threads=1
 //! ```
+//!
+//! The tests use the service role key and make users, so they refuse to run
+//! unless the API URL is on `127.0.0.1` or `localhost`.
 //!
 //! Users are made with the admin API (service role key) and sign in with a
 //! password, so no browser is necessary.
 
 use keyman_cli::cloud::account::{self, LoginOutcome, Prompt, Unlocked};
-use keyman_cli::cloud::api::{self, Session};
+use keyman_cli::cloud::api::{self, Api, Session};
+use keyman_cli::cloud::config;
 use keyman_cli::cloud::crypto::KdfParams;
 use keyman_cli::cloud::groups::{self, Removal};
 use keyman_cli::cloud::keystore::MemoryStore;
 use keyman_cli::cloud::merge::{self, Conflict, Keep};
+use keyman_cli::cloud::state;
 use keyman_cli::cloud::sync::{self, PullResult, PushResult, Resolver, Vaults};
 use keyman_cli::master::{self, Variables};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PASSWORD: &str = "e2e vault password";
@@ -65,33 +73,70 @@ struct Local {
     service: String,
 }
 
-/// `None` (skip the test) unless `KEYMAN_E2E=1`.
-fn local() -> Option<Local> {
-    if std::env::var("KEYMAN_E2E").as_deref() != Ok("1") {
+/// The host of an `http://` or `https://` URL, without the port.
+fn host_of(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.contains('@') {
         return None;
     }
-    let var = |name: &str| {
-        std::env::var(name)
-            .unwrap_or_else(|_| panic!("set {name} (run: eval \"$(supabase status -o env)\")"))
-    };
-    let url = std::env::var("API_URL").unwrap_or_else(|_| "http://127.0.0.1:54321".to_string());
-    let local = Local {
-        url: url.trim_end_matches('/').to_string(),
-        anon: var("ANON_KEY"),
-        service: var("SERVICE_ROLE_KEY"),
-    };
-    std::env::set_var("KEYMAN_SUPABASE_URL", &local.url);
-    std::env::set_var("KEYMAN_SUPABASE_KEY", &local.anon);
-    Some(local)
+    Some(
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    )
 }
 
-macro_rules! local_or_skip {
-    () => {
-        match local() {
-            Some(local) => local,
-            None => return,
-        }
-    };
+/// Only a local stack: the tests use the service role key and make users.
+fn is_loopback(url: &str) -> bool {
+    matches!(host_of(url), Some("127.0.0.1" | "localhost"))
+}
+
+static LOCAL: OnceLock<Local> = OnceLock::new();
+
+/// The local stack. The first call checks the settings and points Keyman at
+/// the stack (one time, before any test reads the settings).
+fn local() -> &'static Local {
+    LOCAL.get_or_init(|| {
+        assert_eq!(
+            std::env::var("KEYMAN_E2E").as_deref(),
+            Ok("1"),
+            "set KEYMAN_E2E=1 to run the cloud end-to-end tests"
+        );
+        let var = |name: &str| {
+            std::env::var(name)
+                .unwrap_or_else(|_| panic!("set {name} (run: eval \"$(supabase status -o env)\")"))
+        };
+        let url = std::env::var("API_URL").unwrap_or_else(|_| "http://127.0.0.1:54321".to_string());
+        let url = url.trim_end_matches('/').to_string();
+        assert!(
+            is_loopback(&url),
+            "the end-to-end tests run only against 127.0.0.1 or localhost, not {url}"
+        );
+        let local = Local {
+            url,
+            anon: var("ANON_KEY"),
+            service: var("SERVICE_ROLE_KEY"),
+        };
+        std::env::set_var("KEYMAN_SUPABASE_URL", &local.url);
+        std::env::set_var("KEYMAN_SUPABASE_KEY", &local.anon);
+        assert_eq!(config::config().url, local.url);
+        local
+    })
+}
+
+#[test]
+fn only_a_loopback_server_is_accepted() {
+    assert!(is_loopback("http://127.0.0.1:54321"));
+    assert!(is_loopback("http://localhost:54321/"));
+    assert!(is_loopback("https://localhost"));
+    assert!(!is_loopback("https://ukcjavxqyfjklagzkuzg.supabase.co"));
+    assert!(!is_loopback("http://127.0.0.1.example.com:54321"));
+    assert!(!is_loopback("http://localhost@evil.example:54321"));
+    assert!(!is_loopback("http://localhost.evil.example"));
+    assert!(!is_loopback("ftp://localhost"));
 }
 
 fn call(
@@ -143,6 +188,26 @@ impl Local {
         let (status, body) = call("GET", &url, &self.service, self.service_bearer(), None);
         assert!(status < 300, "GET {path}: {status} {body}");
         body
+    }
+
+    /// Change rows as the service role: this is what a hostile server can do.
+    fn service_patch(&self, path: &str, body: Value) {
+        let url = format!("{}{path}", self.url);
+        let (status, text) = call(
+            "PATCH",
+            &url,
+            &self.service,
+            self.service_bearer(),
+            Some(&body),
+        );
+        assert!(status < 300, "PATCH {path}: {status} {text}");
+    }
+
+    /// A request with the token of a user (row level security applies).
+    fn user_call(&self, method: &str, path: &str, token: &str, body: Option<Value>) {
+        let url = format!("{}{path}", self.url);
+        let (status, text) = call(method, &url, &self.anon, Some(token), body.as_ref());
+        assert!(status < 300, "{method} {path}: {status} {text}");
     }
 
     /// A new user with a confirmed email (the RLS policies require one).
@@ -338,9 +403,10 @@ fn two_linked_computers(local: &Local, tag: &str) -> (Computer, Computer) {
 }
 
 #[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
 fn two_computers_push_and_pull() {
-    let local = local_or_skip!();
-    let (c1, c2) = two_linked_computers(&local, "two");
+    let local = local();
+    let (c1, c2) = two_linked_computers(local, "two");
     assert_eq!(c2.vars("app"), c1.vars("app"));
 
     c1.write_master("app:\n  API_KEY: \"k2\"\n  DB_URL: \"postgres://db\"\n  NEW: \"n\"\n");
@@ -354,9 +420,10 @@ fn two_computers_push_and_pull() {
 }
 
 #[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
 fn conflict_is_resolved_with_keep_cloud() {
-    let local = local_or_skip!();
-    let (c1, c2) = two_linked_computers(&local, "conflict");
+    let local = local();
+    let (c1, c2) = two_linked_computers(local, "conflict");
     c1.write_master("app:\n  API_KEY: \"one\"\n  DB_URL: \"postgres://db\"\n");
     assert!(matches!(c1.push()[..], [PushResult::Pushed { .. }]));
     c2.write_master(&format!(
@@ -371,9 +438,10 @@ fn conflict_is_resolved_with_keep_cloud() {
 }
 
 #[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
 fn push_refused_when_cloud_is_newer() {
-    let local = local_or_skip!();
-    let (c1, c2) = two_linked_computers(&local, "newer");
+    let local = local();
+    let (c1, c2) = two_linked_computers(local, "newer");
     c1.write_master("app:\n  API_KEY: \"from-1\"\n  DB_URL: \"postgres://db\"\n");
     assert!(matches!(c1.push()[..], [PushResult::Pushed { .. }]));
     c2.write_master(&format!(
@@ -383,13 +451,14 @@ fn push_refused_when_cloud_is_newer() {
 }
 
 #[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
 fn server_rows_hold_no_plain_text() {
-    let local = local_or_skip!();
+    let local = local();
     let c1 = Computer::new(
         "plain",
         "plainprojectname:\n  PLAINVARNAME: \"plainvaluetext\"\nplaingroupproject:\n  PLAINGROUPVAR: \"plaingroupvalue\"\n",
     );
-    c1.set_up(&local, "plain");
+    c1.set_up(local, "plain");
     let u = c1.unlocked();
     sync::link(&c1.home, &u, "plainprojectname", None).unwrap();
     groups::create(&u, "plaingroupname").unwrap();
@@ -443,20 +512,22 @@ fn join_group(local: &Local, owner: &Computer, tag: &str) -> (Computer, String) 
 }
 
 #[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
 fn invite_then_accept_on_pull() {
-    let local = local_or_skip!();
-    let (ca, _) = owner_with_group(&local, "invite");
-    let (cb, _) = join_group(&local, &ca, "invite-b");
+    let local = local();
+    let (ca, _) = owner_with_group(local, "invite");
+    let (cb, _) = join_group(local, &ca, "invite-b");
     assert_eq!(cb.vars("shared"), ca.vars("shared"));
     assert_eq!(groups::waiting(&cb.unlocked()).unwrap(), 0);
 }
 
 #[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
 fn remove_rotates_key() {
-    let local = local_or_skip!();
-    let (ca, group_id) = owner_with_group(&local, "remove");
-    let (cb, b_email) = join_group(&local, &ca, "remove-b");
-    let (cc, _) = join_group(&local, &ca, "remove-c");
+    let local = local();
+    let (ca, group_id) = owner_with_group(local, "remove");
+    let (cb, b_email) = join_group(local, &ca, "remove-b");
+    let (cc, _) = join_group(local, &ca, "remove-c");
 
     let ua = ca.unlocked();
     let vaults = Vaults::load(&ua).unwrap();
@@ -485,10 +556,11 @@ fn remove_rotates_key() {
 }
 
 #[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
 fn recover_sets_new_password() {
-    let local = local_or_skip!();
+    let local = local();
     let c1 = Computer::new("recover", APP);
-    let (_, code) = c1.set_up(&local, "recover");
+    let (_, code) = c1.set_up(local, "recover");
     let mut answers = Answers {
         password: String::new(),
         new_password: NEW_PASSWORD.to_string(),
@@ -508,8 +580,9 @@ fn recover_sets_new_password() {
 }
 
 #[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
 fn expired_access_token_is_refreshed() {
-    let local = local_or_skip!();
+    let local = local();
     let c1 = Computer::new("expired", APP);
     let email = local.new_user("expired");
     let mut session = local.sign_in(&email);
@@ -519,4 +592,182 @@ fn expired_access_token_is_refreshed() {
     let u = c1.unlocked();
     assert_eq!(u.user_id, session.user_id);
     assert!(u.api.my_profile().unwrap().is_some());
+}
+
+/// The ID of the personal vault that this computer saved.
+fn saved_personal_vault(computer: &Computer) -> String {
+    state::load(&computer.home)
+        .unwrap()
+        .personal_vault
+        .expect("setup saves the personal vault")
+}
+
+#[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
+fn server_swapped_personal_vault_is_refused() {
+    let local = local();
+    let c1 = Computer::new("swap", APP);
+    c1.set_up(local, "swap");
+    let personal = saved_personal_vault(&c1);
+    let group = groups::create(&c1.unlocked(), "team").unwrap();
+
+    // The server labels the group as the personal vault.
+    local.service_patch(
+        &format!("/rest/v1/vaults?id=eq.{personal}"),
+        json!({"kind": "group"}),
+    );
+    local.service_patch(
+        &format!("/rest/v1/vaults?id=eq.{group}"),
+        json!({"kind": "personal"}),
+    );
+    let error = sync::link(&c1.home, &c1.unlocked(), "app", None).unwrap_err();
+    assert_eq!(
+        error,
+        "The server changed your personal vault. Keyman stops."
+    );
+    assert!(state::load(&c1.home).unwrap().links.is_empty());
+}
+
+#[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
+fn vault_key_moved_to_the_personal_vault_is_not_used() {
+    let local = local();
+    let c1 = Computer::new("moved", APP);
+    c1.set_up(local, "moved");
+    let personal = saved_personal_vault(&c1);
+    let group = groups::create(&c1.unlocked(), "team").unwrap();
+
+    // The server gives the personal vault the wrapped key of the group,
+    // which every member of the group can open.
+    let rows: Value = serde_json::from_str(&local.service_get(&format!(
+        "/rest/v1/vault_members?select=wrapped_key&vault_id=eq.{group}"
+    )))
+    .unwrap();
+    let group_key = rows[0]["wrapped_key"].as_str().unwrap().to_string();
+    local.service_patch(
+        &format!("/rest/v1/vault_members?vault_id=eq.{personal}"),
+        json!({"wrapped_key": group_key}),
+    );
+    let vaults = Vaults::load(&c1.unlocked()).unwrap();
+    assert!(vaults.key(&group).is_ok());
+    assert!(vaults.key(&personal).is_err());
+    assert!(sync::link(&c1.home, &c1.unlocked(), "app", None).is_err());
+}
+
+#[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
+fn cloud_roll_back_is_skipped() {
+    let local = local();
+    let c1 = Computer::new("rollback", APP);
+    let (email, _) = c1.set_up(local, "rollback");
+    let link = sync::link(&c1.home, &c1.unlocked(), "app", None).unwrap();
+    let id = link.cloud_id.clone();
+    let rows: Value = serde_json::from_str(&local.service_get(&format!(
+        "/rest/v1/projects?select=vault_id,key_generation,sealed&id=eq.{id}"
+    )))
+    .unwrap();
+    let old = rows[0].clone();
+
+    c1.write_master("app:\n  API_KEY: \"k2\"\n  DB_URL: \"postgres://db\"\n");
+    assert_eq!(
+        c1.push(),
+        vec![PushResult::Pushed {
+            project: "app".to_string(),
+            version: 2
+        }]
+    );
+
+    // The server puts back version 1. The old sealed copy still opens.
+    let session = local.sign_in(&email);
+    let token = session.access_token.as_str();
+    local.user_call(
+        "DELETE",
+        &format!("/rest/v1/projects?id=eq.{id}"),
+        token,
+        None,
+    );
+    local.user_call(
+        "POST",
+        "/rest/v1/projects",
+        token,
+        Some(json!({
+            "id": id,
+            "vault_id": old["vault_id"],
+            "key_generation": old["key_generation"],
+            "sealed": old["sealed"],
+            "updated_by": session.user_id,
+        })),
+    );
+    assert_eq!(
+        c1.pull(&mut NoConflicts),
+        vec![PullResult::Skipped {
+            project: "app".to_string(),
+            reason: "The cloud has an older version of app than this computer. Keyman did not change it."
+                .to_string(),
+        }]
+    );
+    assert_eq!(var(&c1.vars("app"), "API_KEY").as_deref(), Some("k2"));
+    assert_eq!(
+        state::load(&c1.home).unwrap().link("app").unwrap().version,
+        2
+    );
+}
+
+/// Answers setup with one password and confirms the code that it shows.
+struct Echo {
+    code: String,
+}
+
+impl Prompt for Echo {
+    fn new_password(&mut self) -> Result<String, String> {
+        Ok(PASSWORD.to_string())
+    }
+    fn password(&mut self) -> Result<String, String> {
+        Ok(PASSWORD.to_string())
+    }
+    fn recovery_code(&mut self) -> Result<String, String> {
+        Ok(self.code.clone())
+    }
+    fn show_recovery_code(&mut self, code: &str) -> Result<(), String> {
+        self.code = code.to_string();
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
+fn second_setup_cannot_replace_the_key_pair() {
+    let local = local();
+    let c1 = Computer::new("race-1", APP);
+    let (email, _) = c1.set_up(local, "race");
+    let before = c1.unlocked().api.my_profile().unwrap().unwrap().public_key;
+
+    let c2 = Computer::new("race-2", OTHER);
+    assert_eq!(
+        account::setup_with(
+            &c2.home,
+            &c2.store,
+            &local.sign_in(&email),
+            PASSWORD,
+            PARAMS
+        )
+        .err()
+        .unwrap(),
+        "This account has a vault password already. Keyman did not change it."
+    );
+    // A setup that read "no profile" before the first one finished.
+    let api = Api::new(config::config(), local.sign_in(&email));
+    let error = account::setup_profile(
+        &api,
+        &mut Echo {
+            code: String::new(),
+        },
+        PARAMS,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error, api::PROFILE_EXISTS);
+    let after = c1.unlocked().api.my_profile().unwrap().unwrap().public_key;
+    assert_eq!(after, before);
+    assert_eq!(state::load(&c2.home).unwrap(), state::State::default());
 }

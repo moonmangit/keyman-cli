@@ -71,7 +71,7 @@ Tests that pin these: Task 2 (`merge_after_lost_base_has_no_conflicts`), Task 1 
 | `supabase/config.toml` | Local Supabase config (auth providers, redirect URLs) |
 | `supabase/migrations/20261117000000_cloud_sync.sql` | Tables, RLS, functions, trigger |
 | `supabase/tests/rls_test.sql` | pgTAP tests for RLS and functions |
-| `tests/cloud_e2e.rs` | End-to-end tests against local Supabase (ignored unless `KEYMAN_E2E=1`) |
+| `tests/cloud_e2e.rs` | End-to-end tests against local Supabase (`#[ignore]`; run with `KEYMAN_E2E=1` and `--ignored`, loopback only) |
 | `README.md` | New "Cloud sync" section |
 
 ---
@@ -746,7 +746,7 @@ Groups · 2
   - `remove_rotates_key` — A removes B; B cannot read projects; A and C still pull; generation is 2.
   - `recover_sets_new_password` — recover with the code, then unlock with the new password works and the old password fails.
   - `expired_access_token_is_refreshed` — store a session with `expires_at` in the past → `session()` succeeds.
-- [ ] **Step 3: Run** — `supabase start && KEYMAN_E2E=1 cargo test --test cloud_e2e -- --test-threads=1` → PASS
+- [ ] **Step 3: Run** — `supabase start && KEYMAN_E2E=1 cargo test --test cloud_e2e -- --ignored --test-threads=1` → PASS
 - [ ] **Step 4: Manual check of browser sign-in** — `cargo run -- login --github` against the hosted project; report the result to the user.
 - [ ] **Step 5: Commit** — `git commit -m "Connect hosted Supabase and add cloud end-to-end tests"`
 
