@@ -72,23 +72,16 @@ pub fn personal_vault(u: &Unlocked) -> Result<String, String> {
     personal_in(&u.api.my_memberships()?)
 }
 
-/// The vault of the group with this name, among the vaults the user is in.
-fn group_vault(memberships: &[Membership], vaults: &Vaults, name: &str) -> Result<String, String> {
-    for member in memberships.iter().filter(|m| m.vaults.kind != "personal") {
-        let Some(sealed) = &member.vaults.name_sealed else {
-            continue;
-        };
-        let Ok((key, _)) = vaults.key(&member.vault_id) else {
-            continue;
-        };
-        let aad = crypto::vault_name_aad(&member.vault_id);
-        if let Ok(plain) = crypto::open(key, &aad, sealed) {
-            if plain.as_slice() == name.as_bytes() {
-                return Ok(member.vault_id.clone());
-            }
+/// The vault of the group with this name. Two groups with one name are
+/// refused: an outsider can invite a person to a group with the same name.
+pub(crate) fn group_vault(vaults: &Vaults, name: &str) -> Result<String, String> {
+    groups::find_in(vaults, name).map_err(|error| {
+        if error.starts_with("There is no group") {
+            format!("You are not in a group named '{name}'.")
+        } else {
+            error
         }
-    }
-    Err(format!("You are not in a group named '{name}'."))
+    })
 }
 
 const KEY_CHANGED: &str = "The group key changed. Run 'keyman pull' again.";
@@ -165,7 +158,7 @@ pub fn link(home: &Path, u: &Unlocked, project: &str, group: Option<&str>) -> Re
     let memberships = u.api.my_memberships()?;
     let vaults = Vaults::from_memberships(u, &memberships);
     let vault_id = match group {
-        Some(name) => group_vault(&memberships, &vaults, name)?,
+        Some(name) => group_vault(&vaults, name)?,
         None => personal_in(&memberships)?,
     };
     let (key, generation) = vaults.key(&vault_id)?;
@@ -326,8 +319,12 @@ pub fn pull(
     resolver: &mut dyn Resolver,
 ) -> Result<Vec<PullResult>, String> {
     let vaults = Vaults::load(u)?;
-    for (group, email) in groups::accept_pending(u, &vaults)? {
+    let accepted = groups::accept_pending(u, &vaults)?;
+    for (group, email) in &accepted.given {
         println!("Gave {email} access to {group}.");
+    }
+    for warning in &accepted.warnings {
+        eprintln!("{warning}");
     }
     let mut ids: Vec<String> = vaults.by_id.keys().cloned().collect();
     ids.sort();

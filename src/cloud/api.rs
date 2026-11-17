@@ -518,6 +518,13 @@ impl Api {
         Ok(rows.into_iter().next())
     }
 
+    /// Only the owner of the group can delete an invite. The server ignores
+    /// a delete that it does not allow, so the caller must read again.
+    pub fn delete_invite(&self, invite_id: &str) -> Result<(), String> {
+        let path = format!("/rest/v1/invites?id=eq.{}", urlenc(invite_id));
+        self.call("DELETE", &path, None, None).map(|_| ())
+    }
+
     pub fn delete_project(&self, id: &str) -> Result<(), String> {
         let path = format!("/rest/v1/projects?id=eq.{}", urlenc(id));
         self.call("DELETE", &path, None, None).map(|_| ())

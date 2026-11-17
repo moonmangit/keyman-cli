@@ -127,19 +127,35 @@ fn check_invite(
     Ok(email)
 }
 
-/// The name of a group, with control characters replaced (the owner makes
-/// the name, and it goes to the terminal of every member).
-fn group_name(vaults: &Vaults, member: &Membership) -> Option<String> {
+/// Control characters and Unicode format characters (category Cf), such as
+/// the bidirectional overrides and the zero width characters.
+fn is_hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(c as u32,
+            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x180E
+            | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+            | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// The name of a group as sealed, with no change.
+fn raw_name(vaults: &Vaults, member: &Membership) -> Option<String> {
     if member.vaults.kind != "group" {
         return None;
     }
     let sealed = member.vaults.name_sealed.as_ref()?;
     let (key, _) = vaults.key(&member.vault_id).ok()?;
     let plain = crypto::open(key, &crypto::vault_name_aad(&member.vault_id), sealed).ok()?;
-    let text = std::str::from_utf8(&plain).ok()?;
+    String::from_utf8(plain.to_vec()).ok()
+}
+
+/// The name of a group, with hidden characters replaced (the owner makes
+/// the name, and it goes to the terminal of every member). It is also the
+/// form that names are compared in.
+fn group_name(vaults: &Vaults, member: &Membership) -> Option<String> {
     Some(
-        text.chars()
-            .map(|c| if c.is_control() { '?' } else { c })
+        raw_name(vaults, member)?
+            .chars()
+            .map(|c| if is_hidden(c) { '?' } else { c })
             .collect(),
     )
 }
@@ -153,7 +169,7 @@ fn names(vaults: &Vaults) -> Vec<(String, String)> {
         .collect()
 }
 
-fn find_in(vaults: &Vaults, name: &str) -> Result<String, String> {
+pub(crate) fn find_in(vaults: &Vaults, name: &str) -> Result<String, String> {
     let mut found = names(vaults)
         .into_iter()
         .filter(|(_, group)| group == name)
@@ -201,6 +217,8 @@ fn removal_error(message: String) -> String {
         "A member changed a project during the removal. Run the command again.".to_string()
     } else if message.contains("a new key is necessary for each remaining member")
         || message.contains("a key is for a user who is not a member")
+        || message.contains("every remaining member must get a new key")
+        || message.contains("the user is not a member")
     {
         "A person joined or left the group during the removal. Run the command again.".to_string()
     } else if message.contains("all projects of the vault must be encrypted again") {
@@ -239,7 +257,7 @@ pub fn create(u: &Unlocked, name: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("The group needs a name.".to_string());
     }
-    if name.chars().any(|c| c.is_control()) {
+    if name.chars().any(is_hidden) {
         return Err("The name of the group has a character that Keyman cannot use.".to_string());
     }
     let vaults = Vaults::load(u)?;
@@ -287,42 +305,78 @@ pub fn invite(u: &Unlocked, group: &str, email: &str) -> Result<(), String> {
     u.api.create_invite(&id, &email)
 }
 
+/// What to do with the answer of the server for one invite.
+#[derive(Debug, PartialEq)]
+enum InviteOutcome {
+    Done,
+    /// Another member was first, or the key changed. The next pull is right.
+    Quiet,
+    Warn,
+}
+
+fn invite_outcome(answer: &Result<(), String>) -> InviteOutcome {
+    match answer {
+        Ok(()) => InviteOutcome::Done,
+        Err(message)
+            if message.contains("the invite does not exist")
+                || message.contains("the group key changed") =>
+        {
+            InviteOutcome::Quiet
+        }
+        Err(_) => InviteOutcome::Warn,
+    }
+}
+
+/// What `accept_pending` did: `(group, email)` for each person who got
+/// access, and a warning for each invite that Keyman could not finish.
+#[derive(Debug, Default, PartialEq)]
+pub struct Accepted {
+    pub given: Vec<(String, String)>,
+    pub warnings: Vec<String>,
+}
+
 /// For each invite in my groups whose email has a profile: wrap the vault
-/// key for that profile and accept. Returns `(group, email)` for each person
-/// who got access. An invite with no profile is skipped: the person has not
-/// set up Keyman Cloud yet.
-pub fn accept_pending(u: &Unlocked, vaults: &Vaults) -> Result<Vec<(String, String)>, String> {
+/// key for that profile and accept. An invite with no profile is skipped:
+/// the person has not set up Keyman Cloud yet. A problem with one invite
+/// (the invitee controls their own public key) gives a warning and never
+/// stops the others. Only a failure to read the invites is an error.
+pub fn accept_pending(u: &Unlocked, vaults: &Vaults) -> Result<Accepted, String> {
     let group_names: HashMap<String, String> = names(vaults).into_iter().collect();
     let mut ids: Vec<String> = group_names.keys().cloned().collect();
     ids.sort();
-    let mut done = Vec::new();
+    let mut result = Accepted::default();
     for invite in u.api.invites_for_vaults(&ids)? {
         let Ok((key, generation)) = vaults.key(&invite.vault_id) else {
             continue;
         };
-        let Some(profile) = u.api.find_profile_by_email(&invite.email)? else {
+        let group = group_names
+            .get(&invite.vault_id)
+            .cloned()
+            .unwrap_or_default();
+        let warn = format!("Keyman cannot give {} access to {group} now.", invite.email);
+        let profile = match u.api.find_profile_by_email(&invite.email) {
+            Ok(Some(profile)) => profile,
+            Ok(None) => continue,
+            Err(_) => {
+                result.warnings.push(warn);
+                continue;
+            }
+        };
+        let Ok(public) = public_key(&profile) else {
+            result.warnings.push(warn);
             continue;
         };
-        let wrapped = crypto::wrap_for(&public_key(&profile)?, key);
-        match u
+        let wrapped = crypto::wrap_for(&public, key);
+        let answer = u
             .api
-            .accept_invite(&invite.id, &profile.user_id, &wrapped, *generation)
-        {
-            Ok(()) => {
-                let group = group_names
-                    .get(&invite.vault_id)
-                    .cloned()
-                    .unwrap_or_default();
-                done.push((group, invite.email));
-            }
-            // Another member was first, or the key changed. The next pull is right.
-            Err(message)
-                if message.contains("the invite does not exist")
-                    || message.contains("the group key changed") => {}
-            Err(message) => return Err(message),
+            .accept_invite(&invite.id, &profile.user_id, &wrapped, *generation);
+        match invite_outcome(&answer) {
+            InviteOutcome::Done => result.given.push((group, invite.email)),
+            InviteOutcome::Quiet => {}
+            InviteOutcome::Warn => result.warnings.push(warn),
         }
     }
-    Ok(done)
+    Ok(result)
 }
 
 /// How many invites for my own email address wait for a member.
@@ -330,20 +384,93 @@ pub fn waiting(u: &Unlocked) -> Result<usize, String> {
     Ok(u.api.my_invites()?.len())
 }
 
-/// Removes a member. Makes a new vault key, encrypts all projects and the
-/// name again, and wraps the key for each remaining member, in one call.
-pub fn remove(u: &Unlocked, vaults: &Vaults, group: &str, email: &str) -> Result<(), String> {
+/// What a removal does to an email address.
+#[derive(Debug, PartialEq)]
+pub enum Removal {
+    /// A member: new group key, `projects` encrypted again.
+    Member { projects: usize },
+    /// A pending invite: only the invite is deleted (no key was given).
+    Invite,
+}
+
+#[derive(Debug, PartialEq)]
+enum Target {
+    Member,
+    Invite(String),
+}
+
+/// A member comes first. Then a pending invite.
+fn classify(email: &str, member_emails: &[String], invites: &[Invite]) -> Option<Target> {
+    if member_emails.iter().any(|m| m.to_lowercase() == email) {
+        return Some(Target::Member);
+    }
+    invites
+        .iter()
+        .find(|invite| invite.email.to_lowercase() == email)
+        .map(|invite| Target::Invite(invite.id.clone()))
+}
+
+/// Before the confirmation: the user must own the group, and the email must
+/// be a member or have an invite. Only a member needs a confirmation.
+pub fn check_remove(
+    u: &Unlocked,
+    vaults: &Vaults,
+    group: &str,
+    email: &str,
+) -> Result<Removal, String> {
     let email = clean_email(email)?;
     let id = find_in(vaults, group)?;
     owned(vaults, u, &id, NOT_OWNER_REMOVE)?;
+    let rows = u.api.vault_members(&id)?;
+    let ids: Vec<String> = rows.iter().map(|row| row.user_id.clone()).collect();
+    let profiles = u.api.public_profiles(&ids)?;
+    let member_emails: Vec<String> = profiles.iter().map(|p| p.email.clone()).collect();
+    let invites = u.api.invites_for_vaults(std::slice::from_ref(&id))?;
+    match classify(&email, &member_emails, &invites) {
+        Some(Target::Member) => {
+            if profiles
+                .iter()
+                .any(|p| p.user_id == u.api.user_id() && p.email.to_lowercase() == email)
+            {
+                return Err("The owner cannot be removed. Delete the group instead.".to_string());
+            }
+            Ok(Removal::Member {
+                projects: u.api.projects(std::slice::from_ref(&id))?.len(),
+            })
+        }
+        Some(Target::Invite(_)) => Ok(Removal::Invite),
+        None => Err(format!("{email} is not in the group '{group}'.")),
+    }
+}
+
+/// Removes a member, or deletes the invite of a person who is not a member.
+/// For a member it makes a new vault key, encrypts all projects and the
+/// name again, and wraps the key for each remaining member, in one call.
+pub fn remove(u: &Unlocked, vaults: &Vaults, group: &str, email: &str) -> Result<Removal, String> {
+    let email = clean_email(email)?;
+    let id = find_in(vaults, group)?;
+    let membership = owned(vaults, u, &id, NOT_OWNER_REMOVE)?;
     let (old, generation) = vaults.key(&id)?;
     let rows = u.api.vault_members(&id)?;
     let ids: Vec<String> = rows.iter().map(|row| row.user_id.clone()).collect();
     let profiles = u.api.public_profiles(&ids)?;
-    let target = profiles
-        .iter()
-        .find(|profile| profile.email.to_lowercase() == email)
-        .ok_or_else(|| format!("{email} is not in the group '{group}'."))?;
+    let member_emails: Vec<String> = profiles.iter().map(|p| p.email.clone()).collect();
+    let invites = u.api.invites_for_vaults(std::slice::from_ref(&id))?;
+    let target = match classify(&email, &member_emails, &invites) {
+        Some(Target::Invite(invite_id)) => {
+            u.api.delete_invite(&invite_id)?;
+            let left = u.api.invites_for_vaults(std::slice::from_ref(&id))?;
+            if left.iter().any(|invite| invite.id == invite_id) {
+                return Err("Keyman could not remove the invite.".to_string());
+            }
+            return Ok(Removal::Invite);
+        }
+        Some(Target::Member) => profiles
+            .iter()
+            .find(|profile| profile.email.to_lowercase() == email)
+            .ok_or_else(|| format!("{email} is not in the group '{group}'."))?,
+        None => return Err(format!("{email} is not in the group '{group}'.")),
+    };
     if target.user_id == u.api.user_id() {
         return Err("The owner cannot be removed. Delete the group instead.".to_string());
     }
@@ -353,7 +480,10 @@ pub fn remove(u: &Unlocked, vaults: &Vaults, group: &str, email: &str) -> Result
         let profile = profiles
             .iter()
             .find(|profile| profile.user_id == row.user_id)
-            .ok_or_else(|| "Keyman cannot read the profile of a member.".to_string())?;
+            .ok_or_else(|| {
+                "Keyman cannot read the profile of a member. Keyman did not remove anyone."
+                    .to_string()
+            })?;
         keys.push((
             row.user_id.clone(),
             crypto::wrap_for(&public_key(profile)?, &new),
@@ -364,19 +494,16 @@ pub fn remove(u: &Unlocked, vaults: &Vaults, group: &str, email: &str) -> Result
         return Err(KEY_CHANGED.to_string());
     }
     let sealed = reseal_all(old, &new, &projects)?;
-    let sealed_name = crypto::seal(&new, &crypto::vault_name_aad(&id), group.as_bytes());
+    // The name that was sealed, not the text that was typed.
+    let name = raw_name(vaults, membership)
+        .ok_or_else(|| "Keyman cannot read the name of the group.".to_string())?;
+    let sealed_name = crypto::seal(&new, &crypto::vault_name_aad(&id), name.as_bytes());
     u.api
         .rotate_vault(&id, &target.user_id, &keys, &sealed, Some(&sealed_name))
-        .map(|_| ())
+        .map(|_| Removal::Member {
+            projects: projects.len(),
+        })
         .map_err(removal_error)
-}
-
-/// Before a removal is confirmed: the user must own the group. Returns how
-/// many projects a removal encrypts again.
-pub fn check_remove(u: &Unlocked, vaults: &Vaults, group: &str) -> Result<usize, String> {
-    let id = find_in(vaults, group)?;
-    owned(vaults, u, &id, NOT_OWNER_REMOVE)?;
-    Ok(u.api.projects(std::slice::from_ref(&id))?.len())
 }
 
 /// Before a delete is confirmed: the user must own the group. Returns the
@@ -441,6 +568,108 @@ mod tests {
             key_generation: 1,
             sealed,
             updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn one_bad_invite_is_a_warning_not_an_error() {
+        assert_eq!(invite_outcome(&Ok(())), InviteOutcome::Done);
+        for quiet in [
+            "the invite does not exist",
+            "the group key changed; run the command again",
+        ] {
+            assert_eq!(
+                invite_outcome(&Err(quiet.to_string())),
+                InviteOutcome::Quiet
+            );
+        }
+        for bad in [
+            "duplicate key value violates unique constraint",
+            "the user does not match the invite email",
+        ] {
+            assert_eq!(invite_outcome(&Err(bad.to_string())), InviteOutcome::Warn);
+        }
+        let bad_key = PublicProfile {
+            user_id: "u".to_string(),
+            email: "x@x.com".to_string(),
+            public_key: "not a key".to_string(),
+        };
+        assert!(public_key(&bad_key).is_err());
+    }
+
+    #[test]
+    fn an_invite_is_removed_when_the_person_is_not_a_member() {
+        let invites = vec![Invite {
+            id: "i1".to_string(),
+            vault_id: "v".to_string(),
+            email: "Pending@x.com".to_string(),
+        }];
+        let members = vec!["m@x.com".to_string()];
+        assert_eq!(
+            classify("m@x.com", &members, &invites),
+            Some(Target::Member)
+        );
+        assert_eq!(
+            classify("pending@x.com", &members, &invites),
+            Some(Target::Invite("i1".to_string()))
+        );
+        assert_eq!(classify("none@x.com", &members, &invites), None);
+        // a member who also has an invite is a member
+        assert_eq!(
+            classify("pending@x.com", &["pending@x.com".to_string()], &invites),
+            Some(Target::Member)
+        );
+    }
+
+    #[test]
+    fn format_characters_are_hidden_in_names() {
+        let pair = KeyPair::generate();
+        let m = membership(
+            &pair,
+            "v9",
+            "group",
+            Some("a\u{202E}b\u{200B}c\u{2066}d"),
+            "me",
+        );
+        let vaults = Vaults::from_pair(&pair, std::slice::from_ref(&m));
+        assert_eq!(group_name(&vaults, &m).unwrap(), "a?b?c?d");
+        // the sealed text keeps the original, for re-sealing
+        assert_eq!(
+            raw_name(&vaults, &m).unwrap(),
+            "a\u{202E}b\u{200B}c\u{2066}d"
+        );
+    }
+
+    #[test]
+    fn link_refuses_two_groups_with_one_name() {
+        let f = fixture();
+        let mut memberships = f.memberships.clone();
+        memberships.push(membership(&f.pair, "v3", "group", Some("billing"), "other"));
+        let vaults = Vaults::from_pair(&f.pair, &memberships);
+        assert_eq!(
+            crate::cloud::sync::group_vault(&vaults, "billing").unwrap_err(),
+            "You are in more than one group named 'billing'."
+        );
+        assert_eq!(
+            crate::cloud::sync::group_vault(&vaults, "team-api").unwrap(),
+            "v1"
+        );
+        assert_eq!(
+            crate::cloud::sync::group_vault(&vaults, "zzz").unwrap_err(),
+            "You are not in a group named 'zzz'."
+        );
+    }
+
+    #[test]
+    fn more_server_errors_have_short_messages() {
+        for message in [
+            "every remaining member must get a new key",
+            "the user is not a member",
+        ] {
+            assert_eq!(
+                removal_error(message.to_string()),
+                "A person joined or left the group during the removal. Run the command again."
+            );
         }
     }
 

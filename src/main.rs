@@ -3,7 +3,7 @@ mod completions;
 
 use keyman_cli::cloud::account::Unlocked;
 use keyman_cli::cloud::account::{self, Prompt};
-use keyman_cli::cloud::groups;
+use keyman_cli::cloud::groups::{self, Removal};
 use keyman_cli::cloud::keystore::SystemStore;
 use keyman_cli::cloud::merge::{choose_all, Conflict, Keep};
 use keyman_cli::cloud::state;
@@ -240,13 +240,17 @@ fn pull_command(given: Option<&OsString>, flags: &cli::Flags) -> Result<Outcome,
         local_name.as_deref(),
         resolver.as_mut(),
     )?;
-    let waiting = groups::waiting(&unlocked)?;
-    let waiting_line = (waiting > 0).then(|| {
-        yellow(&format!(
+    // The pull is done. A failure here must not hide its results.
+    let waiting_line = match groups::waiting(&unlocked) {
+        Ok(0) => None,
+        Ok(waiting) => Some(yellow(&format!(
             "Waiting for access to {}. A member must run 'keyman pull'.",
             plural(waiting, "group")
-        ))
-    });
+        ))),
+        Err(_) => Some(yellow(
+            "Keyman cannot check for waiting invites now. Run 'keyman pull' again later.",
+        )),
+    };
     if results.is_empty() {
         let mut lines = vec![dim("No projects in the cloud yet.")];
         lines.extend(waiting_line);
@@ -333,23 +337,36 @@ Use 'keyman group create', 'invite', 'remove', 'list' or 'delete'.",
         }
         "remove" => {
             let vaults = sync::Vaults::load(&unlocked)?;
-            let count = groups::check_remove(&unlocked, &vaults, &group)?;
-            println!(
-                "Keyman makes a new group key and encrypts all {} again. {} keeps the data that they got before.",
-                plural(count, "project"),
-                email.trim().to_lowercase()
-            );
-            println!("Type the email address to confirm:");
-            if read_answer()?.to_lowercase() != email.trim().to_lowercase() {
-                return Err(
-                    "The email address is not the same. Keyman did not remove anyone.".to_string(),
+            let shown = email.trim().to_lowercase();
+            if let Removal::Member { projects } =
+                groups::check_remove(&unlocked, &vaults, &group, &email)?
+            {
+                let encrypted = if projects == 1 {
+                    "the 1 project".to_string()
+                } else {
+                    format!("all {projects} projects")
+                };
+                println!(
+                    "Keyman makes a new group key and encrypts {encrypted} again. {shown} keeps the data that they got before."
                 );
+                println!("Type the email address to confirm:");
+                if read_answer()?.to_lowercase() != shown {
+                    return Err(
+                        "The email address is not the same. Keyman did not remove anyone."
+                            .to_string(),
+                    );
+                }
             }
-            groups::remove(&unlocked, &vaults, &group, &email)?;
-            Ok(Outcome::Print(ui::success(&format!(
-                "Removed {} from {group}. The group has a new key.",
-                email.trim().to_lowercase()
-            ))))
+            Ok(Outcome::Print(
+                match groups::remove(&unlocked, &vaults, &group, &email)? {
+                    Removal::Member { .. } => ui::success(&format!(
+                        "Removed {shown} from {group}. The group has a new key."
+                    )),
+                    Removal::Invite => {
+                        ui::success(&format!("Keyman removed the invite for {shown}."))
+                    }
+                },
+            ))
         }
         "list" => {
             let vaults = sync::Vaults::load(&unlocked)?;
