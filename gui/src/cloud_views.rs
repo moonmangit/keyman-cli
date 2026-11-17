@@ -7,7 +7,7 @@ use keyman_cli::cloud::sync::LinkStatus;
 use rune::{Color, El, TextEdit, TextStyle, Tx, col, el, icon, row, text, text_input};
 use zeroize::Zeroizing;
 
-use crate::cloud::{self, Ask, Busy, CloudState};
+use crate::cloud::{self, Ask, Attention, Busy, CloudState, SyncSummary};
 use crate::i18n::{count, t};
 use crate::icons as ic;
 use crate::widgets::*;
@@ -908,6 +908,262 @@ pub fn delete_dialog(s: &App, p: Paint) -> El {
         )
 }
 
+// ── Sync results ────────────────────────────────────────────────────────────
+
+/// One project in the **Sync results** dialog, with its reason in words.
+#[derive(Debug, PartialEq)]
+pub struct ResultRow {
+    pub project: String,
+    pub reason: String,
+    /// A same-name project: the row has **Merge**.
+    pub merge: bool,
+}
+
+/// The projects that need the person, in the order of the sync. A library reason stays as it is.
+pub fn attention_rows(summary: &SyncSummary) -> Vec<ResultRow> {
+    summary
+        .attention
+        .iter()
+        .map(|attention| {
+            let project = attention.project().to_owned();
+            let reason = match attention {
+                Attention::Skipped { reason, .. } => reason.clone(),
+                Attention::Stopped { project, .. } => tf!(
+                    "You stopped the sync of {}. Keyman did not change it.",
+                    "คุณหยุดการซิงก์ {} แล้ว Keyman ไม่ได้เปลี่ยนโปรเจกต์นี้",
+                    project
+                ),
+                Attention::CloudIsNewer(project) => tf!(
+                    "The cloud has newer changes for {}. Click Sync again.",
+                    "คลาวด์มีการเปลี่ยนแปลงของ {} ที่ใหม่กว่า กดซิงก์อีกครั้ง",
+                    project
+                ),
+                Attention::CanMerge(project) => tf!(
+                    "This computer has a different project with the name {}. Click Merge to join it with the cloud project.",
+                    "เครื่องนี้มีโปรเจกต์อื่นชื่อ {} อยู่แล้ว กดรวมเพื่อรวมกับโปรเจกต์บนคลาวด์",
+                    project
+                ),
+            };
+            ResultRow {
+                project,
+                reason,
+                merge: matches!(attention, Attention::CanMerge(_)),
+            }
+        })
+        .collect()
+}
+
+/// A line in the results: an icon and a text that wraps.
+fn result_line(
+    p: Paint,
+    key: String,
+    glyph: &'static rune::Icon,
+    tint: Color,
+    message: String,
+) -> El {
+    row()
+        .key(key)
+        .w_full()
+        .gap(8.0)
+        .child(icon(glyph, 14.0).color(tint).a11y_hidden())
+        .child(
+            text(message)
+                .font(SMALL)
+                .color(p.text)
+                .wrap()
+                .selectable(true)
+                .grow(1.0)
+                .min_w(0.0),
+        )
+}
+
+/// **Sync results**: the projects that need the person, with **Merge** for a same-name
+/// project, the added projects, and the invite lines.
+pub fn sync_results_dialog(s: &App, p: Paint) -> El {
+    let Some(summary) = &s.sync_results else {
+        return el();
+    };
+    let idle = cloud::can_start(&s.busy);
+    let mut list = col().key("sync-rows").w_full().gap(8.0);
+    for row_data in attention_rows(summary) {
+        let ResultRow {
+            project,
+            reason,
+            merge,
+        } = row_data;
+        let mut entry = row()
+            .key(format!("sync-row-{project}"))
+            .w_full()
+            .padding(12.0)
+            .gap(12.0)
+            .center_y()
+            .radius(10.0)
+            .fill(p.card)
+            .border(1.0, p.border)
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(3.0)
+                    .child(
+                        text(project.clone())
+                            .font(BODY_STRONG)
+                            .color(p.text)
+                            .truncate(),
+                    )
+                    .child(
+                        text(reason)
+                            .font(SMALL)
+                            .color(p.muted)
+                            .wrap()
+                            .selectable(true),
+                    ),
+            );
+        if merge {
+            entry = entry.child(button(
+                p,
+                &format!("merge-{project}"),
+                t("Merge", "รวม"),
+                Some(&ic::MERGE),
+                Kind::Secondary,
+                idle,
+                move |s, _| s.cloud_merge(&project),
+            ));
+        }
+        list = list.child(entry);
+    }
+    if !summary.added.is_empty() {
+        list = list.child(result_line(
+            p,
+            "sync-added".into(),
+            &ic::PLUS,
+            p.green,
+            tf!(
+                "Added to this computer: {}",
+                "เพิ่มในเครื่องนี้แล้ว: {}",
+                summary.added.join(", ")
+            ),
+        ));
+    }
+    for (i, (group, email)) in summary.given.iter().enumerate() {
+        list = list.child(result_line(
+            p,
+            format!("sync-given-{i}"),
+            &ic::CHECK_CIRCLE,
+            p.green,
+            cloud::given_line(group, email),
+        ));
+    }
+    for (i, warning) in summary.warnings.iter().enumerate() {
+        list = list.child(result_line(
+            p,
+            format!("sync-warning-{i}"),
+            &ic::ALERT,
+            p.yellow,
+            warning.clone(),
+        ));
+    }
+    let intro_text = if summary.attention.is_empty() {
+        cloud::counts_text(summary)
+    } else {
+        format!(
+            "{} {}",
+            cloud::counts_text(summary),
+            t("These projects need you:", "โปรเจกต์เหล่านี้ต้องให้คุณจัดการ:")
+        )
+    };
+    sheet(
+        p,
+        "sync-results",
+        t("Sync results", "ผลการซิงก์"),
+        &ic::CLOUD_UP,
+        p.accent,
+    )
+    .w(520.0)
+    .max_h(620.0)
+    .child(intro(p, &intro_text))
+    .child(
+        col()
+            .key("sync-scroll")
+            .w_full()
+            .child(list)
+            .scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            })
+            .shrink()
+            .min_h(0.0),
+    )
+    .child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .pt(6.0)
+            .child(el().grow(1.0))
+            .child(button(
+                p,
+                "sync-results-ok",
+                t("OK", "ตกลง"),
+                None,
+                Kind::Primary,
+                true,
+                |s, _| s.close_dialog(),
+            )),
+    )
+}
+
+/// The title-bar **Sync**, only when signed in. While a cloud task runs, it is disabled and
+/// its icon turns, in the busy colour of the cloud icon.
+pub fn sync_button(s: &App, p: Paint) -> Option<El> {
+    if !matches!(s.cloud, CloudState::SignedIn { .. }) {
+        return None;
+    }
+    let label = t("Sync", "ซิงก์");
+    let (tip, glyph) = match &s.busy {
+        Some(busy) => (
+            busy.label.to_owned(),
+            icon(&ic::SYNC, 15.0)
+                .color(p.accent)
+                .a11y_hidden()
+                .looping(rune::LoopSpec::rotation(0.9)),
+        ),
+        None => (
+            t(
+                "Get the cloud changes, then send yours",
+                "รับการเปลี่ยนแปลงจากคลาวด์ แล้วส่งของคุณ",
+            )
+            .to_owned(),
+            icon(&ic::SYNC, 15.0).color(p.muted).a11y_hidden(),
+        ),
+    };
+    let busy = s.busy.is_some();
+    let b = row()
+        .key("tb-sync")
+        .role("button")
+        .label(label)
+        .help(&tip)
+        .h(30.0)
+        .px(10.0)
+        .gap(6.0)
+        .center()
+        .radius(7.0)
+        .disabled(busy)
+        .child(glyph)
+        .child(
+            text(label)
+                .font(BODY_STRONG)
+                .color(if busy { p.muted } else { p.text })
+                .a11y_hidden(),
+        );
+    Some(if busy {
+        b
+    } else {
+        b.focusable(true)
+            .hover(p.hover)
+            .press(p.press)
+            .on_press(|s: &mut App| s.cloud_sync())
+    })
+}
+
 // ── Question dialogs ────────────────────────────────────────────────────────
 
 fn field_fill(p: Paint) -> Color {
@@ -1252,6 +1508,63 @@ mod tests {
             status_label(Some(&LinkStatus::LocalChanges)),
             ("Changes on this computer", "มีการเปลี่ยนแปลงในเครื่องนี้")
         );
+    }
+
+    #[test]
+    fn sync_results_list_needs_attention() {
+        let library = "The master file changed while Keyman worked. Keyman did not write anything. Run 'keyman pull' again.";
+        let summary = SyncSummary {
+            updated: 0,
+            added: vec!["new-app".into()],
+            sent: 0,
+            attention: vec![
+                Attention::Skipped {
+                    project: "e".into(),
+                    reason: library.into(),
+                },
+                Attention::Stopped {
+                    project: "d".into(),
+                    conflicts: 2,
+                },
+                Attention::CloudIsNewer("g".into()),
+                Attention::CanMerge("f".into()),
+            ],
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let rows = attention_rows(&summary);
+        assert_eq!(
+            rows[0],
+            ResultRow {
+                project: "e".into(),
+                reason: library.into(),
+                merge: false
+            }
+        );
+        // Either language: another test may switch it meanwhile.
+        assert!(
+            [
+                "You stopped the sync of d. Keyman did not change it.",
+                "คุณหยุดการซิงก์ d แล้ว Keyman ไม่ได้เปลี่ยนโปรเจกต์นี้",
+            ]
+            .contains(&rows[1].reason.as_str()),
+            "{}",
+            rows[1].reason
+        );
+        assert!(
+            [
+                "The cloud has newer changes for g. Click Sync again.",
+                "คลาวด์มีการเปลี่ยนแปลงของ g ที่ใหม่กว่า กดซิงก์อีกครั้ง",
+            ]
+            .contains(&rows[2].reason.as_str()),
+            "{}",
+            rows[2].reason
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.merge).collect::<Vec<_>>(),
+            [false, false, false, true]
+        );
+        assert_eq!(rows[3].project, "f");
     }
 
     #[test]

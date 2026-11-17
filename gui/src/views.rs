@@ -78,6 +78,12 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
         root = root.child(
             scrim(p, "question-scrim").child(sheet.modal(false, |s: &mut App| s.cloud_cancel())),
         );
+    } else if let Some(sheet) = crate::resolve::cloud_resolve_dialog(s, p) {
+        // A cloud conflict: dismissing it is its Cancel, and the sync goes on.
+        root = root.child(
+            scrim(p, "question-scrim")
+                .child(sheet.modal(false, |s: &mut App| s.cloud_resolve_cancel())),
+        );
     }
     // Above the dialogs, so a notice from a cloud task (a wrong password) is not dimmed.
     if let Some(toast) = &s.toast {
@@ -208,6 +214,7 @@ fn titlebar(s: &App, p: Paint, cx: &mut Cx<App>) -> El {
             },
             |_, tx| tx.toggle_full_screen(),
         ))
+        .children(cloud_views::sync_button(s, p))
         .child(cloud_views::cloud_button(s, p))
         .child(icon_button(
             p,
@@ -1338,6 +1345,7 @@ fn dialog_view(s: &App, p: Paint, dialog: Dialog) -> El {
         Dialog::ConfirmSignOut => cloud_views::confirm_sign_out(p),
         Dialog::LinkPicker => cloud_views::link_picker_dialog(s, p),
         Dialog::ConfirmDelete => cloud_views::delete_dialog(s, p),
+        Dialog::SyncResults => cloud_views::sync_results_dialog(s, p),
         Dialog::Resolve => crate::resolve::resolve_dialog(s, p),
         Dialog::Panel => panel_dialog(s, p),
     };

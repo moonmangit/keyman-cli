@@ -14,13 +14,15 @@ use keyman_cli::cloud::account::{self, Prompt};
 use keyman_cli::cloud::groups;
 use keyman_cli::cloud::keystore::{self, Store, SystemStore};
 use keyman_cli::cloud::merge::Conflict;
-use keyman_cli::cloud::sync::{self, Resolver as CloudResolver, Vaults};
+use keyman_cli::cloud::sync::{
+    self, PullReport, PullResult, PushResult, Resolver as CloudResolver, Vaults,
+};
 use rune::{AppHandle, TextEdit};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::cloud_views;
 use crate::i18n::t;
-use crate::{App, Dialog, LinkPicker};
+use crate::{App, Dialog, LinkPicker, Pick, ResolveItem, SettingsPage};
 
 /// What a bridge question gives the library when the person cancels it.
 pub const CANCELLED: &str = "cancelled";
@@ -221,6 +223,10 @@ pub fn post(s: &mut App, question: Question) {
             busy.label = signing_in_label();
         }
         s.cloud_fields.clear();
+        s.cloud_picks = match &question.ask {
+            Ask::Resolve { conflicts, .. } => Some(CloudPicks::new(conflicts)),
+            _ => None,
+        };
         s.question = Some(question);
     }
 }
@@ -246,6 +252,7 @@ pub fn cancel(s: &mut App) {
     }
     // Dropped without an answer = Cancel for the waiting thread.
     s.question = None;
+    s.cloud_picks = None;
 }
 
 /// The library's `Prompt` and `Resolver` for a cloud task: each question becomes a dialog.
@@ -354,8 +361,12 @@ pub enum Done {
     },
     SignedOut,
     Toast(String),
-    #[expect(dead_code, reason = "the Sync action (a later step) makes it")]
     SyncFinished(SyncSummary),
+    /// The pull after **Merge** of `project`.
+    Merged {
+        project: String,
+        summary: SyncSummary,
+    },
     /// The person's groups, `(vault id, name)`, for the link picker.
     Groups(Vec<(String, String)>),
 }
@@ -374,12 +385,246 @@ pub struct SyncSummary {
 
 /// A project that needs the person after a sync.
 #[derive(Debug, Clone, PartialEq)]
-#[expect(dead_code, reason = "the Sync action (a later step) makes these")]
 pub enum Attention {
     Skipped { project: String, reason: String },
     Stopped { project: String, conflicts: usize },
     CloudIsNewer(String),
     CanMerge(String),
+}
+
+impl Attention {
+    pub fn project(&self) -> &str {
+        match self {
+            Attention::Skipped { project, .. } | Attention::Stopped { project, .. } => project,
+            Attention::CloudIsNewer(project) | Attention::CanMerge(project) => project,
+        }
+    }
+}
+
+/// The counts and the projects that need the person, from a pull and the push after it.
+/// A project is listed once: a push result for a project the pull listed already is left out.
+pub fn summarize(report: &PullReport, pushed: &[PushResult]) -> SyncSummary {
+    let mut summary = SyncSummary {
+        updated: 0,
+        added: Vec::new(),
+        sent: 0,
+        attention: Vec::new(),
+        given: report.given.clone(),
+        warnings: report.warnings.clone(),
+    };
+    for result in &report.results {
+        match result {
+            PullResult::Updated { .. } => summary.updated += 1,
+            PullResult::Added(project) => summary.added.push(project.clone()),
+            PullResult::UpToDate(_) => {}
+            PullResult::Stopped { project, conflicts } => {
+                summary.attention.push(Attention::Stopped {
+                    project: project.clone(),
+                    conflicts: *conflicts,
+                })
+            }
+            PullResult::Skipped { project, reason } => summary.attention.push(Attention::Skipped {
+                project: project.clone(),
+                reason: reason.clone(),
+            }),
+            PullResult::NameTaken { project } => {
+                summary.attention.push(Attention::CanMerge(project.clone()))
+            }
+        }
+    }
+    for result in pushed {
+        let attention = match result {
+            PushResult::Pushed { .. } => {
+                summary.sent += 1;
+                continue;
+            }
+            PushResult::UpToDate(_) => continue,
+            PushResult::CloudIsNewer(project) => Attention::CloudIsNewer(project.clone()),
+            PushResult::Skipped { project, reason } => Attention::Skipped {
+                project: project.clone(),
+                reason: reason.clone(),
+            },
+        };
+        if !summary
+            .attention
+            .iter()
+            .any(|listed| listed.project() == attention.project())
+        {
+            summary.attention.push(attention);
+        }
+    }
+    summary
+}
+
+/// Whether the **Sync results** dialog must open: a project needs the person, or a warning.
+pub fn needs_person(summary: &SyncSummary) -> bool {
+    !summary.attention.is_empty() || !summary.warnings.is_empty()
+}
+
+/// The toast after a sync, or `None` when the **Sync results** dialog must open.
+pub fn toast_text(summary: &SyncSummary) -> Option<String> {
+    toast_words(summary, crate::i18n::thai())
+}
+
+fn toast_words(summary: &SyncSummary, thai: bool) -> Option<String> {
+    if needs_person(summary) {
+        return None;
+    }
+    let mut text = counts_words(summary, thai);
+    for (group, email) in &summary.given {
+        text.push('\n');
+        text.push_str(&given_words(group, email, thai));
+    }
+    Some(text)
+}
+
+/// "2 updated, 1 added, 1 sent." with the zero parts left out, or "All projects are up to date."
+pub fn counts_text(summary: &SyncSummary) -> String {
+    counts_words(summary, crate::i18n::thai())
+}
+
+fn counts_words(summary: &SyncSummary, thai: bool) -> String {
+    let parts: Vec<String> = [
+        (summary.updated, "updated", "อัปเดต"),
+        (summary.added.len(), "added", "เพิ่ม"),
+        (summary.sent, "sent", "ส่ง"),
+    ]
+    .into_iter()
+    .filter(|(n, ..)| *n > 0)
+    .map(|(n, en, th)| {
+        if thai {
+            format!("{th} {n} โปรเจกต์")
+        } else {
+            format!("{n} {en}")
+        }
+    })
+    .collect();
+    match (parts.is_empty(), thai) {
+        (true, false) => "All projects are up to date.".to_owned(),
+        (true, true) => "ทุกโปรเจกต์เป็นปัจจุบันแล้ว".to_owned(),
+        (false, false) => format!("{}.", parts.join(", ")),
+        (false, true) => parts.join(", "),
+    }
+}
+
+/// The line for an invited person who got access to a group.
+pub fn given_line(group: &str, email: &str) -> String {
+    given_words(group, email, crate::i18n::thai())
+}
+
+fn given_words(group: &str, email: &str, thai: bool) -> String {
+    if thai {
+        format!("ให้ {email} เข้าถึง {group} แล้ว")
+    } else {
+        format!("Gave {email} access to {group}.")
+    }
+}
+
+/// The open results after **Merge** of `project`: its row goes, and what the merge found is
+/// added.
+pub fn merge_into(mut results: SyncSummary, project: &str, merged: SyncSummary) -> SyncSummary {
+    results
+        .attention
+        .retain(|listed| listed.project() != project);
+    results.updated += merged.updated;
+    results.sent += merged.sent;
+    results.added.extend(merged.added);
+    results.attention.extend(merged.attention);
+    results.given.extend(merged.given);
+    results.warnings.extend(merged.warnings);
+    results
+}
+
+/// The text after a sign-in that the server does not accept now.
+pub fn sign_in_rejected_text() -> &'static str {
+    t(
+        "Your sign-in is not valid now. Sign in again.",
+        "การลงชื่อเข้าใช้นี้ใช้ไม่ได้แล้ว ลงชื่อเข้าใช้อีกครั้ง",
+    )
+}
+
+/// A cloud task failed: back to idle, then tell the person. A sign-in that the server does
+/// not accept signs the app out and opens Settings › Account. A cancel shows nothing.
+pub fn after_failure(s: &mut App, error: &str) {
+    s.busy = None;
+    drop_question(s);
+    if error == CANCELLED || error == account::SIGN_IN_CANCELLED {
+        return;
+    }
+    if error == account::SIGN_IN_INVALID {
+        s.cloud = CloudState::SignedOut;
+        s.close_dialog();
+        s.dialog = Some(Dialog::Settings(SettingsPage::Account));
+        s.fail(sign_in_rejected_text());
+    } else {
+        s.fail(app_wording(error));
+    }
+}
+
+/// Removes the open question (the waiting thread gets `Cancel`) and everything typed for it.
+fn drop_question(s: &mut App) {
+    s.question = None;
+    s.cloud_fields.clear();
+    s.cloud_picks = None;
+}
+
+/// The choices of the cloud conflict dialog. The values are secrets: they are wiped when the
+/// picks are dropped (after the answer, a cancel, or the end of the task).
+pub struct CloudPicks {
+    /// `conflict.master` is the value on this computer, `conflict.env` the cloud value;
+    /// `Pick::Master` keeps this computer's, `Pick::Env` the cloud's.
+    pub items: Vec<ResolveItem>,
+    pub reveal: bool,
+}
+
+impl CloudPicks {
+    pub fn new(conflicts: &[Conflict]) -> CloudPicks {
+        let items = conflicts
+            .iter()
+            .map(|conflict| {
+                let start = conflict
+                    .cloud
+                    .as_deref()
+                    .or(conflict.local.as_deref())
+                    .unwrap_or_default();
+                ResolveItem {
+                    conflict: crate::core::Conflict {
+                        name: conflict.name.clone(),
+                        master: conflict.local.clone(),
+                        env: conflict.cloud.clone(),
+                    },
+                    pick: Pick::Master,
+                    edit: TextEdit::new(start).secure(),
+                }
+            })
+            .collect();
+        CloudPicks {
+            items,
+            reveal: false,
+        }
+    }
+
+    /// One choice per conflict (`None` removes the variable). Typed text is moved out.
+    fn choices(&mut self) -> Vec<Option<String>> {
+        self.items
+            .iter_mut()
+            .map(|item| match item.pick {
+                Pick::Master => item.conflict.master.clone(),
+                Pick::Env => item.conflict.env.clone(),
+                Pick::Edit => Some(std::mem::take(&mut item.edit.text)),
+            })
+            .collect()
+    }
+}
+
+impl Drop for CloudPicks {
+    fn drop(&mut self) {
+        for item in &mut self.items {
+            item.conflict.master.zeroize();
+            item.conflict.env.zeroize();
+            item.edit.clear();
+        }
+    }
 }
 
 /// The cloud state at app start: local data only, no network.
@@ -466,8 +711,7 @@ fn start_with<U: Ui + Clone>(
 fn finish(s: &mut App, cloud: Option<CloudState>, result: Result<Done, String>) {
     s.busy = None;
     // Drops a question that is still open, so no dialog stays after its task.
-    s.question = None;
-    s.cloud_fields.clear();
+    drop_question(s);
     if let Some(cloud) = cloud {
         s.cloud = cloud;
     }
@@ -486,9 +730,7 @@ fn finish(s: &mut App, cloud: Option<CloudState>, result: Result<Done, String>) 
     s.reload();
     match result {
         Ok(done) => apply(s, done),
-        // The person stopped the task: no error to show.
-        Err(error) if error == CANCELLED || error == account::SIGN_IN_CANCELLED => {}
-        Err(error) => s.fail(app_wording(&error)),
+        Err(error) => after_failure(s, &error),
     }
 }
 
@@ -523,13 +765,11 @@ fn apply(s: &mut App, done: Done) {
             ));
         }
         Done::Toast(text) => s.ok(text),
-        Done::SyncFinished(summary) => s.ok(tf!(
-            "Sync finished: {} updated, {} added, {} sent.",
-            "ซิงก์เสร็จแล้ว: อัปเดต {} เพิ่ม {} ส่ง {}",
-            summary.updated,
-            summary.added.len(),
-            summary.sent
-        )),
+        Done::SyncFinished(summary) => match toast_text(&summary) {
+            Some(text) => s.ok(text),
+            None => show_results(s, summary),
+        },
+        Done::Merged { project, summary } => merged(s, &project, summary),
         // The link picker was open while they loaded.
         Done::Groups(groups) => {
             if let Some(picker) = &mut s.link_picker {
@@ -537,6 +777,57 @@ fn apply(s: &mut App, done: Done) {
             }
         }
     }
+}
+
+/// Opens the **Sync results** dialog.
+fn show_results(s: &mut App, summary: SyncSummary) {
+    s.close_dialog();
+    s.sync_results = Some(summary);
+    s.dialog = Some(Dialog::SyncResults);
+}
+
+/// After **Merge**: the open results lose the project's row and get what the merge found.
+/// When nothing more needs the person, the dialog closes.
+fn merged(s: &mut App, project: &str, mut summary: SyncSummary) {
+    let open = if s.dialog == Some(Dialog::SyncResults) {
+        s.sync_results.take()
+    } else {
+        None
+    };
+    // A clean merge says so in a toast, with the access it gave; else the dialog lists it.
+    let clean = !needs_person(&summary);
+    let given = if clean {
+        std::mem::take(&mut summary.given)
+    } else {
+        Vec::new()
+    };
+    let next = match open {
+        Some(results) => merge_into(results, project, summary),
+        None => summary,
+    };
+    if needs_person(&next) {
+        s.sync_results = Some(next);
+        s.dialog = Some(Dialog::SyncResults);
+    } else if s.dialog == Some(Dialog::SyncResults) {
+        s.close_dialog();
+    }
+    if clean {
+        let mut text = tf!(
+            "Keyman merged {} with the cloud copy.",
+            "Keyman รวม {} กับสำเนาบนคลาวด์แล้ว",
+            project
+        );
+        for (group, email) in &given {
+            text.push('\n');
+            text.push_str(&given_line(group, email));
+        }
+        s.ok(text);
+    }
+}
+
+/// The busy label while **Sync** runs.
+pub fn syncing_label() -> &'static str {
+    t("Syncing…", "กำลังซิงก์…")
 }
 
 /// The email of the sign-in that this computer saved, as the task's result.
@@ -696,6 +987,74 @@ impl App {
                 project
             )))
         });
+    }
+
+    /// **Sync**: pull every project (this adds new cloud projects), then push.
+    pub fn cloud_sync(&mut self) {
+        if !matches!(self.cloud, CloudState::SignedIn { .. }) {
+            return;
+        }
+        start(self, syncing_label(), |bridge, home| {
+            let u = account::session(home, &SystemStore::new(), bridge)?;
+            let report = sync::pull(home, &u, None, None, bridge)?;
+            // Cancel was clicked during the pull: do not send anything.
+            if bridge.cancelled() {
+                return Err(CANCELLED.to_owned());
+            }
+            let pushed = sync::push(home, &u, None)?;
+            Ok(Done::SyncFinished(summarize(&report, &pushed)))
+        });
+    }
+
+    /// **Merge** in the Sync results: pull the cloud project into the local project with the
+    /// same name (`keyman pull <project>`).
+    pub fn cloud_merge(&mut self, project: &str) {
+        let project = project.to_owned();
+        let label = t("Merging…", "กำลังรวม…");
+        start(self, label, move |bridge, home| {
+            let u = account::session(home, &SystemStore::new(), bridge)?;
+            let report = sync::pull(home, &u, Some(&project), None, bridge)?;
+            Ok(Done::Merged {
+                summary: summarize(&report, &[]),
+                project,
+            })
+        });
+    }
+
+    /// **Apply** in the cloud conflict dialog: one choice per conflict. The picks are wiped.
+    pub fn cloud_resolve_apply(&mut self) {
+        let Some(mut picks) = self.cloud_picks.take() else {
+            return;
+        };
+        if matches!(
+            self.question.as_ref().map(|q| &q.ask),
+            Some(Ask::Resolve { .. })
+        ) && let Some(question) = self.question.take()
+        {
+            question.answer(Reply::Choices(picks.choices()));
+        }
+    }
+
+    /// **Cancel** in the cloud conflict dialog: Keyman changes nothing for this project, and
+    /// the sync goes on with the others.
+    pub fn cloud_resolve_cancel(&mut self) {
+        self.cloud_picks = None;
+        if matches!(
+            self.question.as_ref().map(|q| &q.ask),
+            Some(Ask::Resolve { .. })
+        ) && let Some(question) = self.question.take()
+        {
+            question.answer(Reply::Cancel);
+        }
+    }
+
+    /// The typed value of conflict `i` in the cloud conflict dialog.
+    pub fn cloud_pick_edit(&mut self, i: usize) -> &mut TextEdit {
+        if self.cloud_picks.as_ref().is_some_and(|p| i < p.items.len()) {
+            &mut self.cloud_picks.as_mut().expect("checked above").items[i].edit
+        } else {
+            &mut self.scratch
+        }
     }
 
     /// Stops the running cloud task; an open question gets `Cancel`.
@@ -1194,6 +1553,337 @@ mod tests {
         // No match: the dialog stays and no task starts.
         assert_eq!(app.dialog, Some(Dialog::ConfirmDelete));
         assert!(app.busy.is_none() && app.toast.is_none());
+    }
+
+    fn summary(updated: usize, added: &[&str], sent: usize) -> SyncSummary {
+        SyncSummary {
+            updated,
+            added: added.iter().map(|name| (*name).to_owned()).collect(),
+            sent,
+            attention: Vec::new(),
+            given: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn summarize_counts_and_attention() {
+        let report = PullReport {
+            results: vec![
+                PullResult::Updated {
+                    project: "a".into(),
+                    changes: 2,
+                },
+                PullResult::Added("b".into()),
+                PullResult::UpToDate("c".into()),
+                PullResult::Stopped {
+                    project: "d".into(),
+                    conflicts: 1,
+                },
+                PullResult::Skipped {
+                    project: "e".into(),
+                    reason: "why".into(),
+                },
+                PullResult::NameTaken {
+                    project: "f".into(),
+                },
+            ],
+            given: vec![("team".into(), "x@y.z".into())],
+            warnings: vec!["warn".into()],
+        };
+        let pushed = [
+            PushResult::Pushed {
+                project: "a".into(),
+                version: 3,
+            },
+            PushResult::CloudIsNewer("g".into()),
+        ];
+        let got = summarize(&report, &pushed);
+        assert_eq!(got.updated, 1);
+        assert_eq!(got.added, vec!["b".to_string()]);
+        assert_eq!(got.sent, 1);
+        assert_eq!(
+            got.attention,
+            vec![
+                Attention::Stopped {
+                    project: "d".into(),
+                    conflicts: 1
+                },
+                Attention::Skipped {
+                    project: "e".into(),
+                    reason: "why".into()
+                },
+                Attention::CanMerge("f".into()),
+                Attention::CloudIsNewer("g".into()),
+            ]
+        );
+        assert_eq!(got.given, report.given);
+        assert_eq!(got.warnings, report.warnings);
+
+        // A project the pull stopped is listed once, not again for the push.
+        let stopped = PullReport {
+            results: vec![PullResult::Stopped {
+                project: "d".into(),
+                conflicts: 2,
+            }],
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let again = summarize(&stopped, &[PushResult::CloudIsNewer("d".into())]);
+        assert_eq!(again.attention.len(), 1);
+    }
+
+    #[test]
+    fn toast_text_rules() {
+        assert_eq!(
+            toast_words(&summary(0, &[], 0), false).as_deref(),
+            Some("All projects are up to date.")
+        );
+        assert_eq!(
+            toast_words(&summary(2, &["n"], 1), false).as_deref(),
+            Some("2 updated, 1 added, 1 sent.")
+        );
+        // Zero parts are left out.
+        assert_eq!(
+            toast_words(&summary(0, &["n", "m"], 0), false).as_deref(),
+            Some("2 added.")
+        );
+        assert_eq!(
+            toast_words(&summary(1, &[], 3), false).as_deref(),
+            Some("1 updated, 3 sent.")
+        );
+        assert_eq!(
+            toast_words(&summary(0, &[], 0), true).as_deref(),
+            Some("ทุกโปรเจกต์เป็นปัจจุบันแล้ว")
+        );
+        assert_eq!(
+            toast_words(&summary(2, &["n"], 1), true).as_deref(),
+            Some("อัปเดต 2 โปรเจกต์, เพิ่ม 1 โปรเจกต์, ส่ง 1 โปรเจกต์")
+        );
+        // Access given to invited people goes in the toast too.
+        let mut given = summary(0, &[], 0);
+        given.given.push(("team".into(), "x@y.z".into()));
+        assert_eq!(
+            toast_words(&given, false).as_deref(),
+            Some("All projects are up to date.\nGave x@y.z access to team.")
+        );
+        // Anything that needs the person opens the dialog instead.
+        let mut attention = summary(2, &["n"], 1);
+        attention
+            .attention
+            .push(Attention::CloudIsNewer("g".into()));
+        assert_eq!(toast_words(&attention, false), None);
+        let mut warned = summary(0, &[], 0);
+        warned.warnings.push("warn".into());
+        assert_eq!(toast_words(&warned, false), None);
+    }
+
+    const REJECTED: [&str; 2] = [
+        "Your sign-in is not valid now. Sign in again.",
+        "การลงชื่อเข้าใช้นี้ใช้ไม่ได้แล้ว ลงชื่อเข้าใช้อีกครั้ง",
+    ];
+
+    #[test]
+    fn rejected_sign_in_signs_out() {
+        let mut app = App::for_tests();
+        app.cloud = CloudState::SignedIn {
+            email: "a@b.c".into(),
+        };
+        app.busy = busy("Syncing…");
+        let (waiting, question) = waiting_thread(Ask::Password { tries_left: 3 });
+        app.question = Some(question);
+        after_failure(&mut app, account::SIGN_IN_INVALID);
+        assert_eq!(app.cloud, CloudState::SignedOut);
+        assert_eq!(
+            app.dialog,
+            Some(Dialog::Settings(crate::SettingsPage::Account))
+        );
+        let toast = app.toast.as_ref().unwrap();
+        assert!(REJECTED.contains(&toast.text.as_str()), "{}", toast.text);
+        assert!(app.busy.is_none() && app.question.is_none());
+        assert_eq!(waiting.join().unwrap(), Reply::Cancel);
+
+        // `finish` takes the same way for every task.
+        let mut app = App::for_tests();
+        app.cloud = CloudState::SignedIn {
+            email: "a@b.c".into(),
+        };
+        app.busy = busy("Linking…");
+        finish(&mut app, None, Err(account::SIGN_IN_INVALID.into()));
+        assert_eq!(app.cloud, CloudState::SignedOut);
+        assert_eq!(
+            app.dialog,
+            Some(Dialog::Settings(crate::SettingsPage::Account))
+        );
+    }
+
+    #[test]
+    fn a_failed_task_returns_to_idle() {
+        let mut app = App::for_tests();
+        let signed_in = CloudState::SignedIn {
+            email: "a@b.c".into(),
+        };
+        app.cloud = signed_in.clone();
+        app.busy = busy("Syncing…");
+        let (waiting, question) = waiting_thread(Ask::Password { tries_left: 3 });
+        app.question = Some(question);
+        let error = "Keyman cannot connect to Keyman Cloud.";
+        after_failure(&mut app, error);
+        assert!(app.busy.is_none() && app.question.is_none());
+        assert_eq!(app.cloud, signed_in);
+        assert!(app.dialog.is_none());
+        let toast = app.toast.as_ref().unwrap();
+        assert!(!toast.ok && toast.text == error);
+        assert_eq!(waiting.join().unwrap(), Reply::Cancel);
+
+        // A cancel shows no error.
+        app.toast = None;
+        app.busy = busy("Syncing…");
+        after_failure(&mut app, CANCELLED);
+        assert!(app.busy.is_none() && app.toast.is_none());
+    }
+
+    fn resolve_ask() -> Ask {
+        Ask::Resolve {
+            project: "app".into(),
+            conflicts: vec![
+                conflict(),
+                Conflict {
+                    name: "GONE".into(),
+                    local: Some("old".into()),
+                    cloud: None,
+                },
+                Conflict {
+                    name: "TYPED".into(),
+                    local: Some("x".into()),
+                    cloud: Some("y".into()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_cloud_choice_answers_and_wipes_the_picks() {
+        let mut app = App::for_tests();
+        app.busy = busy("Syncing…");
+        let (waiting, question) = waiting_thread(resolve_ask());
+        post(&mut app, question);
+        let picks = app.cloud_picks.as_mut().expect("picks for a conflict");
+        assert_eq!(picks.items.len(), 3);
+        assert!(!picks.reveal, "values are hidden until revealed");
+        picks.items[0].pick = Pick::Env;
+        picks.items[1].pick = Pick::Env;
+        picks.items[2].pick = Pick::Edit;
+        app.cloud_pick_edit(2).replace_text("typed");
+        app.cloud_resolve_apply();
+        assert!(app.question.is_none() && app.cloud_picks.is_none());
+        assert_eq!(
+            waiting.join().unwrap(),
+            Reply::Choices(vec![Some("b".into()), None, Some("typed".into())])
+        );
+        // The answer does not stop the task.
+        assert!(!app.busy.as_ref().unwrap().cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancel_in_the_cloud_resolver_stops_only_that_project() {
+        let mut app = App::for_tests();
+        app.busy = busy("Syncing…");
+        let (waiting, question) = waiting_thread(resolve_ask());
+        post(&mut app, question);
+        app.cloud_picks.as_mut().unwrap().items[0].pick = Pick::Edit;
+        app.cloud_pick_edit(0).replace_text("typed");
+        app.cloud_resolve_cancel();
+        assert!(app.question.is_none() && app.cloud_picks.is_none());
+        assert_eq!(waiting.join().unwrap(), Reply::Cancel);
+        assert!(!app.busy.as_ref().unwrap().cancel.load(Ordering::SeqCst));
+
+        // The task's Cancel and its end also drop the picks.
+        let (waiting, question) = waiting_thread(resolve_ask());
+        post(&mut app, question);
+        app.cloud_cancel();
+        assert!(app.cloud_picks.is_none());
+        assert_eq!(waiting.join().unwrap(), Reply::Cancel);
+        app.busy = busy("Syncing…");
+        let (waiting, question) = waiting_thread(resolve_ask());
+        post(&mut app, question);
+        finish(&mut app, None, Err("boom".into()));
+        assert!(app.cloud_picks.is_none());
+        assert_eq!(waiting.join().unwrap(), Reply::Cancel);
+    }
+
+    #[test]
+    fn a_sync_opens_the_results_only_when_needed() {
+        let mut app = App::for_tests();
+        app.busy = busy("Syncing…");
+        finish(&mut app, None, Ok(Done::SyncFinished(summary(1, &[], 0))));
+        assert!(app.dialog.is_none() && app.sync_results.is_none());
+        assert!(app.toast.as_ref().is_some_and(|toast| toast.ok));
+
+        let mut needs = summary(0, &["new"], 0);
+        needs.attention.push(Attention::CanMerge("f".into()));
+        needs.given.push(("team".into(), "x@y.z".into()));
+        app.toast = None;
+        app.busy = busy("Syncing…");
+        finish(&mut app, None, Ok(Done::SyncFinished(needs.clone())));
+        assert_eq!(app.dialog, Some(Dialog::SyncResults));
+        assert_eq!(app.sync_results.as_ref(), Some(&needs));
+        // The invite lines are in the dialog, not also in a toast.
+        assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn merge_updates_or_closes_the_results() {
+        let mut open = summary(0, &[], 0);
+        open.attention = vec![
+            Attention::CanMerge("f".into()),
+            Attention::CloudIsNewer("g".into()),
+        ];
+        let mut stopped = summary(0, &[], 0);
+        stopped.attention.push(Attention::Stopped {
+            project: "f".into(),
+            conflicts: 1,
+        });
+        let next = merge_into(open.clone(), "f", stopped);
+        assert_eq!(
+            next.attention,
+            vec![
+                Attention::CloudIsNewer("g".into()),
+                Attention::Stopped {
+                    project: "f".into(),
+                    conflicts: 1
+                },
+            ]
+        );
+
+        // A clean merge with another row left: the row goes, the dialog stays.
+        let mut app = App::for_tests();
+        app.sync_results = Some(open.clone());
+        app.dialog = Some(Dialog::SyncResults);
+        app.busy = busy("Merging…");
+        let done = Done::Merged {
+            project: "f".into(),
+            summary: summary(1, &[], 0),
+        };
+        finish(&mut app, None, Ok(done));
+        assert_eq!(app.dialog, Some(Dialog::SyncResults));
+        assert_eq!(
+            app.sync_results.as_ref().unwrap().attention,
+            vec![Attention::CloudIsNewer("g".into())]
+        );
+        assert!(app.toast.as_ref().is_some_and(|toast| toast.ok));
+
+        // The last row: the dialog closes.
+        let mut only = summary(0, &[], 0);
+        only.attention.push(Attention::CanMerge("f".into()));
+        app.sync_results = Some(only);
+        app.busy = busy("Merging…");
+        let done = Done::Merged {
+            project: "f".into(),
+            summary: summary(1, &[], 0),
+        };
+        finish(&mut app, None, Ok(done));
+        assert!(app.dialog.is_none() && app.sync_results.is_none());
     }
 
     #[test]

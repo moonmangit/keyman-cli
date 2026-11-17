@@ -30,7 +30,7 @@ use rune::{
     App as RuneApp, AppHandle, AppSpec, FileDialogOptions, Key, KeyEvent, TextEdit, Titlebar, Tx,
 };
 
-use crate::cloud::{Ask, Busy, CloudState, Question};
+use crate::cloud::{Ask, Attention, Busy, CloudState, Question};
 use crate::core::{Conflict, DiffLine, FolderStatus, Master, SavePreview};
 use crate::i18n::{count, t};
 use crate::settings::Settings;
@@ -67,6 +67,8 @@ pub enum Dialog {
     LinkPicker,
     /// Type the project name to delete it from the cloud (`App::delete_confirm`).
     ConfirmDelete,
+    /// What a **Sync** found that needs the person (`App::sync_results`).
+    SyncResults,
     Resolve,
     /// The compare or save-to-master preview in `App::panel`.
     Panel,
@@ -171,6 +173,10 @@ pub struct App {
     pub delete_typed: TextEdit,
     /// The project page's ⋯ menu.
     pub project_menu: Option<MenuAt>,
+    /// The **Sync results** dialog's content.
+    pub sync_results: Option<cloud::SyncSummary>,
+    /// The choices of the open cloud conflict question; wiped after the answer.
+    pub cloud_picks: Option<cloud::CloudPicks>,
 }
 
 impl App {
@@ -233,6 +239,8 @@ impl App {
             delete_confirm: None,
             delete_typed: TextEdit::new(""),
             project_menu: None,
+            sync_results: None,
+            cloud_picks: None,
         }
     }
 
@@ -416,6 +424,7 @@ impl App {
         self.link_picker = None;
         self.delete_confirm = None;
         self.delete_typed.replace_text("");
+        self.sync_results = None;
         // The Account page opens on its sign-in buttons next time.
         self.recover_pick = false;
     }
@@ -883,9 +892,17 @@ pub fn open_link(s: &mut App, tx: &mut Tx, url: &str) {
 
 /// App-wide shortcuts. ⌘ on macOS, Ctrl on Windows.
 fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
-    // A cloud question is above every dialog: Escape cancels its task.
+    // A cloud question is above every dialog: Escape cancels it. For a cloud conflict, that
+    // is the dialog's Cancel (nothing changes for that project); else it stops the task.
     if ev.key == Key::Escape && s.question.is_some() {
-        s.cloud_cancel();
+        if matches!(
+            s.question.as_ref().map(|q| &q.ask),
+            Some(Ask::Resolve { .. })
+        ) {
+            s.cloud_resolve_cancel();
+        } else {
+            s.cloud_cancel();
+        }
         return true;
     }
     if ev.key == Key::Escape && s.project_menu.is_some() {
@@ -983,6 +1000,67 @@ fn cloud_project(s: &mut App, status: Option<LinkStatus>) {
             _ => LinkStatus::Synced,
         };
         s.link_status.push((other.clone(), status));
+    }
+}
+
+/// Signed in, for the cloud scenes.
+fn signed_in(s: &mut App) {
+    s.cloud = CloudState::SignedIn {
+        email: "dana@example.com".into(),
+    };
+}
+
+/// The **Sync results** dialog with one project of each kind.
+fn sync_results(s: &mut App) {
+    signed_in(s);
+    s.sync_results = Some(cloud::SyncSummary {
+        updated: 1,
+        added: vec!["billing-api".into()],
+        sent: 1,
+        attention: vec![
+            Attention::Stopped {
+                project: "my-app".into(),
+                conflicts: 2,
+            },
+            Attention::Skipped {
+                project: "web".into(),
+                reason: "The master file changed while Keyman worked. Keyman did not write anything. Run 'keyman pull' again.".into(),
+            },
+            Attention::CloudIsNewer("worker".into()),
+            Attention::CanMerge("payments".into()),
+        ],
+        given: vec![("Backend team".into(), "sam@example.com".into())],
+        warnings: vec!["Keyman cannot give lee@example.com access to Design now.".into()],
+    });
+    s.dialog = Some(Dialog::SyncResults);
+}
+
+/// A cloud conflict during **Sync**: the second keeps the cloud value, the third is typed.
+fn cloud_resolve(s: &mut App) {
+    use keyman_cli::cloud::merge::Conflict as CloudConflict;
+    signed_in(s);
+    s.busy = Some(Busy::new(cloud::syncing_label()));
+    let conflict = |name: &str, local: Option<&str>, cloud: Option<&str>| CloudConflict {
+        name: name.into(),
+        local: local.map(Into::into),
+        cloud: cloud.map(Into::into),
+    };
+    let ask = Ask::Resolve {
+        project: "my-app".into(),
+        conflicts: vec![
+            conflict(
+                "DATABASE_URL",
+                Some("postgres://localhost/app"),
+                Some("postgres://db.internal/app"),
+            ),
+            conflict("API_KEY", None, Some("sk-live-2f9c")),
+            conflict("DEBUG", Some("true"), Some("false")),
+        ],
+    };
+    cloud::post(s, Question::unanswered(ask));
+    if let Some(picks) = &mut s.cloud_picks {
+        picks.items[1].pick = Pick::Env;
+        picks.items[2].pick = Pick::Edit;
     }
 }
 
@@ -1149,6 +1227,27 @@ fn main() {
                 s.delete_typed.replace_text(&name);
                 s.delete_confirm = Some(name);
                 s.dialog = Some(Dialog::ConfirmDelete);
+            }),
+            ("cloud-sync-busy", |s| {
+                english(s);
+                signed_in(s);
+                s.busy = Some(Busy::new(cloud::syncing_label()));
+            }),
+            ("cloud-sync-results", |s| {
+                english(s);
+                sync_results(s);
+            }),
+            ("cloud-resolve", |s| {
+                english(s);
+                cloud_resolve(s);
+            }),
+            ("th-cloud-sync-results", |s| {
+                thai(s);
+                sync_results(s);
+            }),
+            ("th-cloud-resolve", |s| {
+                thai(s);
+                cloud_resolve(s);
             }),
             ("th-cloud-link-picker", |s| {
                 thai(s);
