@@ -328,14 +328,76 @@ pub fn login(
     provider: &str,
     prompt: &mut dyn Prompt,
 ) -> Result<LoginOutcome, String> {
+    let session = auth::sign_in_with_browser(&config(), provider)?;
+    login_with_session(home, store, &session, prompt)
+}
+
+/// `login` after the sign-in step: the caller already has a session (the
+/// end-to-end tests sign in with a password).
+pub fn login_with_session(
+    home: &Path,
+    store: &dyn Store,
+    session: &Session,
+    prompt: &mut dyn Prompt,
+) -> Result<LoginOutcome, String> {
     let cfg = config();
-    let session = auth::sign_in_with_browser(&cfg, provider)?;
     let api = Api::new(cfg.clone(), session.clone());
-    let result = finish_login(home, store, &api, &session, prompt);
+    let result = finish_login(home, store, &api, session, prompt);
     if result.is_err() {
-        let _ = api::sign_out(&cfg, &session);
+        let _ = api::sign_out(&cfg, session);
     }
     result
+}
+
+/// Answers the setup questions with one password and confirms the recovery
+/// code that setup shows.
+struct SetupAnswers {
+    password: Zeroizing<String>,
+    code: Option<Zeroizing<String>>,
+}
+
+impl Prompt for SetupAnswers {
+    fn new_password(&mut self) -> Result<String, String> {
+        Ok(self.password.to_string())
+    }
+    fn password(&mut self) -> Result<String, String> {
+        Ok(self.password.to_string())
+    }
+    fn recovery_code(&mut self) -> Result<String, String> {
+        self.code
+            .as_ref()
+            .map(|code| code.to_string())
+            .ok_or_else(|| CODE_MISMATCH.to_string())
+    }
+    fn show_recovery_code(&mut self, code: &str) -> Result<(), String> {
+        self.code = Some(Zeroizing::new(code.to_string()));
+        Ok(())
+    }
+}
+
+/// Set up a new account with no questions, for the end-to-end tests. It
+/// saves the session and the key like `login`. Returns the key pair and the
+/// recovery code.
+pub fn setup_with(
+    home: &Path,
+    store: &dyn Store,
+    session: &Session,
+    password: &str,
+    params: KdfParams,
+) -> Result<(KeyPair, String), String> {
+    let api = Api::new(config(), session.clone());
+    let mut answers = SetupAnswers {
+        password: Zeroizing::new(password.to_string()),
+        code: None,
+    };
+    let pair = setup_profile(&api, &mut answers, params)?;
+    store_session(home, store, session)?;
+    remember_key(store, &session.user_id, &pair)?;
+    let code = answers
+        .code
+        .map(|code| code.to_string())
+        .unwrap_or_default();
+    Ok((pair, code))
 }
 
 fn finish_login(

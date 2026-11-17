@@ -1,9 +1,10 @@
 //! Server settings. Environment variables override the built-in values.
 
-/// Built-in server address (set before release).
-pub const DEFAULT_URL: &str = "https://YOUR-PROJECT.supabase.co";
-/// Built-in public (publishable) API key (set before release).
-pub const DEFAULT_KEY: &str = "YOUR-PUBLISHABLE-KEY";
+/// Built-in server address (the hosted Keyman project).
+pub const DEFAULT_URL: &str = "https://ukcjavxqyfjklagzkuzg.supabase.co";
+/// Built-in public (publishable) API key. It is safe to publish: row level security
+/// protects the data, and the data is encrypted on the computer before upload.
+pub const DEFAULT_KEY: &str = "sb_publishable_Rnllk6qk9z5DR7p4LvihiA_bIkos3o3";
 
 #[derive(Clone, Debug)]
 pub struct Config {
