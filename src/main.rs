@@ -21,7 +21,7 @@ use std::process::{self, Command};
 use cli::Parsed;
 use master::{home_dir, read_master, Variables};
 use save::Edit;
-use ui::{accent, bold, dim, display_path, green, plural, red, yellow};
+use ui::{accent, bold, dim, display_path, green, plural, red, safe_text, yellow};
 
 enum Outcome {
     Print(String),
@@ -196,19 +196,26 @@ fn push_command(given: Option<&OsString>) -> Result<Outcome, String> {
         .map(|result| match result {
             PushResult::Pushed { project, version } => ui::success(&format!(
                 "Sent {} {}",
-                accent(project),
+                accent(&safe_text(project)),
                 dim(&format!("(version {version})"))
             )),
-            PushResult::UpToDate(project) => dim(&format!("  {project} is up to date")),
+            PushResult::UpToDate(project) => {
+                dim(&format!("  {} is up to date", safe_text(project)))
+            }
             PushResult::CloudIsNewer(project) => {
                 code = 1;
                 red(&format!(
-                    "The cloud has newer changes for {project}. Run 'keyman pull' first."
+                    "The cloud has newer changes for {}. Run 'keyman pull' first.",
+                    safe_text(project)
                 ))
             }
             PushResult::Skipped { project, reason } => {
                 code = 1;
-                yellow(&format!("Skipped {project}. {reason}"))
+                yellow(&format!(
+                    "Skipped {}. {}",
+                    safe_text(project),
+                    safe_lines(reason)
+                ))
             }
         })
         .collect();
@@ -262,21 +269,30 @@ fn pull_command(given: Option<&OsString>, flags: &cli::Flags) -> Result<Outcome,
         .map(|result| match result {
             PullResult::Updated { project, changes } => ui::success(&format!(
                 "Updated {} {}",
-                accent(project),
+                accent(&safe_text(project)),
                 dim(&format!("({})", plural(*changes, "change")))
             )),
-            PullResult::Added(project) => ui::success(&format!("Added {}", accent(project))),
-            PullResult::UpToDate(project) => dim(&format!("  {project} is up to date")),
+            PullResult::Added(project) => {
+                ui::success(&format!("Added {}", accent(&safe_text(project))))
+            }
+            PullResult::UpToDate(project) => {
+                dim(&format!("  {} is up to date", safe_text(project)))
+            }
             PullResult::Stopped { project, conflicts } => {
                 code = 1;
                 red(&format!(
-                    "Pull stopped: {} in {project}. Run 'keyman pull' in a terminal, or add --keep-local or --keep-cloud.",
-                    plural(*conflicts, "conflict")
+                    "Pull stopped: {} in {}. Run 'keyman pull' in a terminal, or add --keep-local or --keep-cloud.",
+                    plural(*conflicts, "conflict"),
+                    safe_text(project)
                 ))
             }
             PullResult::Skipped { project, reason } => {
                 code = 1;
-                yellow(&format!("Skipped {project}. {reason}"))
+                yellow(&format!(
+                    "Skipped {}. {}",
+                    safe_text(project),
+                    safe_lines(reason)
+                ))
             }
         })
         .collect();
@@ -346,10 +362,10 @@ Use 'keyman group create', 'invite', 'remove', 'list' or 'delete'.",
                 } else {
                     format!("all {projects} projects")
                 };
-                println!(
+                eprintln!(
                     "Keyman makes a new group key and encrypts {encrypted} again. {shown} keeps the data that they got before."
                 );
-                println!("Type the email address to confirm:");
+                eprintln!("Type the email address to confirm:");
                 if read_answer()?.to_lowercase() != shown {
                     return Err(
                         "The email address is not the same. Keyman did not remove anyone."
@@ -397,7 +413,7 @@ Use 'keyman group create', 'invite', 'remove', 'list' or 'delete'.",
         "delete" => {
             let vaults = sync::Vaults::load(&unlocked)?;
             let vault_id = groups::check_delete(&unlocked, &vaults, &group)?;
-            println!(
+            eprintln!(
                 "Delete the group {group} and all its projects from the cloud for all members? Type the group name to confirm:"
             );
             if read_answer()? != group {
@@ -452,8 +468,9 @@ fn cloud_command(action: &str, given: Option<&OsString>) -> Result<Outcome, Stri
                     "Project '{project}' is not linked. Run 'keyman cloud status' to see the links."
                 ));
             }
-            println!(
-                "Delete {project} from the cloud for all members? Type the project name to confirm:"
+            eprintln!(
+                "Delete {} from the cloud for all members? Type the project name to confirm:",
+                safe_text(&project)
             );
             if read_answer()? != project {
                 return Err(
@@ -500,6 +517,12 @@ impl Resolver for NoTerminalResolver {
     ) -> Result<Option<Vec<Option<String>>>, String> {
         Ok(None)
     }
+}
+
+/// Each line of a message, with hidden characters replaced. The message can
+/// hold a project name from the cloud.
+fn safe_lines(text: &str) -> String {
+    text.lines().map(safe_text).collect::<Vec<_>>().join("\n")
 }
 
 /// Asks about each conflict in the terminal. Values stay hidden until the
@@ -561,7 +584,11 @@ impl Resolver for TerminalResolver {
     ) -> Result<Option<Vec<Option<String>>>, String> {
         let mut choices = Vec::new();
         for conflict in conflicts {
-            eprintln!("Conflict in {project}: {}", conflict.name);
+            eprintln!(
+                "Conflict in {}: {}",
+                safe_text(project),
+                safe_text(&conflict.name)
+            );
             eprintln!("  1) This computer: {}", hidden_value(&conflict.local));
             eprintln!("  2) Cloud:         {}", hidden_value(&conflict.cloud));
             eprintln!("  3) Type a new value");
@@ -1333,6 +1360,14 @@ mod tests {
         assert!(master::init(None, &fixture.home)
             .unwrap_err()
             .contains("already exists"));
+    }
+
+    #[test]
+    fn cloud_text_is_safe_to_print() {
+        assert_eq!(
+            safe_lines("Keyman cannot update 'a\u{1b}[2Jb' safely.\nline\u{202E}two"),
+            "Keyman cannot update 'a?[2Jb' safely.\nline?two"
+        );
     }
 
     #[test]

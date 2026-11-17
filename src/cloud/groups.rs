@@ -202,7 +202,12 @@ fn public_key(profile: &PublicProfile) -> Result<[u8; 32], String> {
         .decode(&profile.public_key)
         .ok()
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .ok_or_else(|| format!("The public key of {} is not valid.", profile.email))
+        .ok_or_else(|| {
+            format!(
+                "The public key of {} is not valid.",
+                safe_text(&profile.email)
+            )
+        })
 }
 
 /// The membership of the user in this vault, only when the user owns it.
@@ -315,7 +320,10 @@ pub fn accept_pending(u: &Unlocked, vaults: &Vaults) -> Result<Accepted, String>
             .get(&invite.vault_id)
             .cloned()
             .unwrap_or_default();
-        let warn = format!("Keyman cannot give {} access to {group} now.", invite.email);
+        let warn = format!(
+            "Keyman cannot give {} access to {group} now.",
+            safe_text(&invite.email)
+        );
         let profile = match u.api.find_profile_by_email(&invite.email) {
             Ok(Some(profile)) => profile,
             Ok(None) => continue,
@@ -334,7 +342,7 @@ pub fn accept_pending(u: &Unlocked, vaults: &Vaults) -> Result<Accepted, String>
             .api
             .accept_invite(&invite.id, &profile.user_id, &wrapped, *generation);
         match invite_outcome(&answer) {
-            InviteOutcome::Done => result.given.push((group, invite.email)),
+            InviteOutcome::Done => result.given.push((group, safe_text(&invite.email))),
             InviteOutcome::Quiet => {}
             InviteOutcome::Warn => result.warnings.push(warn),
         }

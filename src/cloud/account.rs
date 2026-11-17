@@ -285,15 +285,16 @@ pub fn setup_profile(
 }
 
 /// Record the signed-in user. When it is a different user than before, the
-/// old links go away (they belong to the old user). Returns true then.
-fn switch_user(st: &mut State, user_id: &str) -> bool {
-    let switched = st.user_id.as_deref().is_some_and(|old| old != user_id);
-    if switched {
+/// old links go away (they belong to the old user). Returns the old user
+/// then.
+fn switch_user(st: &mut State, user_id: &str) -> Option<String> {
+    let old = st.user_id.clone().filter(|old| old != user_id);
+    if old.is_some() {
         st.links.clear();
         st.personal_vault = None;
     }
     st.user_id = Some(user_id.to_string());
-    switched
+    old
 }
 
 /// True when there is no saved session, so a browser sign-in must come first.
@@ -305,8 +306,12 @@ fn needs_sign_in(store: &dyn Store, st: &State) -> Result<bool, String> {
 /// and the account name.
 fn store_session(home: &Path, store: &dyn Store, session: &Session) -> Result<(), String> {
     let mut st = state::load(home)?;
-    if switch_user(&mut st, &session.user_id) {
+    if let Some(old) = switch_user(&mut st, &session.user_id) {
         crate::ui::warning(USER_SWITCHED);
+        // The private key of the old user stays only while it is signed in.
+        if store.available() {
+            let _ = store.delete(&key_entry(&old));
+        }
     }
     st.email = Some(session.email.clone());
     if store.available() {
@@ -335,11 +340,33 @@ fn saved_refresh_token(store: &dyn Store, st: &state::State) -> Result<Option<St
     }
 }
 
+/// Asks for the vault password up to three times. After the last wrong
+/// password, the error tells how to use the recovery code.
+fn ask_password(
+    prompt: &mut dyn Prompt,
+    unlock: impl Fn(&str) -> Result<KeyPair, String>,
+) -> Result<KeyPair, String> {
+    let mut attempt = 1;
+    loop {
+        let password = Zeroizing::new(prompt.password()?);
+        match unlock(&password) {
+            Ok(pair) => return Ok(pair),
+            Err(error) if error == WRONG_PASSWORD && attempt < PASSWORD_TRIES => {
+                crate::ui::warning(&error);
+                attempt += 1;
+            }
+            Err(error) if error == WRONG_PASSWORD => {
+                return Err(format!("{error}\n\n{RECOVER_HINT}"))
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn unlock_from_server(api: &Api, prompt: &mut dyn Prompt) -> Result<KeyPair, String> {
     let profile = api.my_profile()?.ok_or_else(|| NO_PROFILE.to_string())?;
     check_owner(&profile, api.user_id())?;
-    let password = Zeroizing::new(prompt.password()?);
-    unlock_with_password(&profile, &password)
+    ask_password(prompt, |password| unlock_with_password(&profile, password))
 }
 
 /// Finds the personal vault and checks that its key opens with this key
@@ -457,21 +484,7 @@ fn finish_login(
     let (pair, vault_id, outcome) = match api.my_profile()? {
         Some(profile) => {
             check_owner(&profile, api.user_id())?;
-            let mut attempt = 1;
-            let pair = loop {
-                let password = Zeroizing::new(prompt.password()?);
-                match unlock_with_password(&profile, &password) {
-                    Ok(pair) => break pair,
-                    Err(error) if error == WRONG_PASSWORD && attempt < PASSWORD_TRIES => {
-                        crate::ui::warning(&error);
-                        attempt += 1;
-                    }
-                    Err(error) if error == WRONG_PASSWORD => {
-                        return Err(format!("{error}\n\n{RECOVER_HINT}"))
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
+            let pair = ask_password(prompt, |password| unlock_with_password(&profile, password))?;
             let vault_id = ensure_personal_vault(home, api, &pair)?;
             (pair, vault_id, LoginOutcome::Unlocked)
         }
@@ -901,18 +914,59 @@ mod tests {
             cloud_name: "app".into(),
         });
         state::save(&home, &st).unwrap();
-        // The same user keeps the links.
+        remember_key(&store, "user-A", &KeyPair::generate()).unwrap();
+        // The same user keeps the links and the key.
         let mut same = sample_session();
         same.user_id = "user-A".into();
         store_session(&home, &store, &same).unwrap();
         assert_eq!(state::load(&home).unwrap().links.len(), 1);
-        // A different user does not.
+        assert!(stored_key(&store, "user-A").unwrap().is_some());
+        // A different user does not, and the key of the old user goes away.
         let mut other = sample_session();
         other.user_id = "user-B".into();
         store_session(&home, &store, &other).unwrap();
         let after = state::load(&home).unwrap();
         assert!(after.links.is_empty());
         assert_eq!(after.user_id.as_deref(), Some("user-B"));
+        assert!(stored_key(&store, "user-A").unwrap().is_none());
+    }
+
+    /// Gives the passwords in order and counts the questions.
+    struct Passwords(Vec<&'static str>, usize);
+
+    impl Prompt for Passwords {
+        fn new_password(&mut self) -> Result<String, String> {
+            unreachable!()
+        }
+        fn password(&mut self) -> Result<String, String> {
+            self.1 += 1;
+            Ok(self.0.remove(0).to_string())
+        }
+        fn recovery_code(&mut self) -> Result<String, String> {
+            unreachable!()
+        }
+        fn show_recovery_code(&mut self, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn the_password_gets_three_tries_then_the_recover_hint() {
+        let (profile, pair) = values("correct horse", "ABCD-EFGH");
+        let unlock = |password: &str| open_with_password(&profile, password);
+        let mut second = Passwords(vec!["wrong", "correct horse"], 0);
+        assert_eq!(
+            ask_password(&mut second, unlock).unwrap().public,
+            pair.public
+        );
+        assert_eq!(second.1, 2);
+        let mut never = Passwords(vec!["a", "b", "c", "correct horse"], 0);
+        let error = ask_password(&mut never, unlock).err().unwrap();
+        assert_eq!(never.1, 3);
+        assert_eq!(
+            error,
+            "The vault password is not correct.\n\nRun 'keyman recover' to use your recovery code."
+        );
     }
 
     #[test]
@@ -946,7 +1000,7 @@ mod tests {
     #[test]
     fn first_user_keeps_links() {
         let mut st = state::State::default();
-        assert!(!switch_user(&mut st, "user-A"));
+        assert_eq!(switch_user(&mut st, "user-A"), None);
         assert_eq!(st.user_id.as_deref(), Some("user-A"));
     }
 

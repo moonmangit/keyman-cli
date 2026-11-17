@@ -672,7 +672,7 @@ impl Api {
             return Ok(Vec::new());
         }
         let path = format!(
-            "/rest/v1/projects?{PROJECT_SELECT}&vault_id={}",
+            "/rest/v1/projects?{PROJECT_SELECT}&vault_id={}&order=id",
             in_list(vault_ids)
         );
         parse(&self.get(&path)?)

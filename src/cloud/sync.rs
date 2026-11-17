@@ -232,6 +232,17 @@ pub fn unlink(home: &Path, project: &str) -> Result<(), String> {
     state::save(home, &st)
 }
 
+/// `pull <project>` joins one unlinked cloud project. When two have the
+/// name, Keyman cannot know which one is right.
+fn one_cloud_project_named(unlinked_names: &[String], wanted: &str) -> Result<(), String> {
+    if unlinked_names.iter().filter(|name| *name == wanted).count() > 1 {
+        return Err(format!(
+            "More than one project in the cloud has the name {wanted}."
+        ));
+    }
+    Ok(())
+}
+
 /// The server must never give a version that is older than the last sync:
 /// the old sealed copy still opens, so it is a silent roll back.
 fn older_in_cloud(project: &str, link_version: i64, cloud_version: i64) -> Option<String> {
@@ -411,6 +422,19 @@ pub fn pull(
     ids.sort();
     let rows = u.api.projects(&ids)?;
     let mut st = state::load(home)?;
+    if let Some(wanted) = project {
+        let unlinked: Vec<String> = rows
+            .iter()
+            .filter(|row| st.link_by_cloud_id(&row.id).is_none())
+            .filter_map(|row| {
+                let (key, _) = vaults.key(&row.vault_id).ok()?;
+                let (name, _) =
+                    crypto::open_project(key, &row.id, row.version, &row.sealed).ok()?;
+                Some(name)
+            })
+            .collect();
+        one_cloud_project_named(&unlinked, wanted)?;
+    }
     let mut results = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut matched = false;
@@ -670,7 +694,7 @@ pub fn delete_cloud(home: &Path, u: &Unlocked, project: &str) -> Result<(), Stri
     // The server ignores a delete that the user may not do, so check.
     if u.api.project(&link.cloud_id)?.is_some() {
         return Err(format!(
-            "Keyman cannot delete '{project}' from the cloud. Only the owner of the vault can do this."
+            "Keyman cannot delete '{project}' from the cloud. Only a member of its vault can do this."
         ));
     }
     st.remove_link(project);
@@ -917,6 +941,17 @@ mod tests {
         // The personal vault of another user is not mine.
         assert_eq!(personal_in(&one, "other", None).unwrap_err(), NO_PERSONAL);
         assert_eq!(personal_in(&[], "me", None).unwrap_err(), NO_PERSONAL);
+    }
+
+    #[test]
+    fn two_unlinked_cloud_projects_with_one_name_are_refused() {
+        let names = vec!["app".to_string(), "other".to_string(), "app".to_string()];
+        assert_eq!(
+            one_cloud_project_named(&names, "app").unwrap_err(),
+            "More than one project in the cloud has the name app."
+        );
+        assert!(one_cloud_project_named(&names, "other").is_ok());
+        assert!(one_cloud_project_named(&names, "new").is_ok());
     }
 
     #[test]
