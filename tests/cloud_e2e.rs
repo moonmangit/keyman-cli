@@ -381,7 +381,10 @@ fn var(vars: &Variables, name: &str) -> Option<String> {
 fn no_skips(results: &[PullResult]) {
     for result in results {
         assert!(
-            !matches!(result, PullResult::Skipped { .. }),
+            !matches!(
+                result,
+                PullResult::Skipped { .. } | PullResult::NameTaken { .. }
+            ),
             "skipped: {result:?}"
         );
     }

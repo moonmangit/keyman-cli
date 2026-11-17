@@ -310,7 +310,8 @@ mod tests {
         assert!(parse_callback(&long).unwrap_err().len() < 230);
     }
 
-    struct Cancelling;
+    /// Says "cancelled" from the third call on.
+    struct Cancelling(std::cell::Cell<u32>);
 
     impl Prompt for Cancelling {
         fn new_password(&mut self) -> Result<String, String> {
@@ -326,7 +327,8 @@ mod tests {
             Ok(())
         }
         fn cancelled(&self) -> bool {
-            true
+            self.0.set(self.0.get() + 1);
+            self.0.get() >= 3
         }
     }
 
@@ -334,9 +336,11 @@ mod tests {
     fn cancelled_sign_in_stops() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let started = Instant::now();
-        let result = wait_for_code(&listener, &Cancelling, Instant::now() + WAIT);
+        let prompt = Cancelling(std::cell::Cell::new(0));
+        let result = wait_for_code(&listener, &prompt, Instant::now() + WAIT);
         assert_eq!(result, Err("Sign-in was cancelled.".to_string()));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(prompt.0.get(), 3);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

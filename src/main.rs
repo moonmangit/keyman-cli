@@ -248,12 +248,6 @@ fn pull_command(given: Option<&OsString>, flags: &cli::Flags) -> Result<Outcome,
         resolver.as_mut(),
     )?;
     let output = pull_output(&report);
-    for line in &output.stdout {
-        println!("{line}");
-    }
-    for line in &output.stderr {
-        eprintln!("{line}");
-    }
     // The pull is done. A failure here must not hide its results.
     let waiting_line = match groups::waiting(&unlocked) {
         Ok(0) => None,
@@ -270,20 +264,26 @@ fn pull_command(given: Option<&OsString>, flags: &cli::Flags) -> Result<Outcome,
         lines.extend(waiting_line);
         return Ok(Outcome::Print(lines.join("\n")));
     }
-    let PullOutput {
-        mut lines, code, ..
-    } = output;
+    let PullOutput { mut lines, code } = output;
     lines.extend(waiting_line);
     Ok(finish(lines, code))
 }
 
-/// What the pull command prints for a report: lines for stdout (access that
-/// Keyman gave), lines for stderr (warnings), the result lines and the exit code.
+/// What the pull command prints for a report: the result lines and the exit
+/// code. The invite lines are printed earlier, by `Resolver::invites`.
 struct PullOutput {
-    stdout: Vec<String>,
-    stderr: Vec<String>,
     lines: Vec<String>,
     code: i32,
+}
+
+/// Prints what Keyman did for invites: access given (stdout), warnings (stderr).
+fn print_invites(given: &[(String, String)], warnings: &[String]) {
+    for (group, email) in given {
+        println!("Gave {email} access to {group}.");
+    }
+    for warning in warnings {
+        eprintln!("{warning}");
+    }
 }
 
 fn pull_output(report: &PullReport) -> PullOutput {
@@ -329,16 +329,7 @@ fn pull_output(report: &PullReport) -> PullOutput {
             }
         })
         .collect();
-    PullOutput {
-        stdout: report
-            .given
-            .iter()
-            .map(|(group, email)| format!("Gave {email} access to {group}."))
-            .collect(),
-        stderr: report.warnings.clone(),
-        lines,
-        code,
-    }
+    PullOutput { lines, code }
 }
 
 fn group_command(positional: &[&OsString]) -> Result<Outcome, String> {
@@ -545,6 +536,10 @@ impl Resolver for KeepResolver {
         let keep = if self.local { Keep::Local } else { Keep::Cloud };
         Ok(Some(choose_all(conflicts, keep)))
     }
+
+    fn invites(&mut self, given: &[(String, String)], warnings: &[String]) {
+        print_invites(given, warnings);
+    }
 }
 
 /// With no terminal and no option, a conflict stops the pull.
@@ -557,6 +552,10 @@ impl Resolver for NoTerminalResolver {
         _conflicts: &[Conflict],
     ) -> Result<Option<Vec<Option<String>>>, String> {
         Ok(None)
+    }
+
+    fn invites(&mut self, given: &[(String, String)], warnings: &[String]) {
+        print_invites(given, warnings);
     }
 }
 
@@ -655,6 +654,10 @@ impl Resolver for TerminalResolver {
             choices.push(choice);
         }
         Ok(Some(choices))
+    }
+
+    fn invites(&mut self, given: &[(String, String)], warnings: &[String]) {
+        print_invites(given, warnings);
     }
 }
 
@@ -1204,8 +1207,6 @@ mod tests {
             warnings: vec!["A warning.".to_string()],
         };
         let output = pull_output(&report);
-        assert_eq!(output.stdout, vec!["Gave e@x.com access to team."]);
-        assert_eq!(output.stderr, vec!["A warning."]);
         assert_eq!(
             output.lines,
             vec!["Skipped app. A local project named 'app' exists. Run 'keyman pull app' to merge it with the local project, or use --as <name>."]

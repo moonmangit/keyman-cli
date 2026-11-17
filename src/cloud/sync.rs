@@ -446,6 +446,10 @@ pub trait Resolver {
         project: &str,
         conflicts: &[Conflict],
     ) -> Result<Option<Vec<Option<String>>>, String>;
+
+    /// Called once, right after `pull` gave access to invited people and
+    /// before any other work: `(group, email)` and warnings about invites.
+    fn invites(&mut self, _given: &[(String, String)], _warnings: &[String]) {}
 }
 
 #[derive(Debug, PartialEq)]
@@ -479,6 +483,10 @@ pub struct PullReport {
     pub warnings: Vec<String>,
 }
 
+fn name_taken(project: String) -> PullResult {
+    PullResult::NameTaken { project }
+}
+
 /// The reason text for a `NameTaken` result.
 pub fn name_taken_reason(project: &str) -> String {
     format!(
@@ -498,6 +506,7 @@ pub fn pull(
 ) -> Result<PullReport, String> {
     let vaults = Vaults::load(u)?;
     let accepted = groups::accept_pending(u, &vaults)?;
+    resolver.invites(&accepted.given, &accepted.warnings);
     let mut ids: Vec<String> = vaults.by_id.keys().cloned().collect();
     ids.sort();
     let rows = u.api.projects(&ids)?;
@@ -565,6 +574,7 @@ pub fn pull(
                 let name = link.project.clone();
                 let step = linked_step(&yaml, &link, row.version, &cloud_vars, resolver)?;
                 match step {
+                    // `linked_step` never gives this: only `added_step` does.
                     Step::NameTaken => results.push(PullResult::NameTaken { project: name }),
                     Step::Skipped(reason) => results.push(PullResult::Skipped {
                         project: name,
@@ -629,7 +639,7 @@ pub fn pull(
                     added_step(&yaml, &target, taken, &cloud_vars)?
                 };
                 match step {
-                    Step::NameTaken => results.push(PullResult::NameTaken { project: target }),
+                    Step::NameTaken => results.push(name_taken(target)),
                     Step::Skipped(reason) => results.push(PullResult::Skipped {
                         project: target,
                         reason,
@@ -1347,10 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn added_step_skips_a_name_that_exists() {
-        let yaml = "app:\n  A: \"1\"\n";
-        let step = added_step(yaml, "app", false, &v(&[("A", "9")])).unwrap();
-        assert_eq!(step, Step::NameTaken);
+    fn added_step_skips_a_name_that_exists_or_is_linked() {
         let step = added_step("other:\n  X: \"1\"\n", "app", true, &v(&[])).unwrap();
         assert_eq!(step, Step::NameTaken);
     }
@@ -1359,20 +1366,43 @@ mod tests {
     fn a_name_collision_is_name_taken() {
         let step = added_step("app:\n  A: \"1\"\n", "app", false, &v(&[("A", "2")])).unwrap();
         assert_eq!(step, Step::NameTaken);
-        // The result that a pull gives for this step.
-        let result = match step {
-            Step::NameTaken => PullResult::NameTaken {
-                project: "app".to_string(),
-            },
-            other => panic!("{other:?}"),
-        };
         assert_eq!(
-            result,
+            name_taken("app".to_string()),
             PullResult::NameTaken {
                 project: "app".into()
             }
         );
         assert!(name_taken_reason("app").contains("keyman pull app"));
+    }
+
+    #[derive(Default)]
+    struct Recording(Vec<String>);
+
+    impl Resolver for Recording {
+        fn resolve(
+            &mut self,
+            _project: &str,
+            _conflicts: &[Conflict],
+        ) -> Result<Option<Vec<Option<String>>>, String> {
+            self.0.push("resolve".to_string());
+            Ok(None)
+        }
+        fn invites(&mut self, given: &[(String, String)], _warnings: &[String]) {
+            self.0.push(format!("invites {}", given.len()));
+        }
+    }
+
+    #[test]
+    fn the_invites_hook_has_a_default_and_can_be_recorded() {
+        // `pull` calls `invites` itself, right after `accept_pending`. The
+        // end-to-end tests run the real order; here the default is a no-op.
+        let mut plain = Fixed(None, 0);
+        plain.invites(&[("g".into(), "e@x.com".into())], &[]);
+        assert_eq!(plain.1, 0);
+        let mut r = Recording::default();
+        r.invites(&[], &[]);
+        let _ = r.resolve("app", &[]);
+        assert_eq!(r.0, vec!["invites 0", "resolve"]);
     }
 
     #[test]

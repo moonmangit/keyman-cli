@@ -320,24 +320,21 @@ fn may_give_access(vaults: &Vaults, groups: &HashMap<String, String>, vault_id: 
 /// (the invitee controls their own public key) gives a warning and never
 /// stops the others. Only a failure to read the invites is an error.
 pub fn accept_pending(u: &Unlocked, vaults: &Vaults) -> Result<Accepted, String> {
-    let group_names: HashMap<String, String> = group_names(vaults).into_iter().collect();
-    let mut ids: Vec<String> = group_names.keys().cloned().collect();
+    let my_groups: HashMap<String, String> = group_names(vaults).into_iter().collect();
+    let mut ids: Vec<String> = my_groups.keys().cloned().collect();
     ids.sort();
     let mut result = Accepted::default();
     for invite in u.api.invites_for_vaults(&ids)? {
         // The server chooses which invites it returns. Only an invite to one
         // of my groups is used, and never a personal key: else the server
         // could get the key of the personal vault with a false invite.
-        if !may_give_access(vaults, &group_names, &invite.vault_id) {
+        if !may_give_access(vaults, &my_groups, &invite.vault_id) {
             continue;
         }
         let Ok((key, generation)) = vaults.key(&invite.vault_id) else {
             continue;
         };
-        let group = group_names
-            .get(&invite.vault_id)
-            .cloned()
-            .unwrap_or_default();
+        let group = my_groups.get(&invite.vault_id).cloned().unwrap_or_default();
         let warn = format!(
             "Keyman cannot give {} access to {group} now.",
             safe_text(&invite.email)
