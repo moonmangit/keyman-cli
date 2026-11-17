@@ -1,0 +1,232 @@
+begin;
+create extension if not exists pgtap with schema extensions;
+select plan(36);
+
+-- Users: A (owner), B (invitee/member), C (unrelated)
+insert into auth.users (id, email) values
+  ('aaaaaaaa-0000-0000-0000-00000000000a', 'a@example.com'),
+  ('bbbbbbbb-0000-0000-0000-00000000000b', 'b@example.com'),
+  ('cccccccc-0000-0000-0000-00000000000c', 'c@example.com');
+insert into public.profiles (user_id, email, public_key, kdf_salt, kdf_params, private_key_pw, private_key_recovery) values
+  ('bbbbbbbb-0000-0000-0000-00000000000b', 'b@example.com', 'pk', 's', '{}', 'pw', 'rec'),
+  ('cccccccc-0000-0000-0000-00000000000c', 'c@example.com', 'pk', 's', '{}', 'pw', 'rec');
+
+-- ===== A =====
+do $$ begin perform set_config('request.jwt.claims', '{"sub":"aaaaaaaa-0000-0000-0000-00000000000a","email":"a@example.com","role":"authenticated"}', true); end $$;
+set local role authenticated;
+
+select throws_ok(
+  $$ insert into public.profiles (user_id, email, public_key, kdf_salt, kdf_params, private_key_pw, private_key_recovery)
+     values ('aaaaaaaa-0000-0000-0000-00000000000a', 'b@example.com', 'pk', 's', '{}', 'pw', 'rec') $$,
+  '42501', null, 'profile_insert_requires_own_email');
+select lives_ok(
+  $$ insert into public.profiles (user_id, email, public_key, kdf_salt, kdf_params, private_key_pw, private_key_recovery)
+     values ('aaaaaaaa-0000-0000-0000-00000000000a', 'a@example.com', 'pk', 's', '{}', 'pw', 'rec') $$,
+  'profile insert with own email works');
+
+do $$ begin perform set_config('t.v', public.create_vault('group', 'x', 'k')::text, true); end $$;
+select is(
+  (select role || ':' || key_generation from public.vault_members
+    where vault_id = current_setting('t.v')::uuid and user_id = 'aaaaaaaa-0000-0000-0000-00000000000a'),
+  'owner:1', 'create_vault_makes_owner_member');
+
+select lives_ok($$ select public.create_vault('personal', 'x', 'k') $$, 'first personal vault works');
+select throws_ok($$ select public.create_vault('personal', 'x', 'k') $$, '23505', null, 'second_personal_vault_refused');
+
+-- direct writes to server-owned tables are refused
+select throws_ok(
+  $$ insert into public.vaults (kind, owner_id) values ('group', 'aaaaaaaa-0000-0000-0000-00000000000a') $$,
+  '42501', null, 'client cannot insert vaults directly');
+select throws_ok(
+  $$ insert into public.vault_members (vault_id, user_id, role, wrapped_key, key_generation)
+     values (current_setting('t.v')::uuid, 'cccccccc-0000-0000-0000-00000000000c', 'member', 'k', 1) $$,
+  '42501', null, 'client cannot insert vault_members directly');
+select throws_ok(
+  $$ update public.vaults set key_generation = 50 where id = current_setting('t.v')::uuid $$,
+  '42501', null, 'client cannot update vaults directly');
+select throws_ok(
+  $$ update public.vault_members set role = 'owner' where vault_id = current_setting('t.v')::uuid $$,
+  '42501', null, 'client cannot update vault_members directly');
+
+-- A adds two projects and invites B
+do $$ begin
+  perform set_config('t.p1', gen_random_uuid()::text, true);
+  perform set_config('t.p2', gen_random_uuid()::text, true);
+  insert into public.projects (id, vault_id, key_generation, sealed, updated_by) values
+    (current_setting('t.p1')::uuid, current_setting('t.v')::uuid, 1, 's1', 'aaaaaaaa-0000-0000-0000-00000000000a'),
+    (current_setting('t.p2')::uuid, current_setting('t.v')::uuid, 1, 's2', 'aaaaaaaa-0000-0000-0000-00000000000a');
+  perform set_config('t.inv', gen_random_uuid()::text, true);
+  insert into public.invites (id, vault_id, email, invited_by)
+    values (current_setting('t.inv')::uuid, current_setting('t.v')::uuid, 'b@example.com', 'aaaaaaaa-0000-0000-0000-00000000000a');
+end $$;
+
+select is(
+  (select count(*)::int from public.profiles where email = 'b@example.com'), 1,
+  'member_reads_invitee_profile (A sees B via invite)');
+
+select throws_ok(
+  $$ insert into public.invites (vault_id, email, invited_by)
+     values ((select id from public.vaults where owner_id = 'aaaaaaaa-0000-0000-0000-00000000000a' and kind = 'personal'),
+             'c@example.com', 'aaaaaaaa-0000-0000-0000-00000000000a') $$,
+  '42501', null, 'invite_to_personal_vault_refused');
+
+-- ===== B (not yet a member) =====
+reset role;
+do $$ begin perform set_config('request.jwt.claims', '{"sub":"bbbbbbbb-0000-0000-0000-00000000000b","email":"b@example.com","role":"authenticated"}', true); end $$;
+set local role authenticated;
+
+select is(
+  (select count(*)::int from public.projects where vault_id = current_setting('t.v')::uuid), 0,
+  'non_member_cannot_read_projects');
+select is(
+  (select count(*)::int from public.invites), 1, 'invitee_sees_own_invite');
+
+-- ===== C (no relation) =====
+reset role;
+do $$ begin perform set_config('request.jwt.claims', '{"sub":"cccccccc-0000-0000-0000-00000000000c","email":"c@example.com","role":"authenticated"}', true); end $$;
+set local role authenticated;
+select is(
+  (select count(*)::int from public.profiles where user_id = 'aaaaaaaa-0000-0000-0000-00000000000a'), 0,
+  'member_reads_invitee_profile (C cannot see A)');
+
+-- ===== A accepts =====
+reset role;
+do $$ begin perform set_config('request.jwt.claims', '{"sub":"aaaaaaaa-0000-0000-0000-00000000000a","email":"a@example.com","role":"authenticated"}', true); end $$;
+set local role authenticated;
+select throws_ok(
+  $$ select public.accept_invite(current_setting('t.inv')::uuid, 'cccccccc-0000-0000-0000-00000000000c', 'k') $$,
+  'P0001', 'the user does not match the invite email', 'accept_invite_needs_matching_email');
+select lives_ok(
+  $$ select public.accept_invite(current_setting('t.inv')::uuid, 'bbbbbbbb-0000-0000-0000-00000000000b', 'kb') $$,
+  'accept_invite_by_member runs');
+reset role;
+select is(
+  (select count(*)::int from public.vault_members where vault_id = current_setting('t.v')::uuid and user_id = 'bbbbbbbb-0000-0000-0000-00000000000b' and role = 'member')
+  + (select count(*)::int from public.invites where id = current_setting('t.inv')::uuid),
+  1, 'accept_invite_by_member: B is member, invite row gone');
+
+-- ===== B (now a member) =====
+do $$ begin perform set_config('request.jwt.claims', '{"sub":"bbbbbbbb-0000-0000-0000-00000000000b","email":"b@example.com","role":"authenticated"}', true); end $$;
+set local role authenticated;
+select throws_ok(
+  $$ insert into public.invites (vault_id, email, invited_by)
+     values (current_setting('t.v')::uuid, 'c@example.com', 'bbbbbbbb-0000-0000-0000-00000000000b') $$,
+  '42501', null, 'only_owner_invites');
+
+do $$ declare n int; begin
+  update public.projects set sealed = 'stale', updated_by = 'bbbbbbbb-0000-0000-0000-00000000000b'
+    where id = current_setting('t.p1')::uuid and version = 0;
+  get diagnostics n = row_count; perform set_config('t.n', n::text, true);
+end $$;
+select is(current_setting('t.n')::int, 0, 'push_requires_current_version (stale filter changes 0 rows)');
+do $$ declare n int; begin
+  update public.projects set sealed = 's1b', version = 2, updated_by = 'bbbbbbbb-0000-0000-0000-00000000000b'
+    where id = current_setting('t.p1')::uuid and version = 1;
+  get diagnostics n = row_count; perform set_config('t.n', n::text, true);
+end $$;
+select is(current_setting('t.n')::int, 1, 'push_requires_current_version (current filter changes 1 row)');
+select is((select version from public.projects where id = current_setting('t.p1')::uuid), 2,
+  'push_requires_current_version (version is 2)');
+
+do $$ begin
+  update public.projects set sealed = 's1c', version = 10, updated_by = 'bbbbbbbb-0000-0000-0000-00000000000b'
+    where id = current_setting('t.p1')::uuid;
+end $$;
+select is((select version from public.projects where id = current_setting('t.p1')::uuid), 3,
+  'version_trigger_forces_increment');
+
+select throws_ok(
+  $$ insert into public.projects (vault_id, key_generation, sealed, updated_by)
+     values (current_setting('t.v')::uuid, 99, 's', 'bbbbbbbb-0000-0000-0000-00000000000b') $$,
+  '42501', null, 'insert_requires_current_generation');
+
+select throws_ok(
+  $$ select public.rotate_vault(current_setting('t.v')::uuid, 'bbbbbbbb-0000-0000-0000-00000000000b',
+       '[{"user_id":"aaaaaaaa-0000-0000-0000-00000000000a","wrapped_key":"k2"}]'::jsonb, '[]'::jsonb) $$,
+  'P0001', 'only the owner can remove a member', 'rotate_requires_owner');
+
+-- ===== A rotates =====
+reset role;
+do $$ begin perform set_config('request.jwt.claims', '{"sub":"aaaaaaaa-0000-0000-0000-00000000000a","email":"a@example.com","role":"authenticated"}', true); end $$;
+set local role authenticated;
+
+select throws_ok(
+  $$ select public.rotate_vault(current_setting('t.v')::uuid, 'bbbbbbbb-0000-0000-0000-00000000000b',
+       '[]'::jsonb, '[]'::jsonb) $$,
+  'P0001', 'a new key is necessary for each remaining member', 'rotate_requires_all_members_and_projects (member key missing)');
+select throws_ok(
+  format($$ select public.rotate_vault(%L::uuid, 'bbbbbbbb-0000-0000-0000-00000000000b',
+       '[{"user_id":"aaaaaaaa-0000-0000-0000-00000000000a","wrapped_key":"k2"}]'::jsonb,
+       '[{"id":"%s","version":3,"sealed":"n1"}]'::jsonb) $$, current_setting('t.v'), current_setting('t.p1')),
+  'P0001', 'all projects of the vault must be encrypted again', 'rotate_requires_all_members_and_projects (project missing)');
+select throws_ok(
+  format($$ select public.rotate_vault(%L::uuid, 'bbbbbbbb-0000-0000-0000-00000000000b',
+       '[{"user_id":"aaaaaaaa-0000-0000-0000-00000000000a","wrapped_key":"k2"}]'::jsonb,
+       '[{"id":"%s","version":1,"sealed":"n1"},{"id":"%s","version":1,"sealed":"n2"}]'::jsonb) $$,
+       current_setting('t.v'), current_setting('t.p1'), current_setting('t.p2')),
+  'P0001', 'a project changed during the removal; try again', 'rotate_refuses_stale_version');
+select throws_ok(
+  format($$ select public.rotate_vault(%L::uuid, 'aaaaaaaa-0000-0000-0000-00000000000a',
+       '[{"user_id":"bbbbbbbb-0000-0000-0000-00000000000b","wrapped_key":"k2"}]'::jsonb, '[]'::jsonb) $$,
+       current_setting('t.v')),
+  'P0001', 'the owner cannot be removed', 'cannot_remove_owner');
+
+select is(
+  (select public.rotate_vault(current_setting('t.v')::uuid, 'bbbbbbbb-0000-0000-0000-00000000000b',
+       '[{"user_id":"aaaaaaaa-0000-0000-0000-00000000000a","wrapped_key":"k2"}]'::jsonb,
+       jsonb_build_array(
+         jsonb_build_object('id', current_setting('t.p1'), 'version', 3, 'sealed', 'n1'),
+         jsonb_build_object('id', current_setting('t.p2'), 'version', 1, 'sealed', 'n2')))),
+  2, 'rotate_removes_member (returns generation 2)');
+select is(
+  (select count(*)::int from public.vault_members where vault_id = current_setting('t.v')::uuid and user_id = 'bbbbbbbb-0000-0000-0000-00000000000b'),
+  0, 'rotate_removes_member (B has no row)');
+select is(
+  (select key_generation from public.vaults where id = current_setting('t.v')::uuid), 2,
+  'rotate_removes_member (vault generation 2)');
+select is(
+  (select string_agg(version::text || ':' || key_generation, ',' order by sealed) from public.projects where vault_id = current_setting('t.v')::uuid),
+  '4:2,2:2', 'rotate_removes_member (projects incremented, re-sealed at generation 2)');
+select is(
+  (select key_generation from public.vault_members where vault_id = current_setting('t.v')::uuid and user_id = 'aaaaaaaa-0000-0000-0000-00000000000a'),
+  2, 'rotate_removes_member (owner key at generation 2)');
+
+reset role;
+do $$ begin perform set_config('request.jwt.claims', '{"sub":"bbbbbbbb-0000-0000-0000-00000000000b","email":"b@example.com","role":"authenticated"}', true); end $$;
+set local role authenticated;
+select is(
+  (select count(*)::int from public.projects where vault_id = current_setting('t.v')::uuid), 0,
+  'rotate_removes_member (B selects projects -> 0 rows)');
+
+-- ===== duplicate-key hole: keys [A, A] must not leave B on a stale key =====
+reset role;
+do $$ begin perform set_config('request.jwt.claims', '{"sub":"aaaaaaaa-0000-0000-0000-00000000000a","email":"a@example.com","role":"authenticated"}', true); end $$;
+set local role authenticated;
+do $$ begin perform set_config('t.v2', public.create_vault('group', 'y', 'k')::text, true); end $$;
+reset role;
+-- add B and C as members of V2 (setup as postgres; the client path is covered by accept_invite above)
+insert into public.vault_members (vault_id, user_id, role, wrapped_key, key_generation) values
+  (current_setting('t.v2')::uuid, 'bbbbbbbb-0000-0000-0000-00000000000b', 'member', 'kb', 1),
+  (current_setting('t.v2')::uuid, 'cccccccc-0000-0000-0000-00000000000c', 'member', 'kc', 1);
+set local role authenticated;
+select throws_ok(
+  format($$ select public.rotate_vault(%L::uuid, 'cccccccc-0000-0000-0000-00000000000c',
+       '[{"user_id":"aaaaaaaa-0000-0000-0000-00000000000a","wrapped_key":"k2"},{"user_id":"aaaaaaaa-0000-0000-0000-00000000000a","wrapped_key":"k3"}]'::jsonb,
+       '[]'::jsonb) $$, current_setting('t.v2')),
+  'P0001', 'every remaining member must get a new key', 'rotate_refuses_duplicate_keys');
+
+-- ===== invites only work for group vaults (invite planted as postgres; clients cannot insert one) =====
+reset role;
+insert into public.invites (vault_id, email, invited_by)
+  select id, 'c@example.com', owner_id from public.vaults
+  where owner_id = 'aaaaaaaa-0000-0000-0000-00000000000a' and kind = 'personal';
+set local role authenticated;
+select throws_ok(
+  $$ select public.accept_invite(
+       (select i.id from public.invites i join public.vaults v on v.id = i.vault_id
+         where v.owner_id = 'aaaaaaaa-0000-0000-0000-00000000000a' and v.kind = 'personal'),
+       'cccccccc-0000-0000-0000-00000000000c', 'k') $$,
+  'P0001', 'only a group accepts invites', 'accept_invite_to_personal_vault_refused');
+
+select * from finish();
+rollback;
