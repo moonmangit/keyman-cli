@@ -368,7 +368,9 @@ impl Computer {
     }
 
     fn pull(&self, resolver: &mut dyn Resolver) -> Vec<PullResult> {
-        sync::pull(&self.home, &self.unlocked(), None, None, resolver).unwrap()
+        sync::pull(&self.home, &self.unlocked(), None, None, resolver)
+            .unwrap()
+            .results
     }
 }
 

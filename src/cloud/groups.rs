@@ -146,8 +146,9 @@ fn group_name(vaults: &Vaults, member: &Membership) -> Option<String> {
     Some(safe_text(&raw_name(vaults, member)?))
 }
 
-/// `(vault ID, name)` of every group the user is in.
-fn names(vaults: &Vaults) -> Vec<(String, String)> {
+/// `(vault ID, name)` of every group the user is in. These are the groups
+/// that `link --group` accepts.
+pub fn group_names(vaults: &Vaults) -> Vec<(String, String)> {
     vaults
         .memberships()
         .iter()
@@ -158,7 +159,7 @@ fn names(vaults: &Vaults) -> Vec<(String, String)> {
 }
 
 pub(crate) fn find_in(vaults: &Vaults, name: &str) -> Result<String, String> {
-    let mut found = names(vaults)
+    let mut found = group_names(vaults)
         .into_iter()
         .filter(|(_, group)| group == name)
         .map(|(id, _)| id);
@@ -237,7 +238,10 @@ pub fn create(u: &Unlocked, name: &str) -> Result<String, String> {
         return Err("The name of the group has a character that Keyman cannot use.".to_string());
     }
     let vaults = Vaults::load(u)?;
-    if names(&vaults).iter().any(|(_, existing)| existing == name) {
+    if group_names(&vaults)
+        .iter()
+        .any(|(_, existing)| existing == name)
+    {
         return Err(format!("You are in a group named '{name}' already."));
     }
     let id = api::new_uuid();
@@ -316,7 +320,7 @@ fn may_give_access(vaults: &Vaults, groups: &HashMap<String, String>, vault_id: 
 /// (the invitee controls their own public key) gives a warning and never
 /// stops the others. Only a failure to read the invites is an error.
 pub fn accept_pending(u: &Unlocked, vaults: &Vaults) -> Result<Accepted, String> {
-    let group_names: HashMap<String, String> = names(vaults).into_iter().collect();
+    let group_names: HashMap<String, String> = group_names(vaults).into_iter().collect();
     let mut ids: Vec<String> = group_names.keys().cloned().collect();
     ids.sort();
     let mut result = Accepted::default();
@@ -512,7 +516,7 @@ pub fn check_delete(u: &Unlocked, vaults: &Vaults, group: &str) -> Result<String
 
 /// The groups of the user. It needs no decryption except the names.
 pub fn list(u: &Unlocked, vaults: &Vaults) -> Result<Vec<Group>, String> {
-    let ids: Vec<String> = names(vaults).into_iter().map(|(id, _)| id).collect();
+    let ids: Vec<String> = group_names(vaults).into_iter().map(|(id, _)| id).collect();
     let members = u.api.members_for_vaults(&ids)?;
     let invites = u.api.invites_for_vaults(&ids)?;
     Ok(summarize(vaults, u.api.user_id(), &members, &invites))
@@ -804,10 +808,25 @@ mod tests {
     }
 
     #[test]
+    fn group_names_lists_my_groups_only() {
+        let f = fixture();
+        let vaults = Vaults::from_pair(&f.pair, &f.memberships, None);
+        let mut names = group_names(&vaults);
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ("v1".to_string(), "team-api".to_string()),
+                ("v2".to_string(), "billing".to_string())
+            ]
+        );
+    }
+
+    #[test]
     fn a_personal_key_is_never_given_to_an_invite() {
         let f = fixture();
         let vaults = Vaults::from_pair(&f.pair, &f.memberships, None);
-        let groups: HashMap<String, String> = names(&vaults).into_iter().collect();
+        let groups: HashMap<String, String> = group_names(&vaults).into_iter().collect();
         // v0 is the personal vault: a false invite for it is not used.
         assert!(vaults.key("v0").is_ok());
         assert!(vaults.is_personal("v0"));

@@ -7,7 +7,7 @@ use keyman_cli::cloud::groups::{self, Removal};
 use keyman_cli::cloud::keystore::SystemStore;
 use keyman_cli::cloud::merge::{choose_all, Conflict, Keep};
 use keyman_cli::cloud::state;
-use keyman_cli::cloud::sync::{self, LinkStatus, PullResult, PushResult, Resolver};
+use keyman_cli::cloud::sync::{self, LinkStatus, PullReport, PullResult, PushResult, Resolver};
 use keyman_cli::envfile::{self, Change};
 use keyman_cli::{master, save, ui};
 
@@ -240,13 +240,20 @@ fn pull_command(given: Option<&OsString>, flags: &cli::Flags) -> Result<Outcome,
         (false, false) => Box::new(NoTerminalResolver),
     };
     let unlocked = unlock(&home)?;
-    let results = sync::pull(
+    let report = sync::pull(
         &home,
         &unlocked,
         project.as_deref(),
         local_name.as_deref(),
         resolver.as_mut(),
     )?;
+    let output = pull_output(&report);
+    for line in &output.stdout {
+        println!("{line}");
+    }
+    for line in &output.stderr {
+        eprintln!("{line}");
+    }
     // The pull is done. A failure here must not hide its results.
     let waiting_line = match groups::waiting(&unlocked) {
         Ok(0) => None,
@@ -258,13 +265,31 @@ fn pull_command(given: Option<&OsString>, flags: &cli::Flags) -> Result<Outcome,
             "Keyman cannot check for waiting invites now. Run 'keyman pull' again later.",
         )),
     };
-    if results.is_empty() {
+    if report.results.is_empty() {
         let mut lines = vec![dim("No projects in the cloud yet.")];
         lines.extend(waiting_line);
         return Ok(Outcome::Print(lines.join("\n")));
     }
+    let PullOutput {
+        mut lines, code, ..
+    } = output;
+    lines.extend(waiting_line);
+    Ok(finish(lines, code))
+}
+
+/// What the pull command prints for a report: lines for stdout (access that
+/// Keyman gave), lines for stderr (warnings), the result lines and the exit code.
+struct PullOutput {
+    stdout: Vec<String>,
+    stderr: Vec<String>,
+    lines: Vec<String>,
+    code: i32,
+}
+
+fn pull_output(report: &PullReport) -> PullOutput {
     let mut code = 0;
-    let mut lines: Vec<String> = results
+    let lines: Vec<String> = report
+        .results
         .iter()
         .map(|result| match result {
             PullResult::Updated { project, changes } => ui::success(&format!(
@@ -294,10 +319,26 @@ fn pull_command(given: Option<&OsString>, flags: &cli::Flags) -> Result<Outcome,
                     safe_lines(reason)
                 ))
             }
+            PullResult::NameTaken { project } => {
+                code = 1;
+                yellow(&format!(
+                    "Skipped {}. {}",
+                    safe_text(project),
+                    safe_lines(&sync::name_taken_reason(project))
+                ))
+            }
         })
         .collect();
-    lines.extend(waiting_line);
-    Ok(finish(lines, code))
+    PullOutput {
+        stdout: report
+            .given
+            .iter()
+            .map(|(group, email)| format!("Gave {email} access to {group}."))
+            .collect(),
+        stderr: report.warnings.clone(),
+        lines,
+        code,
+    }
 }
 
 fn group_command(positional: &[&OsString]) -> Result<Outcome, String> {
@@ -660,6 +701,14 @@ Your recovery code:
         eprintln!("If you lose the password and this code, nobody can get your cloud data back.");
         eprintln!("Type the code again to confirm:");
         Ok(())
+    }
+
+    fn notice(&mut self, text: &str) {
+        ui::warning(text);
+    }
+
+    fn sign_in_link(&mut self, url: &str) {
+        println!("Open this link to sign in:\n{url}");
     }
 }
 
@@ -1144,6 +1193,25 @@ fn run(variables: &[(String, String)], command: &[OsString]) -> Result<i32, Stri
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn pull_report_prints_like_before() {
+        let report = PullReport {
+            results: vec![PullResult::NameTaken {
+                project: "app".to_string(),
+            }],
+            given: vec![("team".to_string(), "e@x.com".to_string())],
+            warnings: vec!["A warning.".to_string()],
+        };
+        let output = pull_output(&report);
+        assert_eq!(output.stdout, vec!["Gave e@x.com access to team."]);
+        assert_eq!(output.stderr, vec!["A warning."]);
+        assert_eq!(
+            output.lines,
+            vec!["Skipped app. A local project named 'app' exists. Run 'keyman pull app' to merge it with the local project, or use --as <name>."]
+        );
+        assert_eq!(output.code, 1);
+    }
 
     /// Numbers each fixture so tests running in parallel never share a folder.
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);

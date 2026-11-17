@@ -1,5 +1,6 @@
 //! Browser sign-in: PKCE and a local loopback listener.
 
+use super::account::{Prompt, SIGN_IN_CANCELLED};
 use super::api::{self, Session};
 use super::config::Config;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -151,13 +152,20 @@ fn bind_callback_port() -> Result<(TcpListener, u16), String> {
     Err("Keyman cannot open a local port for sign-in. Close other programs that use ports 47821 to 47825, then try again.".to_string())
 }
 
-/// Wait for the browser to call back and return the request line.
-fn wait_for_callback(listener: &TcpListener) -> Result<String, String> {
+/// Wait for the browser to call back and return the request line. The
+/// prompt can cancel the wait.
+fn wait_for_callback(
+    listener: &TcpListener,
+    prompt: &dyn Prompt,
+    deadline: Instant,
+) -> Result<String, String> {
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("Keyman cannot wait for sign-in: {e}"))?;
-    let deadline = Instant::now() + WAIT;
     loop {
+        if prompt.cancelled() {
+            return Err(SIGN_IN_CANCELLED.to_string());
+        }
         if Instant::now() >= deadline {
             return Err("Sign-in took too long. Try again.".to_string());
         }
@@ -198,15 +206,28 @@ fn wait_for_callback(listener: &TcpListener) -> Result<String, String> {
     }
 }
 
-pub fn sign_in_with_browser(cfg: &Config, provider: &str) -> Result<Session, String> {
+/// Wait for the browser and return the sign-in code.
+fn wait_for_code(
+    listener: &TcpListener,
+    prompt: &dyn Prompt,
+    deadline: Instant,
+) -> Result<String, String> {
+    let line = wait_for_callback(listener, prompt, deadline)?;
+    parse_callback(&line)
+}
+
+pub fn sign_in_with_browser(
+    cfg: &Config,
+    provider: &str,
+    prompt: &mut dyn Prompt,
+) -> Result<Session, String> {
     let (listener, port) = bind_callback_port()?;
     let redirect = format!("http://127.0.0.1:{port}/callback");
     let pk = pkce();
     let url = authorize_url(cfg, provider, &redirect, &pk.challenge);
-    println!("Open this link to sign in:\n{url}");
+    prompt.sign_in_link(&url);
     let _ = webbrowser::open(&url);
-    let line = wait_for_callback(&listener)?;
-    let code = parse_callback(&line)?;
+    let code = wait_for_code(&listener, prompt, Instant::now() + WAIT)?;
     api::exchange_code(cfg, &code, &pk.verifier)
 }
 
@@ -287,6 +308,35 @@ mod tests {
             "a".repeat(500)
         );
         assert!(parse_callback(&long).unwrap_err().len() < 230);
+    }
+
+    struct Cancelling;
+
+    impl Prompt for Cancelling {
+        fn new_password(&mut self) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        fn password(&mut self) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        fn recovery_code(&mut self) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        fn show_recovery_code(&mut self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn cancelled_sign_in_stops() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let started = Instant::now();
+        let result = wait_for_code(&listener, &Cancelling, Instant::now() + WAIT);
+        assert_eq!(result, Err("Sign-in was cancelled.".to_string()));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

@@ -450,11 +450,40 @@ pub trait Resolver {
 
 #[derive(Debug, PartialEq)]
 pub enum PullResult {
-    Updated { project: String, changes: usize },
+    Updated {
+        project: String,
+        changes: usize,
+    },
     Added(String),
     UpToDate(String),
-    Stopped { project: String, conflicts: usize },
-    Skipped { project: String, reason: String },
+    Stopped {
+        project: String,
+        conflicts: usize,
+    },
+    Skipped {
+        project: String,
+        reason: String,
+    },
+    /// A cloud project has the name of a local project that is not linked.
+    NameTaken {
+        project: String,
+    },
+}
+
+/// What a pull did: one result for each project, the people who got access
+/// to a group (`(group, email)`), and warnings about invites.
+#[derive(Debug, PartialEq)]
+pub struct PullReport {
+    pub results: Vec<PullResult>,
+    pub given: Vec<(String, String)>,
+    pub warnings: Vec<String>,
+}
+
+/// The reason text for a `NameTaken` result.
+pub fn name_taken_reason(project: &str) -> String {
+    format!(
+        "A local project named '{project}' exists. Run 'keyman pull {project}' to merge it with the local project, or use --as <name>."
+    )
 }
 
 const CHANGED_WHILE_WORKING: &str =
@@ -466,15 +495,9 @@ pub fn pull(
     project: Option<&str>,
     local_name: Option<&str>,
     resolver: &mut dyn Resolver,
-) -> Result<Vec<PullResult>, String> {
+) -> Result<PullReport, String> {
     let vaults = Vaults::load(u)?;
     let accepted = groups::accept_pending(u, &vaults)?;
-    for (group, email) in &accepted.given {
-        println!("Gave {email} access to {group}.");
-    }
-    for warning in &accepted.warnings {
-        eprintln!("{warning}");
-    }
     let mut ids: Vec<String> = vaults.by_id.keys().cloned().collect();
     ids.sort();
     let rows = u.api.projects(&ids)?;
@@ -542,6 +565,7 @@ pub fn pull(
                 let name = link.project.clone();
                 let step = linked_step(&yaml, &link, row.version, &cloud_vars, resolver)?;
                 match step {
+                    Step::NameTaken => results.push(PullResult::NameTaken { project: name }),
                     Step::Skipped(reason) => results.push(PullResult::Skipped {
                         project: name,
                         reason,
@@ -605,6 +629,7 @@ pub fn pull(
                     added_step(&yaml, &target, taken, &cloud_vars)?
                 };
                 match step {
+                    Step::NameTaken => results.push(PullResult::NameTaken { project: target }),
                     Step::Skipped(reason) => results.push(PullResult::Skipped {
                         project: target,
                         reason,
@@ -671,7 +696,11 @@ pub fn pull(
             ));
         }
     }
-    Ok(results)
+    Ok(PullReport {
+        results,
+        given: accepted.given,
+        warnings: accepted.warnings,
+    })
 }
 
 /// Merges base, local and cloud. `Ok(None)` means the resolver stopped.
@@ -764,6 +793,8 @@ pub fn delete_cloud(home: &Path, u: &Unlocked, project: &str) -> Result<(), Stri
 #[derive(Debug, PartialEq)]
 enum Step {
     Skipped(String),
+    /// A local project has this name already (see `name_taken_reason`).
+    NameTaken,
     Stopped(usize),
     /// `yaml` is the new master file text, or `None` when nothing changes.
     Done {
@@ -863,9 +894,7 @@ fn added_step(
 ) -> Result<Step, String> {
     let exists = master::project_names(yaml)?.iter().any(|n| n == name);
     if exists || linked {
-        return Ok(Step::Skipped(format!(
-            "A local project named '{name}' exists. Run 'keyman pull {name}' to merge it with the local project, or use --as <name>."
-        )));
+        return Ok(Step::NameTaken);
     }
     Ok(match write_project(yaml, name, false, cloud) {
         Ok(text) => Step::Done {
@@ -1321,15 +1350,29 @@ mod tests {
     fn added_step_skips_a_name_that_exists() {
         let yaml = "app:\n  A: \"1\"\n";
         let step = added_step(yaml, "app", false, &v(&[("A", "9")])).unwrap();
-        assert_eq!(
-            step,
-            Step::Skipped(
-                "A local project named 'app' exists. Run 'keyman pull app' to merge it with the local project, or use --as <name>."
-                    .to_string()
-            )
-        );
+        assert_eq!(step, Step::NameTaken);
         let step = added_step("other:\n  X: \"1\"\n", "app", true, &v(&[])).unwrap();
-        assert!(matches!(step, Step::Skipped(_)));
+        assert_eq!(step, Step::NameTaken);
+    }
+
+    #[test]
+    fn a_name_collision_is_name_taken() {
+        let step = added_step("app:\n  A: \"1\"\n", "app", false, &v(&[("A", "2")])).unwrap();
+        assert_eq!(step, Step::NameTaken);
+        // The result that a pull gives for this step.
+        let result = match step {
+            Step::NameTaken => PullResult::NameTaken {
+                project: "app".to_string(),
+            },
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            result,
+            PullResult::NameTaken {
+                project: "app".into()
+            }
+        );
+        assert!(name_taken_reason("app").contains("keyman pull app"));
     }
 
     #[test]
@@ -1427,10 +1470,7 @@ mod tests {
     #[test]
     fn pull_all_still_skips_a_name_collision() {
         let step = added_step("app:\n  A: \"1\"\n", "app", false, &v(&[("A", "2")])).unwrap();
-        let Step::Skipped(reason) = step else {
-            panic!("expected skip");
-        };
-        assert!(reason.contains("keyman pull app"), "{reason}");
+        assert_eq!(step, Step::NameTaken);
     }
 
     #[test]

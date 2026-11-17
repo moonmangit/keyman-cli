@@ -21,7 +21,10 @@ const KEY_MISMATCH: &str = "The key on the server does not match. Keyman stops."
 const BAD_LOCAL_KEY: &str = "The key on this computer is not valid. Run 'keyman login' again.";
 const CODE_MISMATCH: &str =
     "The code is not the same. Keyman did not save anything. Run 'keyman login' to start again.";
-const SIGN_IN_INVALID: &str = "Your sign-in is not valid now. Run 'keyman login'.";
+/// The error when the saved sign-in is not valid now.
+pub const SIGN_IN_INVALID: &str = "Your sign-in is not valid now. Run 'keyman login'.";
+/// The error when the person stops a browser sign-in.
+pub const SIGN_IN_CANCELLED: &str = "Sign-in was cancelled.";
 const WRONG_OWNER: &str = "The profile on the server is for a different user. Keyman stops.";
 const SESSION: &str = "session";
 const LEGACY_KEY: &str = "private_key";
@@ -48,6 +51,17 @@ pub trait Prompt {
     fn password(&mut self) -> Result<String, String>;
     fn recovery_code(&mut self) -> Result<String, String>;
     fn show_recovery_code(&mut self, code: &str) -> Result<(), String>;
+
+    /// A message for the person that does not stop the work.
+    fn notice(&mut self, _text: &str) {}
+
+    /// The link for the browser sign-in, for a person who must open it.
+    fn sign_in_link(&mut self, _url: &str) {}
+
+    /// True when the person stopped the browser sign-in.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -259,6 +273,19 @@ pub(crate) fn pin_personal_vault(home: &Path, user_id: &str, vault_id: &str) -> 
     }
 }
 
+/// Asks for the recovery code up to three times. Each wrong code is a notice.
+fn confirm_code(prompt: &mut dyn Prompt, code: &str) -> Result<bool, String> {
+    let wanted = crypto::normalize_recovery_code(code);
+    for _ in 0..CODE_TRIES {
+        let typed = Zeroizing::new(prompt.recovery_code()?);
+        if crypto::normalize_recovery_code(&typed) == wanted {
+            return Ok(true);
+        }
+        prompt.notice("The code is not the same. Try again.");
+    }
+    Ok(false)
+}
+
 /// First sign-in: make the keys, the profile and the personal vault.
 /// The caller saves the session first, then the private key.
 /// Returns the key pair and the ID of the personal vault.
@@ -271,17 +298,7 @@ pub fn setup_profile(
     let code = Zeroizing::new(crypto::recovery_code());
     let (profile, pair) = new_profile_values(api.user_id(), api.email(), &password, &code, params)?;
     prompt.show_recovery_code(&code)?;
-    let wanted = crypto::normalize_recovery_code(&code);
-    let mut confirmed = false;
-    for _ in 0..CODE_TRIES {
-        let typed = Zeroizing::new(prompt.recovery_code()?);
-        if crypto::normalize_recovery_code(&typed) == wanted {
-            confirmed = true;
-            break;
-        }
-        crate::ui::warning("The code is not the same. Try again.");
-    }
-    if !confirmed {
+    if !confirm_code(prompt, &code)? {
         return Err(CODE_MISMATCH.to_string());
     }
     api.insert_profile(&profile)?;
@@ -307,12 +324,30 @@ fn needs_sign_in(store: &dyn Store, st: &State) -> Result<bool, String> {
     Ok(saved_refresh_token(store, st)?.is_none())
 }
 
+/// `store_session`, and the notice goes to the prompt.
+fn save_session(
+    home: &Path,
+    store: &dyn Store,
+    session: &Session,
+    prompt: &mut dyn Prompt,
+) -> Result<(), String> {
+    if let Some(text) = store_session(home, store, session)? {
+        prompt.notice(text);
+    }
+    Ok(())
+}
+
 /// Save the refresh token (store, or the state file when there is no store)
-/// and the account name.
-fn store_session(home: &Path, store: &dyn Store, session: &Session) -> Result<(), String> {
+/// and the account name. Returns a notice when the user is a different one.
+fn store_session(
+    home: &Path,
+    store: &dyn Store,
+    session: &Session,
+) -> Result<Option<&'static str>, String> {
     let mut st = state::load(home)?;
+    let mut notice = None;
     if let Some(old) = switch_user(&mut st, &session.user_id) {
-        crate::ui::warning(USER_SWITCHED);
+        notice = Some(USER_SWITCHED);
         // The private key of the old user stays only while it is signed in.
         if store.available() {
             let _ = store.delete(&key_entry(&old));
@@ -331,7 +366,8 @@ fn store_session(home: &Path, store: &dyn Store, session: &Session) -> Result<()
     } else {
         st.refresh_token = Some(session.refresh_token.clone());
     }
-    state::save(home, &st)
+    state::save(home, &st)?;
+    Ok(notice)
 }
 
 fn saved_refresh_token(store: &dyn Store, st: &state::State) -> Result<Option<String>, String> {
@@ -357,7 +393,7 @@ fn ask_password(
         match unlock(&password) {
             Ok(pair) => return Ok(pair),
             Err(error) if error == WRONG_PASSWORD && attempt < PASSWORD_TRIES => {
-                crate::ui::warning(&error);
+                prompt.notice(&error);
                 attempt += 1;
             }
             Err(error) if error == WRONG_PASSWORD => {
@@ -404,7 +440,7 @@ pub fn login(
     provider: &str,
     prompt: &mut dyn Prompt,
 ) -> Result<LoginOutcome, String> {
-    let session = auth::sign_in_with_browser(&config(), provider)?;
+    let session = auth::sign_in_with_browser(&config(), provider, prompt)?;
     login_with_session(home, store, &session, prompt)
 }
 
@@ -470,7 +506,7 @@ pub fn setup_with(
         code: None,
     };
     let (pair, vault_id) = setup_profile(&api, &mut answers, params)?;
-    store_session(home, store, session)?;
+    save_session(home, store, session, &mut answers)?;
     remember_key(store, &session.user_id, &pair)?;
     pin_personal_vault(home, &session.user_id, &vault_id)?;
     let code = answers
@@ -500,7 +536,7 @@ fn finish_login(
         }
     };
     // The session entry comes first, then the key.
-    store_session(home, store, session)?;
+    save_session(home, store, session, prompt)?;
     remember_key(store, &session.user_id, &pair)?;
     pin_personal_vault(home, &session.user_id, &vault_id)?;
     if store.available() {
@@ -523,7 +559,7 @@ fn drop_session(home: &Path, store: &dyn Store) {
 
 /// Use the saved refresh token to get a new session, and save the new token.
 /// The server gives a new refresh token each time, so the save comes first.
-fn signed_in(home: &Path, store: &dyn Store) -> Result<Api, String> {
+fn signed_in(home: &Path, store: &dyn Store, prompt: &mut dyn Prompt) -> Result<Api, String> {
     let st = state::load(home)?;
     let token = saved_refresh_token(store, &st)?.ok_or_else(|| NOT_SIGNED_IN.to_string())?;
     let cfg = config();
@@ -536,7 +572,7 @@ fn signed_in(home: &Path, store: &dyn Store) -> Result<Api, String> {
         }
         Err(api::RefreshError::Unavailable(message)) => return Err(message),
     };
-    store_session(home, store, &session)?;
+    save_session(home, store, &session, prompt)?;
     Ok(Api::new(cfg, session))
 }
 
@@ -545,7 +581,7 @@ pub fn session(
     store: &dyn Store,
     prompt: &mut dyn Prompt,
 ) -> Result<Unlocked, String> {
-    let api = signed_in(home, store)?;
+    let api = signed_in(home, store, prompt)?;
     let user_id = api.user_id().to_string();
     let pair = if store.available() {
         match stored_key(store, &user_id)? {
@@ -580,7 +616,7 @@ pub fn recover(
     let saved = if needs_sign_in(store, &st)? {
         None
     } else {
-        match signed_in(home, store) {
+        match signed_in(home, store, prompt) {
             Ok(api) => Some(api),
             // The saved sign-in is old: sign in again with the browser.
             Err(error) if error == SIGN_IN_INVALID => None,
@@ -591,7 +627,7 @@ pub fn recover(
         Some(api) => (api, None),
         None => {
             let cfg = config();
-            let session = auth::sign_in_with_browser(&cfg, provider()?)?;
+            let session = auth::sign_in_with_browser(&cfg, provider()?, prompt)?;
             (Api::new(cfg, session.clone()), Some(session))
         }
     };
@@ -618,7 +654,7 @@ fn finish_recover(
     api.update_profile_keys(&updated)?;
     // The session entry comes first, then the key.
     if let Some(session) = fresh {
-        store_session(home, store, session)?;
+        save_session(home, store, session, prompt)?;
     }
     remember_key(store, api.user_id(), &pair)
 }
@@ -630,7 +666,7 @@ pub fn change_password(
     store: &dyn Store,
     prompt: &mut dyn Prompt,
 ) -> Result<(), String> {
-    let api = signed_in(home, store)?;
+    let api = signed_in(home, store, prompt)?;
     let profile = api.my_profile()?.ok_or_else(|| NO_PROFILE.to_string())?;
     check_owner(&profile, api.user_id())?;
     let current = Zeroizing::new(prompt.password()?);
@@ -638,6 +674,16 @@ pub fn change_password(
     let password = Zeroizing::new(prompt.new_password()?);
     let updated = reseal_password(&profile, &pair, &password)?;
     api.update_profile_keys(&updated)
+}
+
+/// The email of the saved session, from this computer only. It never uses
+/// the network, so the answer can be old: the server may refuse the token.
+pub fn signed_in_offline(home: &Path, store: &dyn Store) -> Result<Option<String>, String> {
+    let st = state::load(home)?;
+    if saved_refresh_token(store, &st)?.is_none() {
+        return Ok(None);
+    }
+    Ok(st.email)
 }
 
 /// Sign out on the server (network errors are ignored), then remove the
@@ -856,6 +902,69 @@ mod tests {
         home
     }
 
+    #[derive(Default)]
+    struct Recorder {
+        notices: Vec<String>,
+    }
+
+    impl Prompt for Recorder {
+        fn new_password(&mut self) -> Result<String, String> {
+            Ok("password".to_string())
+        }
+        fn password(&mut self) -> Result<String, String> {
+            Ok("password".to_string())
+        }
+        fn recovery_code(&mut self) -> Result<String, String> {
+            Ok("WRONG-CODE".to_string())
+        }
+        fn show_recovery_code(&mut self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn notice(&mut self, text: &str) {
+            self.notices.push(text.to_string());
+        }
+    }
+
+    #[test]
+    fn notices_go_to_the_prompt() {
+        let mut prompt = Recorder::default();
+        assert_eq!(confirm_code(&mut prompt, "ABCD-EFGH"), Ok(false));
+        assert_eq!(
+            prompt.notices,
+            vec!["The code is not the same. Try again."; CODE_TRIES]
+        );
+        // A different user is a notice from `save_session`.
+        let home = temp_home("notice");
+        let store = crate::cloud::keystore::MemoryStore::new();
+        let mut prompt = Recorder::default();
+        save_session(&home, &store, &sample_session(), &mut prompt).unwrap();
+        assert!(prompt.notices.is_empty());
+        let mut other = sample_session();
+        other.user_id = "user-2".into();
+        save_session(&home, &store, &other, &mut prompt).unwrap();
+        assert_eq!(prompt.notices, vec![USER_SWITCHED.to_string()]);
+    }
+
+    #[test]
+    fn signed_in_offline_reads_local_data_only() {
+        let home = temp_home("offline");
+        let store = crate::cloud::keystore::MemoryStore::new();
+        assert_eq!(signed_in_offline(&home, &store), Ok(None));
+        store_session(&home, &store, &sample_session()).unwrap();
+        assert_eq!(
+            signed_in_offline(&home, &store),
+            Ok(Some("a@example.com".to_string()))
+        );
+        // With no credential store, the token is in the state file.
+        let other = temp_home("offline-nostore");
+        assert_eq!(signed_in_offline(&other, &NoStore), Ok(None));
+        store_session(&other, &NoStore, &sample_session()).unwrap();
+        assert_eq!(
+            signed_in_offline(&other, &NoStore),
+            Ok(Some("a@example.com".to_string()))
+        );
+    }
+
     #[test]
     fn token_goes_to_the_store_when_there_is_one() {
         let home = temp_home("store");
@@ -890,7 +999,9 @@ mod tests {
     fn missing_token_means_not_signed_in() {
         let home = temp_home("none");
         let store = crate::cloud::keystore::MemoryStore::new();
-        let error = signed_in(&home, &store).err().unwrap();
+        let error = signed_in(&home, &store, &mut Recorder::default())
+            .err()
+            .unwrap();
         assert_eq!(error, "You are not signed in. Run 'keyman login' first.");
     }
 
