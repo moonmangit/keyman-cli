@@ -973,8 +973,7 @@ pub fn added_line(summary: &SyncSummary) -> String {
 /// The first line of the **Sync results** dialog. The counts show only when something was
 /// done; "up to date" does not show above projects that need the person.
 pub fn results_intro(summary: &SyncSummary) -> String {
-    let done = summary.updated + summary.added.len() + summary.sent > 0;
-    let counts = done.then(|| cloud::counts_text(summary));
+    let counts = cloud::did_something(summary).then(|| cloud::counts_text(summary));
     match (counts, summary.attention.is_empty()) {
         (Some(counts), false) => format!(
             "{counts} {}",

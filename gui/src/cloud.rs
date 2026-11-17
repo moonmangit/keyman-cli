@@ -512,8 +512,13 @@ pub fn push_failed_line(error: &str) -> String {
 }
 
 /// The results of a sync as plain lines, for a toast that cannot show the dialog.
+/// The counts show only when something was done: "up to date" is not said when nothing was
+/// sent.
 pub fn summary_lines(summary: &SyncSummary) -> Vec<String> {
-    let mut lines = vec![counts_text(summary)];
+    let mut lines: Vec<String> = did_something(summary)
+        .then(|| counts_text(summary))
+        .into_iter()
+        .collect();
     lines.extend(
         crate::cloud_views::attention_rows(summary, |_| false)
             .into_iter()
@@ -529,6 +534,25 @@ pub fn summary_lines(summary: &SyncSummary) -> Vec<String> {
             .map(|(group, email)| given_line(group, email)),
     );
     lines.extend(summary.warnings.iter().cloned());
+    lines
+}
+
+/// Whether the sync updated, added or sent a project.
+pub fn did_something(summary: &SyncSummary) -> bool {
+    summary.updated + summary.added.len() + summary.sent > 0
+}
+
+/// At most this many result lines go under the text of a toast.
+const TOAST_LINES: usize = 5;
+
+/// `summary_lines` for a toast: the first `TOAST_LINES`, then how many more there are.
+pub fn toast_lines(summary: &SyncSummary) -> Vec<String> {
+    let mut lines = summary_lines(summary);
+    if lines.len() > TOAST_LINES {
+        let more = lines.len() - TOAST_LINES;
+        lines.truncate(TOAST_LINES);
+        lines.push(tf!("And {} more.", "และอีก {} รายการ", more));
+    }
     lines
 }
 
@@ -850,7 +874,7 @@ fn apply(s: &mut App, done: Done) {
             after_failure(s, account::SIGN_IN_INVALID);
             // The pull's changes are written: say what they are under the sign-in text.
             if let Some(toast) = &mut s.toast {
-                for line in summary_lines(&summary) {
+                for line in toast_lines(&summary) {
                     toast.text.push('\n');
                     toast.text.push_str(&line);
                 }
@@ -2081,6 +2105,66 @@ mod tests {
             toast.text
         );
         assert!(toast.text.contains("x@y.z"), "{}", toast.text);
+    }
+
+    #[test]
+    fn a_rejected_push_with_nothing_done_does_not_say_up_to_date() {
+        let reason = "The project web is not in the cloud now. Run 'keyman unlink web'.";
+        let report = PullReport {
+            results: vec![PullResult::Skipped {
+                project: "web".into(),
+                reason: reason.into(),
+            }],
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let done = sync_outcome(
+            &report,
+            PushOutcome::Failed(account::SIGN_IN_INVALID.into()),
+        );
+        let mut app = App::for_tests();
+        app.busy = busy("Syncing…");
+        finish(&mut app, None, done);
+        assert_eq!(app.cloud, CloudState::SignedOut);
+        let text = &app.toast.as_ref().unwrap().text;
+        assert!(text.contains(reason), "{text}");
+        assert!(
+            !text.contains("All projects are up to date.")
+                && !text.contains("ทุกโปรเจกต์เป็นปัจจุบันแล้ว"),
+            "{text}"
+        );
+        // Both languages: the counts line is left out.
+        let summary = summarize(&report, &[]);
+        assert_eq!(summary_lines(&summary).len(), 1);
+    }
+
+    #[test]
+    fn a_long_list_in_a_toast_is_cut() {
+        let report = PullReport {
+            results: (0..8)
+                .map(|i| PullResult::Skipped {
+                    project: format!("p{i}"),
+                    reason: "why".into(),
+                })
+                .collect(),
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let lines = toast_lines(&summarize(&report, &[]));
+        assert_eq!(lines.len(), TOAST_LINES + 1);
+        assert!(
+            ["And 3 more.", "และอีก 3 รายการ"].contains(&lines[TOAST_LINES].as_str()),
+            "{}",
+            lines[TOAST_LINES]
+        );
+        // A short list is not cut.
+        report_fits();
+    }
+
+    fn report_fits() {
+        let lines = toast_lines(&summarize(&wrote(), &[]));
+        assert_eq!(lines.len(), summary_lines(&summarize(&wrote(), &[])).len());
+        assert!(lines.len() <= TOAST_LINES);
     }
 
     #[test]
