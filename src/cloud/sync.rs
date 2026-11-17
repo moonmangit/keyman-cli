@@ -18,6 +18,9 @@ use std::path::Path;
 /// The vault keys of one user: vault ID to (vault key, key generation).
 pub struct Vaults {
     by_id: HashMap<String, (Key, i64)>,
+    /// The vaults whose key opened as a personal key. Such a key never goes
+    /// to another person (see `groups::accept_pending`).
+    personal: HashSet<String>,
     memberships: Vec<Membership>,
 }
 
@@ -29,31 +32,66 @@ impl Vaults {
     }
 
     fn from_memberships(u: &Unlocked, memberships: &[Membership]) -> Vaults {
-        Vaults::from_pair(&u.pair, memberships)
+        Vaults::from_pair(&u.pair, memberships, u.personal_vault.as_deref())
     }
 
     /// The same, from a key pair. The key is stored with the generation of
     /// the membership it was unwrapped from. A wrapped key must be bound to
     /// its own vault and generation, so the server cannot move a key from
     /// one vault to another.
-    pub(crate) fn from_pair(pair: &KeyPair, memberships: &[Membership]) -> Vaults {
+    ///
+    /// A personal vault (the server says "personal", or it is `personal`, the
+    /// one this computer saved) must have a personal key, which only this key
+    /// pair can make. So the server cannot give the personal vault a key it
+    /// knows, also when it labels the personal vault as a group.
+    pub(crate) fn from_pair(
+        pair: &KeyPair,
+        memberships: &[Membership],
+        personal: Option<&str>,
+    ) -> Vaults {
+        let mut personal_ids = HashSet::new();
+        // A vault ID in more than one row comes from the server: such a vault
+        // gets no key, so a second row cannot replace the key of the first.
+        let mut seen = HashSet::new();
+        let doubled: HashSet<&str> = memberships
+            .iter()
+            .filter(|member| !seen.insert(member.vault_id.as_str()))
+            .map(|member| member.vault_id.as_str())
+            .collect();
         let by_id = memberships
             .iter()
+            .filter(|member| !doubled.contains(member.vault_id.as_str()))
             .filter_map(|member| {
-                let key = crypto::unwrap(
+                let is_personal =
+                    member.vaults.kind == "personal" || personal == Some(member.vault_id.as_str());
+                let unwrap = if is_personal {
+                    crypto::unwrap_personal
+                } else {
+                    crypto::unwrap
+                };
+                let key = unwrap(
                     pair,
                     &member.wrapped_key,
                     &member.vault_id,
                     member.key_generation,
                 )
                 .ok()?;
+                if is_personal {
+                    personal_ids.insert(member.vault_id.clone());
+                }
                 Some((member.vault_id.clone(), (key, member.key_generation)))
             })
             .collect();
         Vaults {
             by_id,
+            personal: personal_ids,
             memberships: memberships.to_vec(),
         }
+    }
+
+    /// True when the key of this vault opened as a personal key.
+    pub fn is_personal(&self, vault_id: &str) -> bool {
+        self.personal.contains(vault_id)
     }
 
     /// The memberships that were read when the keys were loaded.
@@ -70,6 +108,8 @@ impl Vaults {
 
 pub(crate) const NO_PERSONAL: &str = "You have no personal vault. Run 'keyman login' first.";
 pub(crate) const PERSONAL_CHANGED: &str = "The server changed your personal vault. Keyman stops.";
+pub(crate) const PERSONAL_KEY_BAD: &str =
+    "The key of your personal vault is not valid. Keyman stops.";
 const TWO_PERSONAL: &str = "The server shows more than one personal vault. Keyman stops.";
 
 /// The personal vault of `user_id` in the memberships. `pinned` is the
@@ -98,11 +138,19 @@ pub(crate) fn personal_in(
     }
 }
 
-/// The personal vault, checked against the one this computer saved. The
-/// first time, Keyman saves it.
-fn personal_vault(home: &Path, u: &Unlocked, memberships: &[Membership]) -> Result<String, String> {
+/// The personal vault, checked against the one this computer saved. Its key
+/// must be a personal key. The first time, Keyman saves it.
+fn personal_vault(
+    home: &Path,
+    u: &Unlocked,
+    memberships: &[Membership],
+    vaults: &Vaults,
+) -> Result<String, String> {
     let pinned = account::pinned_vault(&state::load(home)?, &u.user_id);
     let id = personal_in(memberships, &u.user_id, pinned.as_deref())?;
+    if vaults.key(&id).is_err() {
+        return Err(PERSONAL_KEY_BAD.to_string());
+    }
     account::pin_personal_vault(home, &u.user_id, &id)?;
     Ok(id)
 }
@@ -193,7 +241,7 @@ pub fn link(home: &Path, u: &Unlocked, project: &str, group: Option<&str>) -> Re
     let vaults = Vaults::from_memberships(u, &memberships);
     let vault_id = match group {
         Some(name) => group_vault(&vaults, name)?,
-        None => personal_vault(home, u, &memberships)?,
+        None => personal_vault(home, u, &memberships, &vaults)?,
     };
     let (key, generation) = vaults.key(&vault_id)?;
     let existing = u.api.projects(std::slice::from_ref(&vault_id))?;
@@ -251,6 +299,15 @@ fn older_in_cloud(project: &str, link_version: i64, cloud_version: i64) -> Optio
             "The cloud has an older version of {project} than this computer. Keyman did not change it."
         )
     })
+}
+
+/// A linked project stays in its vault. Keyman never moves a project, so a
+/// row in another vault comes from the server: if Keyman followed it, the
+/// next push would seal the project with the key of that vault, which the
+/// server can know.
+fn moved_to_other_vault(project: &str, link_vault: &str, cloud_vault: &str) -> Option<String> {
+    (link_vault != cloud_vault)
+        .then(|| format!("The server moved {project} to another vault. Keyman did not change it."))
 }
 
 /// A push changes the version from `link_version` to exactly one more.
@@ -448,7 +505,9 @@ pub fn pull(
             }
         }
         if let Some(link) = &linked {
-            if let Some(reason) = older_in_cloud(&link.project, link.version, row.version) {
+            let refused = moved_to_other_vault(&link.project, &link.vault_id, &row.vault_id)
+                .or_else(|| older_in_cloud(&link.project, link.version, row.version));
+            if let Some(reason) = refused {
                 matched = true;
                 results.push(PullResult::Skipped {
                     project: link.project.clone(),
@@ -504,14 +563,14 @@ pub fn pull(
                             master::atomic_write(&path, text.as_bytes())?;
                         }
                         // (b) then the link: the base is the cloud copy, not the merge.
+                        // The vault never changes here: a row in another vault
+                        // is refused above (`moved_to_other_vault`).
                         let moved = link.version != row.version
-                            || link.vault_id != row.vault_id
                             || link.cloud_name != cloud_name
                             || !same_vars(&link.base, &cloud_vars);
                         if moved {
                             if let Some(stored) = st.link_mut(&name) {
                                 stored.version = row.version;
-                                stored.vault_id = row.vault_id.clone();
                                 stored.cloud_name = cloud_name.clone();
                                 stored.base = cloud_vars;
                             }
@@ -884,12 +943,19 @@ mod tests {
         }
     }
 
+    /// A membership as the server returns it. A "personal" row carries a
+    /// personal key (as Keyman makes it); other rows carry a sealed box.
     fn member(pair: &KeyPair, id: &str, kind: &str, wrapped_for: &str, key: &Key) -> Membership {
+        let wrapped_key = if kind == "personal" {
+            crypto::wrap_personal(pair, key, wrapped_for, 1)
+        } else {
+            crypto::wrap_for(&pair.public, key, wrapped_for, 1)
+        };
         Membership {
             vault_id: id.to_string(),
             user_id: "me".to_string(),
             role: "owner".to_string(),
-            wrapped_key: crypto::wrap_for(&pair.public, key, wrapped_for, 1),
+            wrapped_key,
             key_generation: 1,
             vaults: crate::cloud::api::VaultRow {
                 kind: kind.to_string(),
@@ -904,17 +970,59 @@ mod tests {
     fn a_key_moved_to_another_vault_is_not_used() {
         let pair = KeyPair::generate();
         let group_key = Key::random();
-        // The server puts the wrapped key of the group on the personal vault row.
-        let memberships = vec![
-            member(&pair, "group", "group", "group", &group_key),
-            member(&pair, "personal", "personal", "group", &group_key),
-        ];
-        let vaults = Vaults::from_pair(&pair, &memberships);
+        // The server copies the wrapped key of the group (a sealed box) onto
+        // the personal vault row.
+        let group_row = member(&pair, "group", "group", "group", &group_key);
+        let mut moved = group_row.clone();
+        moved.vault_id = "personal".to_string();
+        moved.vaults.kind = "personal".to_string();
+        let memberships = vec![group_row, moved];
+        let vaults = Vaults::from_pair(&pair, &memberships, None);
         assert!(vaults.key("group").is_ok());
         assert_eq!(
             vaults.key("personal").err().unwrap(),
             "Keyman has no key for this vault."
         );
+    }
+
+    /// A sealed box that the server made itself, with the right binding.
+    fn server_made(pair: &KeyPair, id: &str, kind: &str, key: &Key) -> Membership {
+        let mut row = member(pair, id, "group", id, key);
+        row.vaults.kind = kind.to_string();
+        row
+    }
+
+    #[test]
+    fn a_vault_in_two_rows_gets_no_key() {
+        let pair = KeyPair::generate();
+        let real = member(&pair, "p1", "personal", "p1", &Key::random());
+        // A second row for the same vault, with a key the server made.
+        let mut second = member(&pair, "p1", "group", "p1", &Key::random());
+        second.vaults.kind = "group".to_string();
+        let vaults = Vaults::from_pair(&pair, &[real, second], None);
+        assert!(vaults.key("p1").is_err());
+        assert!(!vaults.is_personal("p1"));
+    }
+
+    #[test]
+    fn a_personal_vault_needs_a_personal_key() {
+        let pair = KeyPair::generate();
+        let server_key = Key::random();
+        // The server makes its own key for the personal vault.
+        let rows = vec![server_made(&pair, "p1", "personal", &server_key)];
+        let vaults = Vaults::from_pair(&pair, &rows, None);
+        assert!(vaults.key("p1").is_err());
+        // The server labels the saved personal vault as a group.
+        let rows = vec![server_made(&pair, "p1", "group", &server_key)];
+        let vaults = Vaults::from_pair(&pair, &rows, Some("p1"));
+        assert!(vaults.key("p1").is_err());
+        // Without the saved vault, a real group with a sealed key still opens.
+        let vaults = Vaults::from_pair(&pair, &rows, None);
+        assert!(vaults.key("p1").is_ok());
+        // The personal key that Keyman makes opens.
+        let rows = vec![member(&pair, "p1", "personal", "p1", &Key::random())];
+        let vaults = Vaults::from_pair(&pair, &rows, Some("p1"));
+        assert!(vaults.key("p1").is_ok());
     }
 
     #[test]
@@ -963,6 +1071,11 @@ mod tests {
                     .to_string()
             )
         );
+        assert_eq!(
+            moved_to_other_vault("app", "personal", "fake-group").unwrap(),
+            "The server moved app to another vault. Keyman did not change it."
+        );
+        assert_eq!(moved_to_other_vault("app", "v1", "v1"), None);
         assert_eq!(older_in_cloud("app", 5, 5), None);
         assert_eq!(older_in_cloud("app", 5, 6), None);
     }

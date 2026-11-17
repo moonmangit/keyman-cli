@@ -656,6 +656,31 @@ fn vault_key_moved_to_the_personal_vault_is_not_used() {
 
 #[test]
 #[ignore = "needs a local Supabase stack (see the file comment)"]
+fn server_made_personal_key_is_refused() {
+    let local = local();
+    let c1 = Computer::new("server-key", APP);
+    c1.set_up(local, "server-key");
+    let personal = saved_personal_vault(&c1);
+
+    // The server knows the public key, so it can seal a key of its own with
+    // the right binding. Keyman must not use it for the personal vault.
+    let public = c1.unlocked().pair.public;
+    let server_key = keyman_cli::cloud::crypto::Key::random();
+    let fake = keyman_cli::cloud::crypto::wrap_for(&public, &server_key, &personal, 1);
+    local.service_patch(
+        &format!("/rest/v1/vault_members?vault_id=eq.{personal}"),
+        json!({"wrapped_key": fake}),
+    );
+    let error = sync::link(&c1.home, &c1.unlocked(), "app", None).unwrap_err();
+    assert_eq!(
+        error,
+        "The key of your personal vault is not valid. Keyman stops."
+    );
+    assert!(state::load(&c1.home).unwrap().links.is_empty());
+}
+
+#[test]
+#[ignore = "needs a local Supabase stack (see the file comment)"]
 fn cloud_roll_back_is_skipped() {
     let local = local();
     let c1 = Computer::new("rollback", APP);

@@ -36,6 +36,10 @@ pub struct Unlocked {
     pub api: Api,
     pub pair: KeyPair,
     pub user_id: String,
+    /// The personal vault that this computer saved for this user. Its key
+    /// must be a personal key (`crypto::unwrap_personal`), whatever kind the
+    /// server reports for it.
+    pub personal_vault: Option<String>,
 }
 
 /// The questions Keyman asks. The terminal and tests implement it.
@@ -213,7 +217,8 @@ fn check_owner(profile: &Profile, user_id: &str) -> Result<(), String> {
 }
 
 /// Makes the personal vault and returns its ID. The ID is made here, so the
-/// wrapped key is bound to it (generation 1).
+/// wrapped key is bound to it (generation 1). The key is a personal key: only
+/// this key pair can make it, so the server cannot put in a key of its own.
 fn create_personal_vault(api: &Api, pair: &KeyPair) -> Result<String, String> {
     let id = api::new_uuid();
     let vault_key = Key::random();
@@ -221,7 +226,7 @@ fn create_personal_vault(api: &Api, pair: &KeyPair) -> Result<String, String> {
         &id,
         "personal",
         None,
-        &crypto::wrap_for(&pair.public, &vault_key, &id, 1),
+        &crypto::wrap_personal(pair, &vault_key, &id, 1),
     )?;
     Ok(id)
 }
@@ -381,7 +386,8 @@ fn ensure_personal_vault(home: &Path, api: &Api, pair: &KeyPair) -> Result<Strin
                 .iter()
                 .find(|member| member.vault_id == id)
                 .ok_or_else(|| sync::PERSONAL_CHANGED.to_string())?;
-            crypto::unwrap(pair, &member.wrapped_key, &id, member.key_generation)?;
+            crypto::unwrap_personal(pair, &member.wrapped_key, &id, member.key_generation)
+                .map_err(|_| sync::PERSONAL_KEY_BAD.to_string())?;
             Ok(id)
         }
         Err(error) if error == sync::NO_PERSONAL => create_personal_vault(api, pair),
@@ -553,7 +559,13 @@ pub fn session(
     } else {
         unlock_from_server(&api, prompt)?
     };
-    Ok(Unlocked { api, pair, user_id })
+    let personal_vault = pinned_vault(&state::load(home)?, &user_id);
+    Ok(Unlocked {
+        api,
+        pair,
+        user_id,
+        personal_vault,
+    })
 }
 
 /// Set a new vault password with the recovery code. With no saved session,

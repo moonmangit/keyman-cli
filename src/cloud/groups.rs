@@ -151,6 +151,8 @@ fn names(vaults: &Vaults) -> Vec<(String, String)> {
     vaults
         .memberships()
         .iter()
+        // A vault with a personal key is never a group.
+        .filter(|member| !vaults.is_personal(&member.vault_id))
         .filter_map(|member| Some((member.vault_id.clone(), group_name(vaults, member)?)))
         .collect()
 }
@@ -302,6 +304,12 @@ pub struct Accepted {
     pub warnings: Vec<String>,
 }
 
+/// Keyman gives a vault key to another person only for a group that it found
+/// by name (its name opened with the group key), and never a personal key.
+fn may_give_access(vaults: &Vaults, groups: &HashMap<String, String>, vault_id: &str) -> bool {
+    groups.contains_key(vault_id) && !vaults.is_personal(vault_id)
+}
+
 /// For each invite in my groups whose email has a profile: wrap the vault
 /// key for that profile and accept. An invite with no profile is skipped:
 /// the person has not set up Keyman Cloud yet. A problem with one invite
@@ -313,6 +321,12 @@ pub fn accept_pending(u: &Unlocked, vaults: &Vaults) -> Result<Accepted, String>
     ids.sort();
     let mut result = Accepted::default();
     for invite in u.api.invites_for_vaults(&ids)? {
+        // The server chooses which invites it returns. Only an invite to one
+        // of my groups is used, and never a personal key: else the server
+        // could get the key of the personal vault with a false invite.
+        if !may_give_access(vaults, &group_names, &invite.vault_id) {
+            continue;
+        }
         let Ok((key, generation)) = vaults.key(&invite.vault_id) else {
             continue;
         };
@@ -613,7 +627,7 @@ mod tests {
             Some("a\u{202E}b\u{200B}c\u{2066}d"),
             "me",
         );
-        let vaults = Vaults::from_pair(&pair, std::slice::from_ref(&m));
+        let vaults = Vaults::from_pair(&pair, std::slice::from_ref(&m), None);
         assert_eq!(group_name(&vaults, &m).unwrap(), "a?b?c?d");
         // the sealed text keeps the original, for re-sealing
         assert_eq!(
@@ -627,7 +641,7 @@ mod tests {
         let f = fixture();
         let mut memberships = f.memberships.clone();
         memberships.push(membership(&f.pair, "v3", "group", Some("billing"), "other"));
-        let vaults = Vaults::from_pair(&f.pair, &memberships);
+        let vaults = Vaults::from_pair(&f.pair, &memberships, None);
         assert_eq!(
             crate::cloud::sync::group_vault(&vaults, "billing").unwrap_err(),
             "You are in more than one group named 'billing'."
@@ -720,11 +734,16 @@ mod tests {
     ) -> Membership {
         let key = Key::random();
         let sealed = name.map(|n| crypto::seal(&key, &crypto::vault_name_aad(id), n.as_bytes()));
+        let wrapped_key = if kind == "personal" {
+            crypto::wrap_personal(pair, &key, id, 1)
+        } else {
+            crypto::wrap_for(&pair.public, &key, id, 1)
+        };
         Membership {
             vault_id: id.to_string(),
             user_id: "me".to_string(),
             role: if owner == "me" { "owner" } else { "member" }.to_string(),
-            wrapped_key: crypto::wrap_for(&pair.public, &key, id, 1),
+            wrapped_key,
             key_generation: 1,
             vaults: VaultRow {
                 kind: kind.to_string(),
@@ -764,7 +783,7 @@ mod tests {
     #[test]
     fn find_gives_the_vault_of_a_group_name() {
         let f = fixture();
-        let vaults = Vaults::from_pair(&f.pair, &f.memberships);
+        let vaults = Vaults::from_pair(&f.pair, &f.memberships, None);
         assert_eq!(find_in(&vaults, "team-api").unwrap(), "v1");
         assert_eq!(find_in(&vaults, "billing").unwrap(), "v2");
         assert_eq!(
@@ -776,7 +795,7 @@ mod tests {
     #[test]
     fn a_personal_vault_is_never_a_group() {
         let f = fixture();
-        let vaults = Vaults::from_pair(&f.pair, &f.memberships);
+        let vaults = Vaults::from_pair(&f.pair, &f.memberships, None);
         assert!(group_name(&vaults, &f.memberships[0]).is_none());
         assert_eq!(
             find_in(&vaults, "").unwrap_err(),
@@ -785,9 +804,27 @@ mod tests {
     }
 
     #[test]
+    fn a_personal_key_is_never_given_to_an_invite() {
+        let f = fixture();
+        let vaults = Vaults::from_pair(&f.pair, &f.memberships, None);
+        let groups: HashMap<String, String> = names(&vaults).into_iter().collect();
+        // v0 is the personal vault: a false invite for it is not used.
+        assert!(vaults.key("v0").is_ok());
+        assert!(vaults.is_personal("v0"));
+        assert!(!may_give_access(&vaults, &groups, "v0"));
+        // A real group of mine is used; a vault I do not know is not.
+        assert!(may_give_access(&vaults, &groups, "v1"));
+        assert!(!may_give_access(&vaults, &groups, "unknown"));
+        // Even if the server puts a personal vault in the group list.
+        let mut forged = groups.clone();
+        forged.insert("v0".to_string(), "team".to_string());
+        assert!(!may_give_access(&vaults, &forged, "v0"));
+    }
+
+    #[test]
     fn list_counts_members_and_invites() {
         let f = fixture();
-        let vaults = Vaults::from_pair(&f.pair, &f.memberships);
+        let vaults = Vaults::from_pair(&f.pair, &f.memberships, None);
         let members = vec![
             other_member("v1", "me"),
             other_member("v1", "u2"),
@@ -817,7 +854,7 @@ mod tests {
         let f = fixture();
         let mut memberships = f.memberships.clone();
         memberships.push(membership(&f.pair, "v3", "group", Some("billing"), "other"));
-        let vaults = Vaults::from_pair(&f.pair, &memberships);
+        let vaults = Vaults::from_pair(&f.pair, &memberships, None);
         assert_eq!(
             find_in(&vaults, "billing").unwrap_err(),
             "You are in more than one group named 'billing'."
@@ -843,7 +880,7 @@ mod tests {
     fn control_characters_in_a_name_are_replaced() {
         let pair = KeyPair::generate();
         let m = membership(&pair, "v9", "group", Some("a\u{1b}[31mb"), "me");
-        let vaults = Vaults::from_pair(&pair, std::slice::from_ref(&m));
+        let vaults = Vaults::from_pair(&pair, std::slice::from_ref(&m), None);
         assert_eq!(group_name(&vaults, &m).unwrap(), "a?[31mb");
     }
 

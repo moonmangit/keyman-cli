@@ -202,8 +202,71 @@ pub fn unwrap(
     if plain.len() != binding.len() + 32 || !plain.starts_with(binding.as_bytes()) {
         return Err(fail());
     }
-    let array: [u8; 32] = plain[binding.len()..].try_into().map_err(|_| fail())?;
-    Ok(Key::from_bytes(array))
+    key_from_plain(&plain[binding.len()..]).ok_or_else(fail)
+}
+
+/// The 32 key bytes at the end of an opened wrap. The copy on the stack is
+/// wiped.
+fn key_from_plain(bytes: &[u8]) -> Option<Key> {
+    let mut array: [u8; 32] = bytes.try_into().ok()?;
+    let key = Key::from_bytes(array);
+    array.zeroize();
+    Some(key)
+}
+
+/// The text in front of a personal vault key. It is different from the group
+/// binding, so a key of one kind never opens as the other kind.
+fn personal_key_binding(vault_id: &str, generation: i64) -> String {
+    format!("keyman/v1|personal-key|{vault_id}|{generation}|")
+}
+
+/// Seals the personal vault key from the user to the user (an authenticated
+/// box: the user's secret key is the sender and the receiver). The server
+/// knows only the public key, so it cannot make a box that opens here. A
+/// sealed box (`wrap_for`) has no sender, and anyone can make one.
+pub fn wrap_personal(pair: &KeyPair, key: &Key, vault_id: &str, generation: i64) -> String {
+    use crypto_box::aead::{Aead, AeadCore};
+    let mut plain = Zeroizing::new(personal_key_binding(vault_id, generation).into_bytes());
+    plain.extend_from_slice(key.0.as_slice());
+    let secret = SecretKey::from_bytes(*pair.secret.0);
+    let boxed = crypto_box::SalsaBox::new(&PublicKey::from(pair.public), &secret);
+    let nonce = crypto_box::SalsaBox::generate_nonce(&mut crypto_box::aead::OsRng);
+    let ciphertext = boxed
+        .encrypt(&nonce, plain.as_slice())
+        .expect("sealing the key failed");
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&ciphertext);
+    STANDARD.encode(out)
+}
+
+/// Opens a personal vault key. Only a box that this key pair made opens, and
+/// its binding must be for `vault_id` and `generation`. Every failure gives
+/// the same error.
+pub fn unwrap_personal(
+    pair: &KeyPair,
+    wrapped: &str,
+    vault_id: &str,
+    generation: i64,
+) -> Result<Key, String> {
+    use crypto_box::aead::Aead;
+    let fail = || UNWRAP_ERROR.to_string();
+    let raw = STANDARD.decode(wrapped.trim()).map_err(|_| fail())?;
+    if raw.len() < NONCE_LEN {
+        return Err(fail());
+    }
+    let (nonce, ciphertext) = raw.split_at(NONCE_LEN);
+    let secret = SecretKey::from_bytes(*pair.secret.0);
+    let boxed = crypto_box::SalsaBox::new(&PublicKey::from(pair.public), &secret);
+    let plain = Zeroizing::new(
+        boxed
+            .decrypt(crypto_box::Nonce::from_slice(nonce), ciphertext)
+            .map_err(|_| fail())?,
+    );
+    let binding = personal_key_binding(vault_id, generation);
+    if plain.len() != binding.len() + 32 || !plain.starts_with(binding.as_bytes()) {
+        return Err(fail());
+    }
+    key_from_plain(&plain[binding.len()..]).ok_or_else(fail)
 }
 
 /// A recovery code: 20 random bytes as Crockford base32, 8 groups of 4.
@@ -434,6 +497,77 @@ mod tests {
         let wrapped = wrap_for(&p.public, &Key::random(), "v|1", 2);
         assert!(unwrap(&p, &wrapped, "v", 1).is_err());
         assert!(unwrap(&p, &wrapped, "v|1", 2).is_ok());
+    }
+
+    #[test]
+    fn personal_wrap_round_trip() {
+        let p = KeyPair::generate();
+        let k = Key::random();
+        let wrapped = wrap_personal(&p, &k, "v1", 1);
+        assert_eq!(
+            unwrap_personal(&p, &wrapped, "v1", 1).unwrap().to_base64(),
+            k.to_base64()
+        );
+    }
+
+    #[test]
+    fn a_key_the_server_seals_is_not_a_personal_key() {
+        // The server knows the public key, so it can make a sealed box with
+        // the right binding text. It must not open as a personal key.
+        let p = KeyPair::generate();
+        let attacker_key = Key::random();
+        let mut plain = personal_key_binding("v1", 1).into_bytes();
+        plain.extend_from_slice(attacker_key.0.as_slice());
+        let sealed = PublicKey::from(p.public)
+            .seal(&mut crypto_box::aead::OsRng, &plain)
+            .unwrap();
+        let wrapped = STANDARD.encode(sealed);
+        assert_eq!(
+            unwrap_personal(&p, &wrapped, "v1", 1).err().unwrap(),
+            UNWRAP_ERROR
+        );
+        let group_style = wrap_for(&p.public, &attacker_key, "v1", 1);
+        assert_eq!(
+            unwrap_personal(&p, &group_style, "v1", 1).err().unwrap(),
+            UNWRAP_ERROR
+        );
+    }
+
+    #[test]
+    fn a_personal_key_made_by_another_pair_is_refused() {
+        let victim = KeyPair::generate();
+        let attacker = KeyPair::generate();
+        // The attacker uses their own secret key and the victim's public key.
+        let fake = KeyPair {
+            public: victim.public,
+            secret: Key::from_base64(&attacker.secret.to_base64()).unwrap(),
+        };
+        let wrapped = wrap_personal(&fake, &Key::random(), "v1", 1);
+        assert_eq!(
+            unwrap_personal(&victim, &wrapped, "v1", 1).err().unwrap(),
+            UNWRAP_ERROR
+        );
+    }
+
+    #[test]
+    fn a_personal_key_is_bound_to_its_vault_and_generation() {
+        let p = KeyPair::generate();
+        let wrapped = wrap_personal(&p, &Key::random(), "v1", 1);
+        assert!(unwrap_personal(&p, &wrapped, "v2", 1).is_err());
+        assert!(unwrap_personal(&p, &wrapped, "v1", 2).is_err());
+        // A personal key does not open as a group key either.
+        assert_eq!(unwrap(&p, &wrapped, "v1", 1).err().unwrap(), UNWRAP_ERROR);
+    }
+
+    #[test]
+    fn a_bad_personal_wrap_is_refused_without_a_panic() {
+        let p = KeyPair::generate();
+        for bad in ["", "not base64!", "AAAA", &STANDARD.encode([0u8; 30])] {
+            assert_eq!(
+                unwrap_personal(&p, bad, "v1", 1).err().unwrap(),
+                UNWRAP_ERROR
+            );
+        }
     }
 
     #[test]
