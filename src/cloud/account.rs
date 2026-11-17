@@ -5,7 +5,7 @@ use super::auth;
 use super::config::config;
 use super::crypto::{self, KdfParams, Key, KeyPair};
 use super::keystore::Store;
-use super::state;
+use super::state::{self, State};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -22,6 +22,9 @@ const CODE_MISMATCH: &str =
     "The code is not the same. Nothing is saved. Run 'keyman login' to start again.";
 const PRIVATE_KEY: &str = "private_key";
 const SESSION: &str = "session";
+const NO_CLOUD: &str = "You do not have Keyman Cloud yet. Run 'keyman login' to set it up.";
+const RECOVER_HINT: &str = "Run 'keyman recover' to use your recovery code.";
+const USER_SWITCHED: &str = "You signed in as a different user. Keyman removed the cloud links of the old user. Your local projects did not change.";
 const PASSWORD_TRIES: usize = 3;
 const CODE_TRIES: usize = 3;
 
@@ -218,11 +221,29 @@ pub fn setup_profile(
     Ok(pair)
 }
 
+/// Record the signed-in user. When it is a different user than before, the
+/// old links go away (they belong to the old user). Returns true then.
+fn switch_user(st: &mut State, user_id: &str) -> bool {
+    let switched = st.user_id.as_deref().is_some_and(|old| old != user_id);
+    if switched {
+        st.links.clear();
+    }
+    st.user_id = Some(user_id.to_string());
+    switched
+}
+
+/// True when there is no saved session, so a browser sign-in must come first.
+fn needs_sign_in(store: &dyn Store, st: &State) -> Result<bool, String> {
+    Ok(saved_refresh_token(store, st)?.is_none())
+}
+
 /// Save the refresh token (store, or the state file when there is no store)
 /// and the account name.
 fn store_session(home: &Path, store: &dyn Store, session: &Session) -> Result<(), String> {
     let mut st = state::load(home)?;
-    st.user_id = Some(session.user_id.clone());
+    if switch_user(&mut st, &session.user_id) {
+        crate::ui::warning(USER_SWITCHED);
+    }
     st.email = Some(session.email.clone());
     if store.available() {
         let stored = StoredSession {
@@ -291,6 +312,13 @@ pub fn login(
                         crate::ui::warning(&error);
                         attempt += 1;
                     }
+                    Err(error) if error == WRONG_PASSWORD => {
+                        return Err(format!(
+                            "{error}
+
+{RECOVER_HINT}"
+                        ))
+                    }
                     Err(error) => return Err(error),
                 }
             };
@@ -345,16 +373,33 @@ pub fn session(
     Ok(Unlocked { api, pair, user_id })
 }
 
-/// Set a new vault password with the recovery code.
-pub fn recover(home: &Path, store: &dyn Store, prompt: &mut dyn Prompt) -> Result<(), String> {
-    let api = signed_in(home, store)?;
-    let profile = api.my_profile()?.ok_or_else(|| NO_PROFILE.to_string())?;
+/// Set a new vault password with the recovery code. With no saved session,
+/// `provider` is called to pick a provider, and Keyman signs in first.
+pub fn recover(
+    home: &Path,
+    store: &dyn Store,
+    provider: &mut dyn FnMut() -> Result<&'static str, String>,
+    prompt: &mut dyn Prompt,
+) -> Result<(), String> {
+    let st = state::load(home)?;
+    let (api, fresh) = if needs_sign_in(store, &st)? {
+        let cfg = config();
+        let session = auth::sign_in_with_browser(&cfg, provider()?)?;
+        (Api::new(cfg, session.clone()), Some(session))
+    } else {
+        (signed_in(home, store)?, None)
+    };
+    let profile = api.my_profile()?.ok_or_else(|| NO_CLOUD.to_string())?;
     let code = Zeroizing::new(prompt.recovery_code()?);
     let pair = unlock_with_recovery(&profile, &code)?;
     let password = Zeroizing::new(prompt.new_password()?);
     let updated = reseal_all(&profile, &pair, &password, &code)?;
     api.put_profile(&updated)?;
-    remember_key(store, &pair)
+    remember_key(store, &pair)?;
+    if let Some(session) = fresh {
+        store_session(home, store, &session)?;
+    }
+    Ok(())
 }
 
 /// Change the vault password. The recovery copy stays as it is, so the
@@ -598,5 +643,57 @@ mod tests {
         let store = crate::cloud::keystore::MemoryStore::new();
         let error = signed_in(&home, &store).err().unwrap();
         assert_eq!(error, "You are not signed in. Run 'keyman login' first.");
+    }
+
+    #[test]
+    fn no_session_means_sign_in_first() {
+        let home = temp_home("needs");
+        let store = crate::cloud::keystore::MemoryStore::new();
+        let st = state::load(&home).unwrap();
+        assert!(needs_sign_in(&store, &st).unwrap());
+        store_session(&home, &store, &sample_session()).unwrap();
+        let st = state::load(&home).unwrap();
+        assert!(!needs_sign_in(&store, &st).unwrap());
+        let mut st = state::State::default();
+        assert!(needs_sign_in(&NoStore, &st).unwrap());
+        st.refresh_token = Some("t".into());
+        assert!(!needs_sign_in(&NoStore, &st).unwrap());
+    }
+
+    #[test]
+    fn a_different_user_loses_the_old_links() {
+        let home = temp_home("switch");
+        let store = crate::cloud::keystore::MemoryStore::new();
+        let mut st = state::State {
+            user_id: Some("user-A".into()),
+            ..Default::default()
+        };
+        st.set_link(state::Link {
+            project: "app".into(),
+            cloud_id: "c1".into(),
+            vault_id: "v1".into(),
+            version: 1,
+            base: vec![("K".into(), "v".into())],
+        });
+        state::save(&home, &st).unwrap();
+        // The same user keeps the links.
+        let mut same = sample_session();
+        same.user_id = "user-A".into();
+        store_session(&home, &store, &same).unwrap();
+        assert_eq!(state::load(&home).unwrap().links.len(), 1);
+        // A different user does not.
+        let mut other = sample_session();
+        other.user_id = "user-B".into();
+        store_session(&home, &store, &other).unwrap();
+        let after = state::load(&home).unwrap();
+        assert!(after.links.is_empty());
+        assert_eq!(after.user_id.as_deref(), Some("user-B"));
+    }
+
+    #[test]
+    fn first_user_keeps_links() {
+        let mut st = state::State::default();
+        assert!(!switch_user(&mut st, "user-A"));
+        assert_eq!(st.user_id.as_deref(), Some("user-A"));
     }
 }

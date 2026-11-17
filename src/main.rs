@@ -120,7 +120,12 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
             ui::success("Signed out. Keyman removed the keys from this computer.")
         }
         "recover" => {
-            account::recover(&home_dir()?, &SystemStore, &mut TerminalPrompt)?;
+            account::recover(
+                &home_dir()?,
+                &SystemStore,
+                &mut || choose_provider(&flags),
+                &mut TerminalPrompt,
+            )?;
             ui::success("The vault password is changed.")
         }
         "password" => {
