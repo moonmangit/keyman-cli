@@ -1,14 +1,14 @@
 mod cli;
 mod completions;
-mod master;
-mod save;
-mod ui;
+
+use keyman_cli::envfile::{self, Change};
+use keyman_cli::{master, save, ui};
 
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process::{self, Command};
 
 use cli::Parsed;
 use master::{home_dir, read_master, Variables};
@@ -87,7 +87,7 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
             let (project, variables) = project_for(arg(0))?;
             let directory = arg(1).map_or_else(|| PathBuf::from("."), PathBuf::from);
             let injected = inject(&variables, &directory)?;
-            if env_file_unignored(&injected.path) {
+            if envfile::unignored(&injected.path) {
                 ui::warning(".env is not ignored by Git in this repository. Add '.env' to .gitignore so you do not commit secrets.");
             }
             injected.message(&project, variables.len())
@@ -383,13 +383,7 @@ fn save_command(
 
 /// Reads DIRECTORY/.env (default: the current directory).
 fn read_env_file(directory: Option<&OsString>) -> Result<(PathBuf, Variables), String> {
-    let env_path = directory
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join(".env");
-    let text = fs::read_to_string(&env_path)
-        .map_err(|error| format!("cannot read '{}': {error}", display_path(&env_path)))?;
-    let variables = save::parse_dotenv(&text)?;
-    Ok((env_path, variables))
+    envfile::read(&directory.map_or_else(|| PathBuf::from("."), PathBuf::from))
 }
 
 /// A git-style diff from the master file (red -) to .env (green +).
@@ -519,13 +513,6 @@ fn edit(home: &Path) -> Result<String, String> {
     )))
 }
 
-#[derive(Debug, PartialEq)]
-enum Change {
-    Created,
-    Replaced,
-    Unchanged,
-}
-
 #[derive(Debug)]
 struct Injected {
     path: PathBuf,
@@ -545,28 +532,7 @@ impl Injected {
 }
 
 fn inject(variables: &[(String, String)], target_directory: &Path) -> Result<Injected, String> {
-    let output = master::format_variables(variables, "");
-    let target = fs::canonicalize(target_directory).map_err(|error| {
-        format!(
-            "target directory '{}' does not exist: {error}",
-            display_path(target_directory)
-        )
-    })?;
-    if !target.is_dir() {
-        return Err(format!("'{}' is not a directory", display_path(&target)));
-    }
-
-    let path = target.join(".env");
-    let change = match fs::read(&path) {
-        Ok(existing) if existing == output.as_bytes() => Change::Unchanged,
-        Ok(_) => Change::Replaced,
-        Err(_) => Change::Created,
-    };
-    if change == Change::Unchanged {
-        master::set_private_permissions(&path)?;
-    } else {
-        master::atomic_write(&path, output.as_bytes())?;
-    }
+    let (path, change) = envfile::write(variables, target_directory)?;
     Ok(Injected { path, change })
 }
 
@@ -597,25 +563,13 @@ fn run(variables: &[(String, String)], command: &[OsString]) -> Result<i32, Stri
     Ok(status.code().unwrap_or(1))
 }
 
-/// True only when Git reports that the .env file is inside a repository and
-/// not ignored. Missing Git or a non-repository directory gives false.
-fn env_file_unignored(env_file: &Path) -> bool {
-    let Some(directory) = env_file.parent() else {
-        return false;
-    };
-    Command::new("git")
-        .args(["check-ignore", "-q", ".env"])
-        .current_dir(directory)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.code() == Some(1))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Numbers each fixture so tests running in parallel never share a folder.
+    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
     struct Fixture {
         root: PathBuf,
@@ -627,11 +581,10 @@ mod tests {
             let root = env::temp_dir().join(format!(
                 "keyman-test-{}-{}",
                 process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
             ));
+            // A folder left by an earlier run with the same process ID.
+            let _ = fs::remove_dir_all(&root);
             let home = root.join("home");
             fs::create_dir_all(&home).unwrap();
             fs::write(root.join("master.yml"), master).unwrap();

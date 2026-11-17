@@ -223,7 +223,6 @@ pub fn project_variables(yaml: &str, project_name: &str) -> Result<Variables, St
     Ok(output)
 }
 
-#[cfg(test)]
 pub fn render_project(yaml: &str, project_name: &str) -> Result<String, String> {
     Ok(format_variables(
         &project_variables(yaml, project_name)?,

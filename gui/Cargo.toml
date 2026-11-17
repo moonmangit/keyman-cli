@@ -1,0 +1,35 @@
+[package]
+name = "keyman-app"
+version = "0.1.0"
+edition = "2024"
+description = "Desktop app for Keyman: manage project secrets and .env files"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "keyman-app"
+path = "src/main.rs"
+
+[build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+keyman-cli = { path = ".." }
+rune = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a", features = ["native-file-dialog"] }
+rune-i18n = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a" }
+
+# Its own workspace, so the CLI keeps building on stable without Rune's toolchain.
+[workspace]
+
+# Rune ships patched copies of these crates and asks apps that build it to patch them too
+# (a dependency's [patch] does not reach the workspace that depends on it).
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a" }
+
+[profile.release]
+lto = "thin"
+strip = true
