@@ -146,18 +146,35 @@ pub struct App {
 
 impl App {
     fn new(handle: Option<AppHandle<App>>, prefs: Prefs) -> App {
+        let home = keyman_cli::master::home_dir().ok();
+        let cloud = home
+            .as_deref()
+            .map_or(CloudState::SignedOut, cloud::initial_state);
+        let mut app = App::build(handle, prefs, home, cloud);
+        i18n::set(app.settings.language);
+        app.reload();
+        app
+    }
+
+    /// An app for unit tests: no window, no home folder, no credential store, no reload.
+    #[cfg(test)]
+    pub fn for_tests() -> App {
+        App::build(None, Prefs::memory(), None, CloudState::SignedOut)
+    }
+
+    fn build(
+        handle: Option<AppHandle<App>>,
+        prefs: Prefs,
+        home: Option<PathBuf>,
+        cloud: CloudState,
+    ) -> App {
         let settings = Settings::load(&prefs);
-        i18n::set(settings.language);
         let ties = if settings.remember_folders {
             Ties::load(&prefs)
         } else {
             Ties::default()
         };
-        let home = keyman_cli::master::home_dir().ok();
-        let cloud = home
-            .as_deref()
-            .map_or(CloudState::SignedOut, cloud::initial_state);
-        let mut app = App {
+        App {
             home,
             handle,
             prefs,
@@ -178,9 +195,7 @@ impl App {
             cloud,
             busy: None,
             question: None,
-        };
-        app.reload();
-        app
+        }
     }
 
     pub fn home(&self) -> Result<PathBuf, String> {

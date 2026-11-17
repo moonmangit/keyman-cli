@@ -41,8 +41,8 @@ pub struct Busy {
     pub cancel: Arc<AtomicBool>,
 }
 
-/// A question from the library for the person.
-#[derive(Clone, PartialEq)]
+/// A question from the library for the person. Not `Clone`: secrets are not copied.
+#[derive(PartialEq)]
 pub enum Ask {
     NewPassword,
     Password {
@@ -50,15 +50,15 @@ pub enum Ask {
     },
     RecoveryCode,
     /// Show this code; the dialog answers with the code typed again (`Reply::Text`).
-    ShowRecoveryCode(String),
+    ShowRecoveryCode(Zeroizing<String>),
     Resolve {
         project: String,
         conflicts: Vec<Conflict>,
     },
 }
 
-/// The answer from a dialog.
-#[derive(Clone, PartialEq)]
+/// The answer from a dialog. Not `Clone`: secrets are not copied.
+#[derive(PartialEq)]
 pub enum Reply {
     Text(String),
     Confirmed,
@@ -118,20 +118,50 @@ pub fn ask_blocking(post: impl FnOnce(Question), ask: Ask) -> Reply {
     reply.recv().unwrap_or(Reply::Cancel)
 }
 
-/// Where the bridge sends its questions and notices: the window, or a test.
-pub trait Ui {
-    fn ask(&self, question: Question);
-    fn notice(&self, text: String);
-}
+/// Work for the UI thread, sent from a cloud task's thread.
+pub type UiWork = Box<dyn FnOnce(&mut App) + Send>;
 
-impl Ui for AppHandle<App> {
+/// Where a cloud task reaches the app from its thread: the window, or a test.
+pub trait Ui: Send + 'static {
+    /// Runs `f` with the app on the UI thread, later.
+    fn run(&self, f: UiWork);
+
     fn ask(&self, question: Question) {
-        self.update(move |s, _| s.question = Some(question));
+        self.run(Box::new(move |s| post(s, question)));
     }
 
     fn notice(&self, text: String) {
-        self.update(move |s, _| s.fail(text));
+        self.run(Box::new(move |s| s.fail(text)));
     }
+}
+
+impl Ui for AppHandle<App> {
+    fn run(&self, f: UiWork) {
+        self.update(move |s, _| f(s));
+    }
+}
+
+/// Shows a task's question, on the UI thread. A question that comes after Cancel, or with no
+/// task running, is dropped, which answers it with `Cancel`: the thread may have read the
+/// cancel flag just before the person clicked Cancel.
+pub fn post(s: &mut App, question: Question) {
+    if s.busy
+        .as_ref()
+        .is_some_and(|busy| !busy.cancel.load(Ordering::SeqCst))
+    {
+        s.question = Some(question);
+    }
+}
+
+/// Stops the running cloud task: at its next question, in the browser wait, or now when a
+/// question is open. A running step (the key step, a server call) finishes first.
+pub fn cancel(s: &mut App) {
+    if let Some(busy) = &mut s.busy {
+        busy.cancel.store(true, Ordering::SeqCst);
+        busy.label = t("Cancelling…", "กำลังยกเลิก…");
+    }
+    // Dropped without an answer = Cancel for the waiting thread.
+    s.question = None;
 }
 
 /// The library's `Prompt` and `Resolver` for a cloud task: each question becomes a dialog.
@@ -192,7 +222,7 @@ impl<U: Ui> Prompt for Bridge<U> {
     /// One dialog shows the code and takes it typed again; the typed text answers the
     /// library's next `recovery_code` call.
     fn show_recovery_code(&mut self, code: &str) -> Result<(), String> {
-        match self.ask(Ask::ShowRecoveryCode(code.to_owned())) {
+        match self.ask(Ask::ShowRecoveryCode(Zeroizing::new(code.to_owned()))) {
             Reply::Text(typed) => {
                 self.typed_code = Some(Zeroizing::new(typed));
                 Ok(())
@@ -282,10 +312,22 @@ pub fn start(
     label: &'static str,
     work: impl FnOnce(&mut Bridge, &Path) -> Result<Done, String> + Send + 'static,
 ) -> bool {
+    let handle = s.handle.clone();
+    start_with(s, handle, initial_state, label, work)
+}
+
+/// `start` with the window and the cloud state reader given, so tests need neither.
+fn start_with<U: Ui + Clone>(
+    s: &mut App,
+    ui: Option<U>,
+    refresh: fn(&Path) -> CloudState,
+    label: &'static str,
+    work: impl FnOnce(&mut Bridge<U>, &Path) -> Result<Done, String> + Send + 'static,
+) -> bool {
     if !can_start(&s.busy) {
         return false;
     }
-    let Some(handle) = s.handle.clone() else {
+    let Some(handle) = ui else {
         return false;
     };
     let home = match s.home() {
@@ -310,8 +352,9 @@ pub fn start(
                     .to_owned())
                 });
             drop(bridge);
-            let cloud = initial_state(&home);
-            handle.update(move |s, _| finish(s, cloud, result));
+            // On a panic here, keep the state the app shows.
+            let cloud = panic::catch_unwind(AssertUnwindSafe(|| refresh(&home))).ok();
+            handle.run(Box::new(move |s| finish(s, cloud, result)));
         });
     match spawned {
         Ok(_) => {
@@ -326,11 +369,13 @@ pub fn start(
 }
 
 /// The end of a cloud task, on the UI thread: back to idle, then show the result.
-fn finish(s: &mut App, cloud: CloudState, result: Result<Done, String>) {
+fn finish(s: &mut App, cloud: Option<CloudState>, result: Result<Done, String>) {
     s.busy = None;
     // Drops a question that is still open, so no dialog stays after its task.
     s.question = None;
-    s.cloud = cloud;
+    if let Some(cloud) = cloud {
+        s.cloud = cloud;
+    }
     s.reload();
     match result {
         Ok(done) => apply(s, done),
@@ -370,6 +415,7 @@ fn apply(s: &mut App, done: Done) {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     /// A window for tests: it keeps each question and answers it at once with `answer`.
     struct TestUi {
@@ -378,13 +424,27 @@ mod tests {
     }
 
     impl Ui for TestUi {
+        fn run(&self, _: UiWork) {
+            unreachable!("the bridge tests answer in `ask`");
+        }
+
         fn ask(&self, question: Question) {
-            self.asked.lock().unwrap().push(question.ask.clone());
-            let reply = (self.answer)(&question.ask);
-            question.answer(reply);
+            let Question { ask, answer } = question;
+            let _ = answer.send((self.answer)(&ask));
+            self.asked.lock().unwrap().push(ask);
         }
 
         fn notice(&self, _: String) {}
+    }
+
+    /// A window for tests that queues the UI-thread work; the test runs it on an `App`.
+    #[derive(Clone)]
+    struct QueueUi(mpsc::Sender<UiWork>);
+
+    impl Ui for QueueUi {
+        fn run(&self, f: UiWork) {
+            let _ = self.0.send(f);
+        }
     }
 
     fn bridge(answer: fn(&Ask) -> Reply) -> (Bridge<TestUi>, Arc<Mutex<Vec<Ask>>>) {
@@ -396,6 +456,13 @@ mod tests {
         (Bridge::new(ui, Arc::new(AtomicBool::new(false))), asked)
     }
 
+    fn busy(label: &'static str) -> Option<Busy> {
+        Some(Busy {
+            label,
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     fn conflict() -> Conflict {
         Conflict {
             name: "KEY".into(),
@@ -404,18 +471,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_answer_reaches_the_waiting_thread() {
+    /// A thread that waits on `ask`; the test gets its question.
+    fn waiting_thread(ask: Ask) -> (thread::JoinHandle<Reply>, Question) {
         let (tx_q, rx_q) = mpsc::channel();
         let waiting = thread::spawn(move || {
             ask_blocking(
                 |q| {
                     let _ = tx_q.send(q);
                 },
-                Ask::NewPassword,
+                ask,
             )
         });
-        let question: Question = rx_q.recv().unwrap();
+        (waiting, rx_q.recv().unwrap())
+    }
+
+    /// A home that does not exist: nothing on disk is read or written.
+    fn no_home() -> Option<std::path::PathBuf> {
+        Some(std::env::temp_dir().join("keyman-app-test-no-home"))
+    }
+
+    #[test]
+    fn an_answer_reaches_the_waiting_thread() {
+        let (waiting, question) = waiting_thread(Ask::NewPassword);
         assert_eq!(question.ask, Ask::NewPassword);
         question.answer(Reply::Text("p".into()));
         assert_eq!(waiting.join().unwrap(), Reply::Text("p".into()));
@@ -423,16 +500,7 @@ mod tests {
 
     #[test]
     fn dropped_answer_cancels_the_question() {
-        let (tx_q, rx_q) = mpsc::channel();
-        let waiting = thread::spawn(move || {
-            ask_blocking(
-                |q| {
-                    let _ = tx_q.send(q);
-                },
-                Ask::RecoveryCode,
-            )
-        });
-        let question: Question = rx_q.recv().unwrap();
+        let (waiting, question) = waiting_thread(Ask::RecoveryCode);
         drop(question);
         assert_eq!(waiting.join().unwrap(), Reply::Cancel);
     }
@@ -447,18 +515,14 @@ mod tests {
         assert_eq!(b.resolve("app", &[conflict()]), Ok(None));
 
         // A dropped question is a cancel too.
-        let ui = TestUi {
-            asked: Arc::new(Mutex::new(Vec::new())),
-            answer: |_| Reply::Cancel,
-        };
-        struct DropUi(TestUi);
+        struct DropUi;
         impl Ui for DropUi {
+            fn run(&self, _: UiWork) {}
             fn ask(&self, question: Question) {
-                self.0.asked.lock().unwrap().push(question.ask.clone());
+                drop(question);
             }
-            fn notice(&self, _: String) {}
         }
-        let mut dropping = Bridge::new(DropUi(ui), Arc::new(AtomicBool::new(false)));
+        let mut dropping = Bridge::new(DropUi, Arc::new(AtomicBool::new(false)));
         assert_eq!(dropping.password(), Err(CANCELLED.to_string()));
         assert_eq!(dropping.resolve("app", &[conflict()]), Ok(None));
 
@@ -468,6 +532,38 @@ mod tests {
         assert!(stopped.cancelled());
         assert_eq!(stopped.password(), Err(CANCELLED.to_string()));
         assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_question_after_cancel_is_not_shown() {
+        let mut app = App::for_tests();
+        app.busy = busy("Signing in…");
+        // The thread read the flag before the click, so its question is on the way.
+        let (waiting, question) = waiting_thread(Ask::NewPassword);
+        cancel(&mut app);
+        let busy_now = app.busy.as_ref().unwrap();
+        assert!(busy_now.cancel.load(Ordering::SeqCst));
+        // Either language: another test may switch it meanwhile.
+        assert!(["Cancelling…", "กำลังยกเลิก…"].contains(&busy_now.label));
+        post(&mut app, question);
+        assert!(app.question.is_none());
+        assert_eq!(waiting.join().unwrap(), Reply::Cancel);
+
+        // Cancel with a question open answers it.
+        app.busy = busy("Signing in…");
+        let (waiting, question) = waiting_thread(Ask::RecoveryCode);
+        post(&mut app, question);
+        assert!(app.question.is_some());
+        cancel(&mut app);
+        assert!(app.question.is_none());
+        assert_eq!(waiting.join().unwrap(), Reply::Cancel);
+
+        // No task running: a question is not shown.
+        app.busy = None;
+        let (waiting, question) = waiting_thread(Ask::NewPassword);
+        post(&mut app, question);
+        assert!(app.question.is_none());
+        assert_eq!(waiting.join().unwrap(), Reply::Cancel);
     }
 
     #[test]
@@ -513,7 +609,7 @@ mod tests {
     #[test]
     fn recovery_code_confirmation_is_answered_once() {
         let (mut b, asked) = bridge(|ask| match ask {
-            Ask::ShowRecoveryCode(code) => Reply::Text(code.clone()),
+            Ask::ShowRecoveryCode(code) => Reply::Text(code.as_str().to_owned()),
             _ => Reply::Text("again".into()),
         });
         assert_eq!(b.show_recovery_code("ABCD-EFGH"), Ok(()));
@@ -521,7 +617,7 @@ mod tests {
         assert_eq!(b.recovery_code(), Ok("ABCD-EFGH".into()));
         assert_eq!(
             *asked.lock().unwrap(),
-            vec![Ask::ShowRecoveryCode("ABCD-EFGH".into())]
+            vec![Ask::ShowRecoveryCode(Zeroizing::new("ABCD-EFGH".into()))]
         );
         // It is used once: a later call asks again.
         assert_eq!(b.recovery_code(), Ok("again".into()));
@@ -533,7 +629,7 @@ mod tests {
     fn secrets_are_not_in_debug_text() {
         let text = format!(
             "{:?} {:?}",
-            Ask::ShowRecoveryCode("ABCD-EFGH".into()),
+            Ask::ShowRecoveryCode(Zeroizing::new("ABCD-EFGH".into())),
             Reply::Text("hunter2-password".into())
         );
         assert!(
@@ -545,52 +641,95 @@ mod tests {
     #[test]
     fn only_one_task_runs() {
         assert!(can_start(&None));
-        let busy = Some(Busy {
-            label: "Syncing…",
-            cancel: Arc::new(AtomicBool::new(false)),
-        });
-        assert!(!can_start(&busy));
+        assert!(!can_start(&busy("Syncing…")));
 
-        let mut app = App::new(None, rune::prefs::Prefs::memory());
-        app.busy = busy;
-        assert!(!start(&mut app, "Signing in…", |_, _| Ok(
-            Done::SignedOut
-        )));
+        let mut app = App::for_tests();
+        app.home = no_home();
+        let (tx, rx) = mpsc::channel();
+        let ui = Some(QueueUi(tx));
+        let refresh: fn(&Path) -> CloudState = |_| CloudState::SignedOut;
+        let work = |_: &mut Bridge<QueueUi>, _: &Path| Ok(Done::Toast("done".into()));
+
+        // With a window, a running task still blocks a second one.
+        app.busy = busy("Syncing…");
+        assert!(!start_with(
+            &mut app,
+            ui.clone(),
+            refresh,
+            "Signing in…",
+            work
+        ));
         assert_eq!(app.busy.as_ref().map(|b| b.label), Some("Syncing…"));
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
 
         // No window: nothing to show the questions, so nothing starts.
         app.busy = None;
-        assert!(!start(&mut app, "Signing in…", |_, _| Ok(
-            Done::SignedOut
-        )));
+        assert!(!start_with(
+            &mut app,
+            None::<QueueUi>,
+            refresh,
+            "Signing in…",
+            work
+        ));
+        assert!(app.busy.is_none());
+
+        // One task starts; a second waits for its end.
+        assert!(start_with(
+            &mut app,
+            ui.clone(),
+            refresh,
+            "Signing in…",
+            work
+        ));
+        assert_eq!(app.busy.as_ref().map(|b| b.label), Some("Signing in…"));
+        assert!(!start_with(&mut app, ui.clone(), refresh, "Syncing…", work));
+        let end = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        end(&mut app);
+        assert!(app.busy.is_none());
+        assert!(app.toast.as_ref().is_some_and(|toast| toast.text == "done"));
+        assert!(start_with(&mut app, ui, refresh, "Syncing…", work));
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()(&mut app);
         assert!(app.busy.is_none());
     }
 
     #[test]
+    fn a_panic_in_a_task_returns_to_idle() {
+        let mut app = App::for_tests();
+        app.home = no_home();
+        let signed_in = CloudState::SignedIn {
+            email: "a@b.c".into(),
+        };
+        app.cloud = signed_in.clone();
+        let (tx, rx) = mpsc::channel();
+        let refresh: fn(&Path) -> CloudState = |_| panic!("refresh");
+        let work = |_: &mut Bridge<QueueUi>, _: &Path| -> Result<Done, String> { panic!("work") };
+        assert!(start_with(
+            &mut app,
+            Some(QueueUi(tx)),
+            refresh,
+            "Syncing…",
+            work
+        ));
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()(&mut app);
+        assert!(app.busy.is_none());
+        // The shown state stays when the refresh fails.
+        assert_eq!(app.cloud, signed_in);
+        assert!(app.toast.as_ref().is_some_and(|toast| !toast.ok));
+    }
+
+    #[test]
     fn the_end_of_a_task_releases_an_open_question() {
-        let mut app = App::new(None, rune::prefs::Prefs::memory());
-        app.toast = None;
-        let (tx_q, rx_q) = mpsc::channel();
-        let waiting = thread::spawn(move || {
-            ask_blocking(
-                |q| {
-                    let _ = tx_q.send(q);
-                },
-                Ask::NewPassword,
-            )
-        });
-        app.question = Some(rx_q.recv().unwrap());
-        app.busy = Some(Busy {
-            label: "Signing in…",
-            cancel: Arc::new(AtomicBool::new(false)),
-        });
-        finish(&mut app, CloudState::SignedOut, Err(CANCELLED.into()));
+        let mut app = App::for_tests();
+        let (waiting, question) = waiting_thread(Ask::NewPassword);
+        app.question = Some(question);
+        app.busy = busy("Signing in…");
+        finish(&mut app, Some(CloudState::SignedOut), Err(CANCELLED.into()));
         assert!(app.busy.is_none() && app.question.is_none());
         assert_eq!(waiting.join().unwrap(), Reply::Cancel);
         // A cancel is not an error for the person.
         assert!(app.toast.is_none());
 
-        finish(&mut app, CloudState::SignedOut, Err("boom".into()));
+        finish(&mut app, None, Err("boom".into()));
         assert!(
             app.toast
                 .as_ref()
