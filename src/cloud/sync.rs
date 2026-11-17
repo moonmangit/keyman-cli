@@ -4,7 +4,7 @@
 //! tested without a network. Order matters on pull: compute everything first,
 //! write the master file, and only then change the link and the state file.
 
-use super::account::Unlocked;
+use super::account::{self, Unlocked};
 use super::api::Membership;
 use super::crypto::{self, Key, KeyPair};
 use super::groups;
@@ -33,12 +33,20 @@ impl Vaults {
     }
 
     /// The same, from a key pair. The key is stored with the generation of
-    /// the membership it was unwrapped from.
+    /// the membership it was unwrapped from. A wrapped key must be bound to
+    /// its own vault and generation, so the server cannot move a key from
+    /// one vault to another.
     pub(crate) fn from_pair(pair: &KeyPair, memberships: &[Membership]) -> Vaults {
         let by_id = memberships
             .iter()
             .filter_map(|member| {
-                let key = crypto::unwrap(pair, &member.wrapped_key).ok()?;
+                let key = crypto::unwrap(
+                    pair,
+                    &member.wrapped_key,
+                    &member.vault_id,
+                    member.key_generation,
+                )
+                .ok()?;
                 Some((member.vault_id.clone(), (key, member.key_generation)))
             })
             .collect();
@@ -60,16 +68,43 @@ impl Vaults {
     }
 }
 
-fn personal_in(memberships: &[Membership]) -> Result<String, String> {
-    memberships
+pub(crate) const NO_PERSONAL: &str = "You have no personal vault. Run 'keyman login' first.";
+pub(crate) const PERSONAL_CHANGED: &str = "The server changed your personal vault. Keyman stops.";
+const TWO_PERSONAL: &str = "The server shows more than one personal vault. Keyman stops.";
+
+/// The personal vault of `user_id` in the memberships. `pinned` is the
+/// personal vault that this computer saved before: a different one, or a
+/// second one, is refused.
+pub(crate) fn personal_in(
+    memberships: &[Membership],
+    user_id: &str,
+    pinned: Option<&str>,
+) -> Result<String, String> {
+    let found: Vec<&str> = memberships
         .iter()
-        .find(|member| member.vaults.kind == "personal")
-        .map(|member| member.vault_id.clone())
-        .ok_or_else(|| "You have no personal vault. Run 'keyman login' first.".to_string())
+        .filter(|member| {
+            member.vaults.kind == "personal"
+                && member.vaults.owner_id == user_id
+                && member.user_id == user_id
+        })
+        .map(|member| member.vault_id.as_str())
+        .collect();
+    match (pinned, found.as_slice()) {
+        (Some(pinned), [one]) if *one == pinned => Ok(pinned.to_string()),
+        (Some(_), _) => Err(PERSONAL_CHANGED.to_string()),
+        (None, [one]) => Ok(one.to_string()),
+        (None, []) => Err(NO_PERSONAL.to_string()),
+        (None, _) => Err(TWO_PERSONAL.to_string()),
+    }
 }
 
-pub fn personal_vault(u: &Unlocked) -> Result<String, String> {
-    personal_in(&u.api.my_memberships()?)
+/// The personal vault, checked against the one this computer saved. The
+/// first time, Keyman saves it.
+fn personal_vault(home: &Path, u: &Unlocked, memberships: &[Membership]) -> Result<String, String> {
+    let pinned = account::pinned_vault(&state::load(home)?, &u.user_id);
+    let id = personal_in(memberships, &u.user_id, pinned.as_deref())?;
+    account::pin_personal_vault(home, &u.user_id, &id)?;
+    Ok(id)
 }
 
 /// The vault of the group with this name. Two groups with one name are
@@ -154,12 +189,11 @@ pub fn link(home: &Path, u: &Unlocked, project: &str, group: Option<&str>) -> Re
     let (_, yaml) = master::read_master(home)?;
     let variables = master::project_variables(&yaml, project)?;
     ensure_unlinked(home, project)?;
-    let mut st = state::load(home)?;
     let memberships = u.api.my_memberships()?;
     let vaults = Vaults::from_memberships(u, &memberships);
     let vault_id = match group {
         Some(name) => group_vault(&vaults, name)?,
-        None => personal_in(&memberships)?,
+        None => personal_vault(home, u, &memberships)?,
     };
     let (key, generation) = vaults.key(&vault_id)?;
     let existing = u.api.projects(std::slice::from_ref(&vault_id))?;
@@ -183,6 +217,8 @@ pub fn link(home: &Path, u: &Unlocked, project: &str, group: Option<&str>) -> Re
         base: variables,
         cloud_name: project.to_string(),
     };
+    // Read the state again: `personal_vault` can save it above.
+    let mut st = state::load(home)?;
     st.set_link(link.clone());
     state::save(home, &st)?;
     Ok(link)
@@ -767,6 +803,65 @@ mod tests {
             base,
             cloud_name: project.to_string(),
         }
+    }
+
+    fn member(pair: &KeyPair, id: &str, kind: &str, wrapped_for: &str, key: &Key) -> Membership {
+        Membership {
+            vault_id: id.to_string(),
+            user_id: "me".to_string(),
+            role: "owner".to_string(),
+            wrapped_key: crypto::wrap_for(&pair.public, key, wrapped_for, 1),
+            key_generation: 1,
+            vaults: crate::cloud::api::VaultRow {
+                kind: kind.to_string(),
+                owner_id: "me".to_string(),
+                name_sealed: None,
+                key_generation: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn a_key_moved_to_another_vault_is_not_used() {
+        let pair = KeyPair::generate();
+        let group_key = Key::random();
+        // The server puts the wrapped key of the group on the personal vault row.
+        let memberships = vec![
+            member(&pair, "group", "group", "group", &group_key),
+            member(&pair, "personal", "personal", "group", &group_key),
+        ];
+        let vaults = Vaults::from_pair(&pair, &memberships);
+        assert!(vaults.key("group").is_ok());
+        assert_eq!(
+            vaults.key("personal").err().unwrap(),
+            "Keyman has no key for this vault."
+        );
+    }
+
+    #[test]
+    fn the_personal_vault_is_checked_against_the_saved_one() {
+        let pair = KeyPair::generate();
+        let key = Key::random();
+        let one = vec![member(&pair, "p1", "personal", "p1", &key)];
+        assert_eq!(personal_in(&one, "me", None).unwrap(), "p1");
+        assert_eq!(personal_in(&one, "me", Some("p1")).unwrap(), "p1");
+        assert_eq!(
+            personal_in(&one, "me", Some("p0")).unwrap_err(),
+            "The server changed your personal vault. Keyman stops."
+        );
+        // A group that the server labels "personal" is a second personal vault.
+        let two = vec![
+            member(&pair, "p1", "personal", "p1", &key),
+            member(&pair, "g1", "personal", "g1", &key),
+        ];
+        assert!(personal_in(&two, "me", None).is_err());
+        assert_eq!(
+            personal_in(&two, "me", Some("p1")).unwrap_err(),
+            PERSONAL_CHANGED
+        );
+        // The personal vault of another user is not mine.
+        assert_eq!(personal_in(&one, "other", None).unwrap_err(), NO_PERSONAL);
+        assert_eq!(personal_in(&[], "me", None).unwrap_err(), NO_PERSONAL);
     }
 
     #[test]

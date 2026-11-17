@@ -162,23 +162,47 @@ pub fn open(key: &Key, aad: &str, sealed: &str) -> Result<Zeroizing<Vec<u8>>, St
         .map_err(|_| DECRYPT_ERROR.to_string())
 }
 
-/// Seal a vault key for one member with their public key (sealed box).
-pub fn wrap_for(public: &[u8; 32], key: &Key) -> String {
+/// The text in front of a wrapped vault key. It binds the key to one vault
+/// and one key generation, so the server cannot give the key of one vault
+/// (for example a group) to another vault (for example the personal vault).
+fn vault_key_binding(vault_id: &str, generation: i64) -> String {
+    format!("keyman/v1|vault-key|{vault_id}|{generation}|")
+}
+
+pub const UNWRAP_ERROR: &str =
+    "The vault key does not open: wrong key pair, wrong vault, or the data changed.";
+
+/// Seal a vault key for one member with their public key (sealed box). The
+/// plaintext is the binding for `vault_id` and `generation`, then the key.
+pub fn wrap_for(public: &[u8; 32], key: &Key, vault_id: &str, generation: i64) -> String {
+    let mut plain = Zeroizing::new(vault_key_binding(vault_id, generation).into_bytes());
+    plain.extend_from_slice(key.0.as_slice());
     let sealed = PublicKey::from(*public)
-        .seal(&mut crypto_box::aead::OsRng, key.0.as_slice())
+        .seal(&mut crypto_box::aead::OsRng, plain.as_slice())
         .expect("sealing the key failed");
     STANDARD.encode(sealed)
 }
 
-pub fn unwrap(pair: &KeyPair, wrapped: &str) -> Result<Key, String> {
-    let fail = || "the key does not unwrap: wrong key pair, or the data changed".to_string();
+/// Opens a wrapped vault key. The binding must be for `vault_id` and
+/// `generation`; every failure gives the same error.
+pub fn unwrap(
+    pair: &KeyPair,
+    wrapped: &str,
+    vault_id: &str,
+    generation: i64,
+) -> Result<Key, String> {
+    let fail = || UNWRAP_ERROR.to_string();
     let raw = STANDARD.decode(wrapped.trim()).map_err(|_| fail())?;
     let plain = Zeroizing::new(
         SecretKey::from_bytes(*pair.secret.0)
             .unseal(&raw)
             .map_err(|_| fail())?,
     );
-    let array: [u8; 32] = plain.as_slice().try_into().map_err(|_| fail())?;
+    let binding = vault_key_binding(vault_id, generation);
+    if plain.len() != binding.len() + 32 || !plain.starts_with(binding.as_bytes()) {
+        return Err(fail());
+    }
+    let array: [u8; 32] = plain[binding.len()..].try_into().map_err(|_| fail())?;
     Ok(Key::from_bytes(array))
 }
 
@@ -352,8 +376,9 @@ mod tests {
     fn wrap_unwrap_round_trip() {
         let p = KeyPair::generate();
         let k = Key::random();
+        let wrapped = wrap_for(&p.public, &k, "v1", 1);
         assert_eq!(
-            unwrap(&p, &wrap_for(&p.public, &k)).unwrap().to_base64(),
+            unwrap(&p, &wrapped, "v1", 1).unwrap().to_base64(),
             k.to_base64()
         );
     }
@@ -362,7 +387,53 @@ mod tests {
     fn unwrap_with_other_pair_fails() {
         let p = KeyPair::generate();
         let k = Key::random();
-        assert!(unwrap(&KeyPair::generate(), &wrap_for(&p.public, &k)).is_err());
+        let wrapped = wrap_for(&p.public, &k, "v1", 1);
+        assert_eq!(
+            unwrap(&KeyPair::generate(), &wrapped, "v1", 1)
+                .err()
+                .unwrap(),
+            UNWRAP_ERROR
+        );
+    }
+
+    #[test]
+    fn wrapped_key_for_another_vault_is_refused() {
+        let p = KeyPair::generate();
+        let wrapped = wrap_for(&p.public, &Key::random(), "group-vault", 1);
+        assert_eq!(
+            unwrap(&p, &wrapped, "personal-vault", 1).err().unwrap(),
+            UNWRAP_ERROR
+        );
+    }
+
+    #[test]
+    fn wrapped_key_for_another_generation_is_refused() {
+        let p = KeyPair::generate();
+        let wrapped = wrap_for(&p.public, &Key::random(), "v1", 2);
+        assert_eq!(unwrap(&p, &wrapped, "v1", 1).err().unwrap(), UNWRAP_ERROR);
+        assert_eq!(unwrap(&p, &wrapped, "v1", 3).err().unwrap(), UNWRAP_ERROR);
+        assert!(unwrap(&p, &wrapped, "v1", 2).is_ok());
+    }
+
+    #[test]
+    fn a_bare_key_with_no_binding_is_refused() {
+        // The old format: the sealed box held only the 32 key bytes.
+        let p = KeyPair::generate();
+        let k = Key::random();
+        let sealed = PublicKey::from(p.public)
+            .seal(&mut crypto_box::aead::OsRng, k.0.as_slice())
+            .unwrap();
+        let wrapped = STANDARD.encode(sealed);
+        assert_eq!(unwrap(&p, &wrapped, "v1", 1).err().unwrap(), UNWRAP_ERROR);
+    }
+
+    #[test]
+    fn a_vault_id_cannot_end_the_binding_early() {
+        // "v|1" with generation 2 must not match "v" with generation "1|2...".
+        let p = KeyPair::generate();
+        let wrapped = wrap_for(&p.public, &Key::random(), "v|1", 2);
+        assert!(unwrap(&p, &wrapped, "v", 1).is_err());
+        assert!(unwrap(&p, &wrapped, "v|1", 2).is_ok());
     }
 
     #[test]

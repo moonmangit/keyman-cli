@@ -29,6 +29,10 @@ pub struct State {
     pub links: Vec<Link>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
+    /// The personal vault of `user_id`, saved at setup or at the first
+    /// unlock. A server that reports a different one is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personal_vault: Option<String>,
 }
 
 pub fn path(home: &Path) -> PathBuf {
@@ -133,6 +137,7 @@ mod tests {
             email: Some("a@example.com".to_string()),
             links: vec![link("app", 3)],
             refresh_token: Some("token".to_string()),
+            personal_vault: Some("vault-0".to_string()),
         };
         save(&home, &state).unwrap();
         assert_eq!(load(&home).unwrap(), state);
@@ -171,6 +176,15 @@ mod tests {
         save(&home, &State::default()).unwrap();
         let mode = fs::metadata(path(&home)).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn an_old_file_with_no_personal_vault_loads() {
+        let home = temp_home();
+        fs::write(path(&home), r#"{"user_id":"u1","email":null,"links":[]}"#).unwrap();
+        let st = load(&home).unwrap();
+        assert_eq!(st.user_id.as_deref(), Some("u1"));
+        assert_eq!(st.personal_vault, None);
     }
 
     #[test]

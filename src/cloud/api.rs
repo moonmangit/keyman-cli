@@ -9,6 +9,7 @@ use std::time::Duration;
 const CONNECT_ERROR: &str =
     "cannot connect to the Keyman server. Check the network connection, then try again.";
 const DEADLOCK: &str = "40P01";
+const BAD_REPLY: &str = "The Keyman server gave a reply that Keyman cannot use.";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -302,7 +303,7 @@ const PROJECT_SELECT: &str = "select=id,vault_id,version,key_generation,sealed,u
 const INVITE_SELECT: &str = "select=id,vault_id,email";
 
 /// A random version 4 UUID.
-fn new_uuid() -> String {
+pub fn new_uuid() -> String {
     let mut b = [0u8; 16];
     getrandom::getrandom(&mut b).expect("system random source failed");
     b[6] = (b[6] & 0x0f) | 0x40;
@@ -414,17 +415,29 @@ impl Api {
         parse(&self.get(&path)?)
     }
 
+    /// Makes a vault with the ID `id` (made on the client, so the wrapped
+    /// key can be bound to it before the call).
     pub fn create_vault(
         &self,
+        id: &str,
         kind: &str,
         name_sealed: Option<&str>,
         wrapped_key: &str,
-    ) -> Result<String, String> {
+    ) -> Result<(), String> {
         let text = self.rpc(
             "create_vault",
-            json!({"p_kind": kind, "p_name_sealed": name_sealed, "p_wrapped_key": wrapped_key}),
+            json!({
+                "p_id": id,
+                "p_kind": kind,
+                "p_name_sealed": name_sealed,
+                "p_wrapped_key": wrapped_key,
+            }),
         )?;
-        parse(&text)
+        let made: String = parse(&text)?;
+        if made != id {
+            return Err(BAD_REPLY.to_string());
+        }
+        Ok(())
     }
 
     /// Members of several vaults in one request.

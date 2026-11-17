@@ -6,6 +6,7 @@ use super::config::config;
 use super::crypto::{self, KdfParams, Key, KeyPair};
 use super::keystore::Store;
 use super::state::{self, State};
+use super::sync;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -210,23 +211,56 @@ fn check_owner(profile: &Profile, user_id: &str) -> Result<(), String> {
     }
 }
 
-fn create_personal_vault(api: &Api, pair: &KeyPair) -> Result<(), String> {
+/// Makes the personal vault and returns its ID. The ID is made here, so the
+/// wrapped key is bound to it (generation 1).
+fn create_personal_vault(api: &Api, pair: &KeyPair) -> Result<String, String> {
+    let id = api::new_uuid();
     let vault_key = Key::random();
     api.create_vault(
+        &id,
         "personal",
         None,
-        &crypto::wrap_for(&pair.public, &vault_key),
+        &crypto::wrap_for(&pair.public, &vault_key, &id, 1),
     )?;
-    Ok(())
+    Ok(id)
+}
+
+const OTHER_USER: &str = "You signed in as a different user. Run 'keyman login' again.";
+
+/// The personal vault that this computer saved for this user, if any.
+pub(crate) fn pinned_vault(st: &State, user_id: &str) -> Option<String> {
+    if st.user_id.as_deref() == Some(user_id) {
+        st.personal_vault.clone()
+    } else {
+        None
+    }
+}
+
+/// Saves the personal vault ID the first time. After that, a different ID
+/// is refused: the server must not swap the personal vault.
+pub(crate) fn pin_personal_vault(home: &Path, user_id: &str, vault_id: &str) -> Result<(), String> {
+    let mut st = state::load(home)?;
+    if st.user_id.as_deref() != Some(user_id) {
+        return Err(OTHER_USER.to_string());
+    }
+    match st.personal_vault.as_deref() {
+        Some(pinned) if pinned == vault_id => Ok(()),
+        Some(_) => Err(sync::PERSONAL_CHANGED.to_string()),
+        None => {
+            st.personal_vault = Some(vault_id.to_string());
+            state::save(home, &st)
+        }
+    }
 }
 
 /// First sign-in: make the keys, the profile and the personal vault.
 /// The caller saves the session first, then the private key.
+/// Returns the key pair and the ID of the personal vault.
 pub fn setup_profile(
     api: &Api,
     prompt: &mut dyn Prompt,
     params: KdfParams,
-) -> Result<KeyPair, String> {
+) -> Result<(KeyPair, String), String> {
     let password = Zeroizing::new(prompt.new_password()?);
     let code = Zeroizing::new(crypto::recovery_code());
     let (profile, pair) = new_profile_values(api.user_id(), api.email(), &password, &code, params)?;
@@ -245,8 +279,8 @@ pub fn setup_profile(
         return Err(CODE_MISMATCH.to_string());
     }
     api.put_profile(&profile)?;
-    create_personal_vault(api, &pair)?;
-    Ok(pair)
+    let vault_id = create_personal_vault(api, &pair)?;
+    Ok((pair, vault_id))
 }
 
 /// Record the signed-in user. When it is a different user than before, the
@@ -255,6 +289,7 @@ fn switch_user(st: &mut State, user_id: &str) -> bool {
     let switched = st.user_id.as_deref().is_some_and(|old| old != user_id);
     if switched {
         st.links.clear();
+        st.personal_vault = None;
     }
     st.user_id = Some(user_id.to_string());
     switched
@@ -306,16 +341,23 @@ fn unlock_from_server(api: &Api, prompt: &mut dyn Prompt) -> Result<KeyPair, Str
     unlock_with_password(&profile, &password)
 }
 
-/// A setup that stopped half way can leave a profile with no vault.
-fn ensure_personal_vault(api: &Api, pair: &KeyPair) -> Result<(), String> {
-    let has_vault = api
-        .my_memberships()?
-        .iter()
-        .any(|member| member.vaults.kind == "personal");
-    if has_vault {
-        Ok(())
-    } else {
-        create_personal_vault(api, pair)
+/// Finds the personal vault and checks that its key opens with this key
+/// pair. A setup that stopped half way can leave a profile with no vault:
+/// then Keyman makes it. Returns the vault ID.
+fn ensure_personal_vault(home: &Path, api: &Api, pair: &KeyPair) -> Result<String, String> {
+    let memberships = api.my_memberships()?;
+    let pinned = pinned_vault(&state::load(home)?, api.user_id());
+    match sync::personal_in(&memberships, api.user_id(), pinned.as_deref()) {
+        Ok(id) => {
+            let member = memberships
+                .iter()
+                .find(|member| member.vault_id == id)
+                .ok_or_else(|| sync::PERSONAL_CHANGED.to_string())?;
+            crypto::unwrap(pair, &member.wrapped_key, &id, member.key_generation)?;
+            Ok(id)
+        }
+        Err(error) if error == sync::NO_PERSONAL => create_personal_vault(api, pair),
+        Err(error) => Err(error),
     }
 }
 
@@ -390,9 +432,10 @@ pub fn setup_with(
         password: Zeroizing::new(password.to_string()),
         code: None,
     };
-    let pair = setup_profile(&api, &mut answers, params)?;
+    let (pair, vault_id) = setup_profile(&api, &mut answers, params)?;
     store_session(home, store, session)?;
     remember_key(store, &session.user_id, &pair)?;
+    pin_personal_vault(home, &session.user_id, &vault_id)?;
     let code = answers
         .code
         .map(|code| code.to_string())
@@ -407,7 +450,7 @@ fn finish_login(
     session: &Session,
     prompt: &mut dyn Prompt,
 ) -> Result<LoginOutcome, String> {
-    let (pair, outcome) = match api.my_profile()? {
+    let (pair, vault_id, outcome) = match api.my_profile()? {
         Some(profile) => {
             check_owner(&profile, api.user_id())?;
             let mut attempt = 1;
@@ -425,17 +468,18 @@ fn finish_login(
                     Err(error) => return Err(error),
                 }
             };
-            ensure_personal_vault(api, &pair)?;
-            (pair, LoginOutcome::Unlocked)
+            let vault_id = ensure_personal_vault(home, api, &pair)?;
+            (pair, vault_id, LoginOutcome::Unlocked)
         }
-        None => (
-            setup_profile(api, prompt, KdfParams::PRODUCTION)?,
-            LoginOutcome::Created,
-        ),
+        None => {
+            let (pair, vault_id) = setup_profile(api, prompt, KdfParams::PRODUCTION)?;
+            (pair, vault_id, LoginOutcome::Created)
+        }
     };
     // The session entry comes first, then the key.
     store_session(home, store, session)?;
     remember_key(store, &session.user_id, &pair)?;
+    pin_personal_vault(home, &session.user_id, &vault_id)?;
     if store.available() {
         forget_legacy_key(store);
     }
@@ -865,6 +909,34 @@ mod tests {
         let after = state::load(&home).unwrap();
         assert!(after.links.is_empty());
         assert_eq!(after.user_id.as_deref(), Some("user-B"));
+    }
+
+    #[test]
+    fn the_personal_vault_is_saved_then_checked() {
+        let home = temp_home("pin");
+        let store = crate::cloud::keystore::MemoryStore::new();
+        store_session(&home, &store, &sample_session()).unwrap();
+        pin_personal_vault(&home, "user-1", "vault-1").unwrap();
+        let st = state::load(&home).unwrap();
+        assert_eq!(st.personal_vault.as_deref(), Some("vault-1"));
+        assert_eq!(pinned_vault(&st, "user-1").as_deref(), Some("vault-1"));
+        assert_eq!(pinned_vault(&st, "user-2"), None);
+        assert!(pin_personal_vault(&home, "user-1", "vault-1").is_ok());
+        assert_eq!(
+            pin_personal_vault(&home, "user-1", "vault-2").unwrap_err(),
+            "The server changed your personal vault. Keyman stops."
+        );
+        assert_eq!(
+            state::load(&home).unwrap().personal_vault.as_deref(),
+            Some("vault-1")
+        );
+        // Another user does not get the saved vault of the old user.
+        let mut other = sample_session();
+        other.user_id = "user-2".into();
+        store_session(&home, &store, &other).unwrap();
+        assert_eq!(state::load(&home).unwrap().personal_vault, None);
+        pin_personal_vault(&home, "user-2", "vault-9").unwrap();
+        assert!(pin_personal_vault(&home, "user-1", "vault-1").is_err());
     }
 
     #[test]

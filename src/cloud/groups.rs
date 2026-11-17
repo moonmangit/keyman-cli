@@ -5,7 +5,7 @@
 //! a new vault key and encrypts every project again, in one server call.
 
 use super::account::Unlocked;
-use super::api::{CloudProject, Invite, Membership, PublicProfile};
+use super::api::{self, CloudProject, Invite, Membership, PublicProfile};
 use super::crypto::{self, Key};
 use super::state;
 use super::sync::Vaults;
@@ -250,8 +250,8 @@ fn owned<'a>(
         .ok_or_else(|| refusal.to_string())
 }
 
-/// Makes a group and returns its vault ID. The ID is not known before the
-/// server makes the vault, so the name is sealed and saved after that.
+/// Makes a group and returns its vault ID. Keyman makes the ID, so the
+/// wrapped key (generation 1) and the sealed name are bound to it.
 pub fn create(u: &Unlocked, name: &str) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -264,15 +264,11 @@ pub fn create(u: &Unlocked, name: &str) -> Result<String, String> {
     if names(&vaults).iter().any(|(_, existing)| existing == name) {
         return Err(format!("You are in a group named '{name}' already."));
     }
+    let id = api::new_uuid();
     let key = Key::random();
-    let wrapped = crypto::wrap_for(&u.pair.public, &key);
-    let id = u.api.create_vault("group", None, &wrapped)?;
+    let wrapped = crypto::wrap_for(&u.pair.public, &key, &id, 1);
     let sealed = crypto::seal(&key, &crypto::vault_name_aad(&id), name.as_bytes());
-    if let Err(error) = u.api.set_vault_name(&id, &sealed) {
-        // A group with no name is of no use. Remove it, and keep the first error.
-        let _ = u.api.delete_vault(&id);
-        return Err(error);
-    }
+    u.api.create_vault(&id, "group", Some(&sealed), &wrapped)?;
     Ok(id)
 }
 
@@ -366,7 +362,8 @@ pub fn accept_pending(u: &Unlocked, vaults: &Vaults) -> Result<Accepted, String>
             result.warnings.push(warn);
             continue;
         };
-        let wrapped = crypto::wrap_for(&public, key);
+        // Bound to this vault and the generation that the server checks.
+        let wrapped = crypto::wrap_for(&public, key, &invite.vault_id, *generation);
         let answer = u
             .api
             .accept_invite(&invite.id, &profile.user_id, &wrapped, *generation);
@@ -474,6 +471,11 @@ pub fn remove(u: &Unlocked, vaults: &Vaults, group: &str, email: &str) -> Result
     if target.user_id == u.api.user_id() {
         return Err("The owner cannot be removed. Delete the group instead.".to_string());
     }
+    if membership.vaults.key_generation != *generation {
+        return Err(KEY_CHANGED.to_string());
+    }
+    // The server makes the generation one higher; the new keys are bound to it.
+    let next = generation + 1;
     let new = Key::random();
     let mut keys = Vec::new();
     for row in rows.iter().filter(|row| row.user_id != target.user_id) {
@@ -486,7 +488,7 @@ pub fn remove(u: &Unlocked, vaults: &Vaults, group: &str, email: &str) -> Result
             })?;
         keys.push((
             row.user_id.clone(),
-            crypto::wrap_for(&public_key(profile)?, &new),
+            crypto::wrap_for(&public_key(profile)?, &new, &id, next),
         ));
     }
     let projects = u.api.projects(std::slice::from_ref(&id))?;
@@ -498,12 +500,19 @@ pub fn remove(u: &Unlocked, vaults: &Vaults, group: &str, email: &str) -> Result
     let name = raw_name(vaults, membership)
         .ok_or_else(|| "Keyman cannot read the name of the group.".to_string())?;
     let sealed_name = crypto::seal(&new, &crypto::vault_name_aad(&id), name.as_bytes());
-    u.api
+    let made = u
+        .api
         .rotate_vault(&id, &target.user_id, &keys, &sealed, Some(&sealed_name))
-        .map(|_| Removal::Member {
-            projects: projects.len(),
-        })
-        .map_err(removal_error)
+        .map_err(removal_error)?;
+    if made != next {
+        return Err(
+            "The group key changed during the removal. Run 'keyman group remove' again."
+                .to_string(),
+        );
+    }
+    Ok(Removal::Member {
+        projects: projects.len(),
+    })
 }
 
 /// Before a delete is confirmed: the user must own the group. Returns the
@@ -755,7 +764,7 @@ mod tests {
             vault_id: id.to_string(),
             user_id: "me".to_string(),
             role: if owner == "me" { "owner" } else { "member" }.to_string(),
-            wrapped_key: crypto::wrap_for(&pair.public, &key),
+            wrapped_key: crypto::wrap_for(&pair.public, &key, id, 1),
             key_generation: 1,
             vaults: VaultRow {
                 kind: kind.to_string(),
