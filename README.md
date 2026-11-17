@@ -136,11 +136,11 @@ keyman list          # project names only, one per line
 
 ## Cloud sync (optional)
 
-Cloud sync lets you use your projects on more than one computer. It also lets you share projects with a group. If you do not sign in, Keyman does not change and does not use the network.
+Cloud sync lets you use your projects on more than one computer. It also lets you share projects with a group. If you do not sign in, Keyman works as before and does not use the network.
 
 ### What the cloud keeps
 
-Keyman encrypts your projects on your computer. The server keeps only encrypted data. This includes project names, variable names, and values.
+Keyman encrypts your projects on your computer. The server keeps only encrypted data. Encrypted data includes project names, variable names, and values.
 
 The server can see these items:
 

@@ -12,15 +12,21 @@ pub struct Config {
 }
 
 pub fn config() -> Config {
-    let pick = |name: &str, default: &str| match std::env::var(name) {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+    config_from(
+        std::env::var("KEYMAN_SUPABASE_URL").ok(),
+        std::env::var("KEYMAN_SUPABASE_KEY").ok(),
+    )
+}
+
+/// Builds the settings from optional overrides. Blank values use the built-in ones.
+pub fn config_from(url: Option<String>, key: Option<String>) -> Config {
+    let pick = |value: Option<String>, default: &str| match value {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => default.to_string(),
     };
     Config {
-        url: pick("KEYMAN_SUPABASE_URL", DEFAULT_URL)
-            .trim_end_matches('/')
-            .to_string(),
-        key: pick("KEYMAN_SUPABASE_KEY", DEFAULT_KEY),
+        url: pick(url, DEFAULT_URL).trim_end_matches('/').to_string(),
+        key: pick(key, DEFAULT_KEY),
     }
 }
 
@@ -30,14 +36,10 @@ mod tests {
 
     #[test]
     fn config_env_overrides() {
-        std::env::set_var("KEYMAN_SUPABASE_URL", "http://example.test/");
-        std::env::set_var("KEYMAN_SUPABASE_KEY", "key123");
-        let c = config();
+        let c = config_from(Some("http://example.test/".into()), Some("key123".into()));
         assert_eq!(c.url, "http://example.test");
         assert_eq!(c.key, "key123");
-        std::env::remove_var("KEYMAN_SUPABASE_URL");
-        std::env::remove_var("KEYMAN_SUPABASE_KEY");
-        let d = config();
+        let d = config_from(None, Some("  ".into()));
         assert_eq!(d.url, DEFAULT_URL);
         assert_eq!(d.key, DEFAULT_KEY);
     }

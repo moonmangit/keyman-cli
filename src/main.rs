@@ -1363,6 +1363,9 @@ mod tests {
         assert!(run(&variables, &[OsString::from("keyman-no-such-program")]).is_err());
     }
 
+    /// Serializes the tests that change the process environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Restores an environment variable when dropped.
     struct EnvGuard(&'static str, Option<OsString>);
 
@@ -1387,6 +1390,7 @@ mod tests {
     /// the server address does not answer, so any network call would hang.
     #[test]
     fn existing_commands_do_no_network() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = Fixture::new("my-app:\n  API_KEY: \"secret\"\n");
         fixture.load();
         let target = fixture.root.join("target");
