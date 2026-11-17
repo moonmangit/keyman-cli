@@ -9,6 +9,7 @@ use super::api::{self, CloudProject, Invite, Membership, PublicProfile};
 use super::crypto::{self, Key};
 use super::state;
 use super::sync::Vaults;
+use crate::ui::{is_hidden, safe_text};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::collections::HashMap;
 use std::path::Path;
@@ -127,16 +128,6 @@ fn check_invite(
     Ok(email)
 }
 
-/// Control characters and Unicode format characters (category Cf), such as
-/// the bidirectional overrides and the zero width characters.
-fn is_hidden(c: char) -> bool {
-    c.is_control()
-        || matches!(c as u32,
-            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x180E
-            | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
-            | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0001 | 0xE0020..=0xE007F)
-}
-
 /// The name of a group as sealed, with no change.
 fn raw_name(vaults: &Vaults, member: &Membership) -> Option<String> {
     if member.vaults.kind != "group" {
@@ -152,12 +143,7 @@ fn raw_name(vaults: &Vaults, member: &Membership) -> Option<String> {
 /// the name, and it goes to the terminal of every member). It is also the
 /// form that names are compared in.
 fn group_name(vaults: &Vaults, member: &Membership) -> Option<String> {
-    Some(
-        raw_name(vaults, member)?
-            .chars()
-            .map(|c| if is_hidden(c) { '?' } else { c })
-            .collect(),
-    )
+    Some(safe_text(&raw_name(vaults, member)?))
 }
 
 /// `(vault ID, name)` of every group the user is in.
@@ -209,23 +195,6 @@ fn summarize(vaults: &Vaults, me: &str, members: &[Membership], invites: &[Invit
         .collect();
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     groups
-}
-
-/// Short messages for the errors that the server gives during a removal.
-fn removal_error(message: String) -> String {
-    if message.contains("a project changed during the removal") {
-        "A member changed a project during the removal. Run the command again.".to_string()
-    } else if message.contains("a new key is necessary for each remaining member")
-        || message.contains("a key is for a user who is not a member")
-        || message.contains("every remaining member must get a new key")
-        || message.contains("the user is not a member")
-    {
-        "A person joined or left the group during the removal. Run the command again.".to_string()
-    } else if message.contains("all projects of the vault must be encrypted again") {
-        "A member added or removed a project during the removal. Run the command again.".to_string()
-    } else {
-        message
-    }
 }
 
 fn public_key(profile: &PublicProfile) -> Result<[u8; 32], String> {
@@ -313,10 +282,7 @@ enum InviteOutcome {
 fn invite_outcome(answer: &Result<(), String>) -> InviteOutcome {
     match answer {
         Ok(()) => InviteOutcome::Done,
-        Err(message)
-            if message.contains("the invite does not exist")
-                || message.contains("the group key changed") =>
-        {
+        Err(message) if message == api::INVITE_GONE || message == api::GROUP_KEY_CHANGED => {
             InviteOutcome::Quiet
         }
         Err(_) => InviteOutcome::Warn,
@@ -502,8 +468,7 @@ pub fn remove(u: &Unlocked, vaults: &Vaults, group: &str, email: &str) -> Result
     let sealed_name = crypto::seal(&new, &crypto::vault_name_aad(&id), name.as_bytes());
     let made = u
         .api
-        .rotate_vault(&id, &target.user_id, &keys, &sealed, Some(&sealed_name))
-        .map_err(removal_error)?;
+        .rotate_vault(&id, &target.user_id, &keys, &sealed, Some(&sealed_name))?;
     if made != next {
         return Err(
             "The group key changed during the removal. Run 'keyman group remove' again."
@@ -588,7 +553,7 @@ mod tests {
             "the group key changed; run the command again",
         ] {
             assert_eq!(
-                invite_outcome(&Err(quiet.to_string())),
+                invite_outcome(&Err(api::server_message("P0001", quiet))),
                 InviteOutcome::Quiet
             );
         }
@@ -667,19 +632,6 @@ mod tests {
             crate::cloud::sync::group_vault(&vaults, "zzz").unwrap_err(),
             "You are not in a group named 'zzz'."
         );
-    }
-
-    #[test]
-    fn more_server_errors_have_short_messages() {
-        for message in [
-            "every remaining member must get a new key",
-            "the user is not a member",
-        ] {
-            assert_eq!(
-                removal_error(message.to_string()),
-                "A person joined or left the group during the removal. Run the command again."
-            );
-        }
     }
 
     #[test]
@@ -885,19 +837,6 @@ mod tests {
         let m = membership(&pair, "v9", "group", Some("a\u{1b}[31mb"), "me");
         let vaults = Vaults::from_pair(&pair, std::slice::from_ref(&m));
         assert_eq!(group_name(&vaults, &m).unwrap(), "a?[31mb");
-    }
-
-    #[test]
-    fn server_errors_become_short_messages() {
-        assert_eq!(
-            removal_error("a project changed during the removal; try again".to_string()),
-            "A member changed a project during the removal. Run the command again."
-        );
-        assert_eq!(
-            removal_error("a new key is necessary for each remaining member".to_string()),
-            "A person joined or left the group during the removal. Run the command again."
-        );
-        assert_eq!(removal_error("other".to_string()), "other");
     }
 
     fn temp_home(tag: &str) -> PathBuf {

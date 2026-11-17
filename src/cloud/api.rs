@@ -7,9 +7,131 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 const CONNECT_ERROR: &str =
-    "cannot connect to the Keyman server. Check the network connection, then try again.";
+    "Keyman cannot connect to the Keyman server. Check the network connection, then try again.";
 const DEADLOCK: &str = "40P01";
 const BAD_REPLY: &str = "The Keyman server gave a reply that Keyman cannot use.";
+const BAD_SIGN_IN: &str = "The sign-in data from the server is not complete.";
+pub const PROFILE_EXISTS: &str =
+    "Another computer set up your account now. Run 'keyman login' again.";
+const PROFILE_NOT_SAVED: &str = "Keyman cannot save the new key data on the server. Try again.";
+
+pub const INVITE_GONE: &str = "The invite does not exist now.";
+pub const GROUP_KEY_CHANGED: &str = "The group key changed. Run the command again.";
+const PERSON_CHANGED: &str =
+    "A person joined or left the group during the removal. Run the command again.";
+
+/// Server error texts that Keyman knows, as short sentences. The first match wins.
+const KNOWN_ERRORS: &[(&str, &str)] = &[
+    ("the invite does not exist", INVITE_GONE),
+    ("the group key changed", GROUP_KEY_CHANGED),
+    (
+        "a project changed during the removal",
+        "A member changed a project during the removal. Run the command again.",
+    ),
+    (
+        "a new key is necessary for each remaining member",
+        PERSON_CHANGED,
+    ),
+    ("a key is for a user who is not a member", PERSON_CHANGED),
+    ("every remaining member must get a new key", PERSON_CHANGED),
+    ("the user is not a member", PERSON_CHANGED),
+    (
+        "all projects of the vault must be encrypted again",
+        "A member added or removed a project during the removal. Run the command again.",
+    ),
+    (
+        "the key generation is out of date",
+        "The group key changed. Run 'keyman pull' again.",
+    ),
+    (
+        "not a member of this vault",
+        "You are not a member of this vault now. Run 'keyman pull'.",
+    ),
+    (
+        "only the owner can remove a member",
+        "Only the owner of the group can remove persons.",
+    ),
+    (
+        "the owner cannot be removed",
+        "The owner cannot be removed. Delete the group instead.",
+    ),
+    (
+        "only a member can accept an invite",
+        "Only a member of the group can give access.",
+    ),
+    (
+        "the user does not match the invite email",
+        "The invite is for a different email address.",
+    ),
+    (
+        "only a group accepts invites",
+        "Only a group accepts invites.",
+    ),
+    (
+        "the public key cannot change",
+        "The key on the server cannot change. Keyman stops.",
+    ),
+    (
+        "a project cannot move to a different vault",
+        "A project cannot move to a different vault.",
+    ),
+    (
+        "sign in first",
+        "You are not signed in. Run 'keyman login' first.",
+    ),
+    (
+        "JWT expired",
+        "Your sign-in is not valid now. Run 'keyman login'.",
+    ),
+];
+
+/// The most characters of an unknown server text that Keyman shows.
+const MAX_SERVER_TEXT: usize = 200;
+
+/// A server error as text that is safe and short for the terminal. Known
+/// errors become fixed sentences. Other text loses its control and format
+/// characters and is cut to `MAX_SERVER_TEXT` characters.
+pub fn server_message(code: &str, message: &str) -> String {
+    if let Some((_, known)) = KNOWN_ERRORS
+        .iter()
+        .find(|(server, _)| message.contains(server))
+    {
+        return known.to_string();
+    }
+    match code {
+        "42501" => return "The server does not allow this change.".to_string(),
+        "PGRST301" => return "Your sign-in is not valid now. Run 'keyman login'.".to_string(),
+        "23505" => return "The cloud has this item already.".to_string(),
+        _ => {}
+    }
+    let spaced: String = message
+        .chars()
+        .filter_map(|c| {
+            if c.is_whitespace() {
+                Some(' ')
+            } else if crate::ui::is_hidden(c) {
+                None
+            } else {
+                Some(c)
+            }
+        })
+        .collect();
+    let clean = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.is_empty() {
+        return "The Keyman server gave an error.".to_string();
+    }
+    if clean.chars().count() > MAX_SERVER_TEXT {
+        let cut: String = clean.chars().take(MAX_SERVER_TEXT).collect();
+        return format!("The Keyman server gave an error: {cut}...");
+    }
+    let end = if clean.ends_with('.') { "" } else { "." };
+    format!("The Keyman server gave an error: {clean}{end}")
+}
+
+/// A second insert of one row: HTTP 409, or the Postgres unique violation.
+pub(crate) fn is_conflict(status: u16, code: &str) -> bool {
+    status == 409 || code == "23505"
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -97,20 +219,20 @@ fn now() -> i64 {
 /// Read the caller's profile from the `my_profile` RPC reply.
 /// A caller with no profile gets `null` or an object of null fields.
 pub fn parse_my_profile(json: &str) -> Result<Option<Profile>, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| format!("bad server reply: {e}"))?;
+    let v: Value = serde_json::from_str(json).map_err(|_| BAD_REPLY.to_string())?;
     if v.get("user_id").is_none_or(Value::is_null) {
         return Ok(None);
     }
     serde_json::from_value(v)
         .map(Some)
-        .map_err(|e| format!("bad server reply: {e}"))
+        .map_err(|_| BAD_REPLY.to_string())
 }
 
 /// Read a token response. `now` is the current Unix time in seconds.
 pub fn parse_session(json: &str, now: i64) -> Result<Session, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| format!("bad server reply: {e}"))?;
+    let v: Value = serde_json::from_str(json).map_err(|_| BAD_REPLY.to_string())?;
     let text = |x: Option<&Value>| x.and_then(Value::as_str).map(str::to_string);
-    let bad = || "bad server reply: the sign-in data is not complete".to_string();
+    let bad = || BAD_SIGN_IN.to_string();
     let expires_at = v
         .get("expires_at")
         .and_then(Value::as_i64)
@@ -167,7 +289,9 @@ fn send_once(
         }
         None => String::new(),
     };
-    let req = req.body(payload).map_err(|e| format!("bad request: {e}"))?;
+    let req = req
+        .body(payload)
+        .map_err(|_| "Keyman cannot make the request.".to_string())?;
     let mut resp = agent().run(req).map_err(|_| CONNECT_ERROR.to_string())?;
     let status = resp.status().as_u16();
     let body = resp
@@ -183,22 +307,35 @@ fn error_fields(body: &str) -> (String, String) {
     let message = ["message", "msg", "error_description", "error"]
         .iter()
         .find_map(|k| pick(k))
-        .unwrap_or_else(|| "the Keyman server returned an error".to_string());
-    (pick("code").unwrap_or_default(), message)
+        .unwrap_or_default();
+    let code = pick("code").or_else(|| pick("error_code"));
+    (code.unwrap_or_default(), message)
+}
+
+/// A request that did not work. `status` is 0 when no reply came.
+struct Failure {
+    status: u16,
+    code: String,
+    /// Safe to show (see `server_message`).
+    message: String,
 }
 
 /// The one place that sends requests. It retries once after a Postgres deadlock.
-fn send(
+fn request(
     cfg: &Config,
     token: Option<&str>,
     method: &str,
     path: &str,
     prefer: Option<&str>,
     body: Option<&Value>,
-) -> Result<String, String> {
+) -> Result<String, Failure> {
     let mut retried = false;
     loop {
-        let r = send_once(cfg, token, method, path, prefer, body)?;
+        let r = send_once(cfg, token, method, path, prefer, body).map_err(|message| Failure {
+            status: 0,
+            code: String::new(),
+            message,
+        })?;
         if r.status < 400 {
             return Ok(r.body);
         }
@@ -207,8 +344,23 @@ fn send(
             retried = true;
             continue;
         }
-        return Err(message);
+        return Err(Failure {
+            status: r.status,
+            message: server_message(&code, &message),
+            code,
+        });
     }
+}
+
+fn send(
+    cfg: &Config,
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+    prefer: Option<&str>,
+    body: Option<&Value>,
+) -> Result<String, String> {
+    request(cfg, token, method, path, prefer, body).map_err(|failure| failure.message)
 }
 
 fn token_request(cfg: &Config, path: &str, body: Value) -> Result<Session, String> {
@@ -239,10 +391,14 @@ const UNAVAILABLE: &str = "The Keyman server is not available now. Try again lat
 /// Sort a failed refresh reply. Only a clear "bad refresh token" answer
 /// (HTTP 400, 401 or 403 with a known error code) is `Rejected`.
 pub fn classify_refresh_failure(status: u16, body: &str) -> RefreshError {
-    const REJECTED: [&str; 3] = [
+    const REJECTED: [&str; 7] = [
         "invalid_grant",
         "refresh_token_not_found",
         "refresh_token_already_used",
+        "session_expired",
+        "session_not_found",
+        "user_not_found",
+        "user_banned",
     ];
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let rejected = [400, 401, 403].contains(&status)
@@ -289,7 +445,7 @@ pub fn sign_out(cfg: &Config, session: &Session) -> Result<(), String> {
 }
 
 fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
-    serde_json::from_str(text).map_err(|e| format!("bad server reply: {e}"))
+    serde_json::from_str(text).map_err(|_| BAD_REPLY.to_string())
 }
 
 fn in_list(ids: &[String]) -> String {
@@ -386,17 +542,58 @@ impl Api {
         parse(&self.get(&path)?)
     }
 
-    pub fn put_profile(&self, p: &Profile) -> Result<(), String> {
+    /// Adds the profile of a new account. It never replaces a profile: when
+    /// another computer was first, the answer is `PROFILE_EXISTS`.
+    pub fn insert_profile(&self, p: &Profile) -> Result<(), String> {
         let mut row = p.clone();
         row.email = row.email.to_lowercase();
-        let body = serde_json::to_value(&row).map_err(|e| e.to_string())?;
-        self.call(
+        let body = serde_json::to_value(&row).map_err(|_| BAD_REPLY.to_string())?;
+        request(
+            &self.cfg,
+            Some(&self.session.access_token),
             "POST",
-            "/rest/v1/profiles?on_conflict=user_id",
-            Some("resolution=merge-duplicates,return=minimal"),
+            "/rest/v1/profiles",
+            Some("return=minimal"),
             Some(&body),
         )
         .map(|_| ())
+        .map_err(|failure| {
+            if is_conflict(failure.status, &failure.code) {
+                PROFILE_EXISTS.to_string()
+            } else {
+                failure.message
+            }
+        })
+    }
+
+    /// Saves new sealed copies of the private key (after a recovery or a
+    /// password change). The public key and the email do not change. The
+    /// server ignores an update it does not allow, so the profile is read
+    /// again to check it.
+    pub fn update_profile_keys(&self, p: &Profile) -> Result<(), String> {
+        let path = format!(
+            "/rest/v1/profiles?user_id=eq.{}",
+            urlenc(&self.session.user_id)
+        );
+        let body = json!({
+            "kdf_salt": p.kdf_salt,
+            "kdf_params": p.kdf_params,
+            "private_key_pw": p.private_key_pw,
+            "private_key_recovery": p.private_key_recovery,
+        });
+        self.call("PATCH", &path, Some("return=minimal"), Some(&body))?;
+        let saved = self
+            .my_profile()?
+            .ok_or_else(|| PROFILE_NOT_SAVED.to_string())?;
+        let same = saved.kdf_salt == p.kdf_salt
+            && saved.kdf_params == p.kdf_params
+            && saved.private_key_pw == p.private_key_pw
+            && saved.private_key_recovery == p.private_key_recovery;
+        if same {
+            Ok(())
+        } else {
+            Err(PROFILE_NOT_SAVED.to_string())
+        }
     }
 
     pub fn my_memberships(&self) -> Result<Vec<Membership>, String> {
@@ -508,9 +705,7 @@ impl Api {
             Some(&body),
         )?;
         let rows: Vec<CloudProject> = parse(&text)?;
-        rows.into_iter()
-            .next()
-            .ok_or_else(|| "bad server reply: no project returned".to_string())
+        rows.into_iter().next().ok_or_else(|| BAD_REPLY.to_string())
     }
 
     /// `Ok(None)` means the cloud copy is newer than `base_version`.
@@ -685,6 +880,67 @@ mod tests {
         let (c, m) = error_fields(r#"{"code":"40P01","message":"deadlock detected"}"#);
         assert_eq!((c.as_str(), m.as_str()), ("40P01", "deadlock detected"));
         assert_eq!(error_fields(r#"{"code":400,"msg":"bad"}"#).1, "bad");
+        assert_eq!(
+            error_fields(r#"{"code":400,"error_code":"user_banned","msg":"x"}"#).0,
+            "user_banned"
+        );
+    }
+
+    #[test]
+    fn known_server_errors_become_short_sentences() {
+        assert_eq!(server_message("", "the invite does not exist"), INVITE_GONE);
+        assert_eq!(
+            server_message("P0001", "the group key changed; run the command again"),
+            GROUP_KEY_CHANGED
+        );
+        assert_eq!(
+            server_message("", "a project changed during the removal; try again"),
+            "A member changed a project during the removal. Run the command again."
+        );
+        for message in [
+            "a new key is necessary for each remaining member",
+            "a key is for a user who is not a member",
+            "every remaining member must get a new key",
+            "the user is not a member",
+        ] {
+            assert_eq!(
+                server_message("P0001", message),
+                "A person joined or left the group during the removal. Run the command again."
+            );
+        }
+        assert_eq!(
+            server_message("", "all projects of the vault must be encrypted again"),
+            "A member added or removed a project during the removal. Run the command again."
+        );
+        assert_eq!(
+            server_message("42501", "new row violates row-level security policy"),
+            "The server does not allow this change."
+        );
+        assert_eq!(
+            server_message("PGRST301", "JWT expired"),
+            "Your sign-in is not valid now. Run 'keyman login'."
+        );
+    }
+
+    #[test]
+    fn unknown_server_errors_are_cleaned() {
+        assert_eq!(
+            server_message("", "boom\u{1b}[2J\u{202E}  now"),
+            "The Keyman server gave an error: boom[2J now."
+        );
+        let long = "x".repeat(500);
+        let shown = server_message("", &long);
+        assert!(shown.chars().count() < 260, "{shown}");
+        assert!(shown.ends_with("..."), "{shown}");
+        assert_eq!(server_message("", ""), "The Keyman server gave an error.");
+    }
+
+    #[test]
+    fn a_second_profile_insert_is_a_conflict() {
+        assert!(is_conflict(409, ""));
+        assert!(is_conflict(400, "23505"));
+        assert!(!is_conflict(403, "42501"));
+        assert!(!is_conflict(500, ""));
     }
 
     #[test]
@@ -706,6 +962,25 @@ mod tests {
             c(401, r#"{"error_code":"refresh_token_not_found"}"#),
             RefreshError::Rejected
         );
+        for code in [
+            "session_expired",
+            "session_not_found",
+            "user_not_found",
+            "user_banned",
+        ] {
+            for status in [400, 401, 403] {
+                assert_eq!(
+                    c(
+                        status,
+                        &format!(r#"{{"code":{status},"error_code":"{code}","msg":"x"}}"#)
+                    ),
+                    RefreshError::Rejected,
+                    "{code} {status}"
+                );
+            }
+            assert!(keep(c(503, &format!(r#"{{"error_code":"{code}"}}"#))));
+            assert!(keep(c(429, &format!(r#"{{"error_code":"{code}"}}"#))));
+        }
         assert!(keep(c(503, "<html>down</html>")));
         assert!(keep(c(503, r#"{"error":"invalid_grant"}"#)));
         assert!(keep(c(429, r#"{"error_code":"over_request_rate_limit"}"#)));

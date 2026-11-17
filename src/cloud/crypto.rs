@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const NONCE_LEN: usize = 24;
-const DECRYPT_ERROR: &str = "the data does not decrypt: wrong key, or the data changed";
+const DECRYPT_ERROR: &str = "The data does not decrypt: wrong key, or the data changed.";
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 fn fill_random(buf: &mut [u8]) {
@@ -42,12 +42,12 @@ impl Key {
         let bytes = Zeroizing::new(
             STANDARD
                 .decode(text.trim())
-                .map_err(|_| "the key is not valid base64".to_string())?,
+                .map_err(|_| "The key is not valid base64.".to_string())?,
         );
         let array: [u8; 32] = bytes
             .as_slice()
             .try_into()
-            .map_err(|_| "the key must be 32 bytes".to_string())?;
+            .map_err(|_| "The key must have 32 bytes.".to_string())?;
         Ok(Key::from_bytes(array))
     }
 }
@@ -281,7 +281,7 @@ pub fn open_project(
 ) -> Result<(String, Variables), String> {
     let plain = open(key, &project_aad(project_id, version), sealed)?;
     let payload: ProjectPayload =
-        serde_json::from_slice(&plain).map_err(|_| "the project data is not valid".to_string())?;
+        serde_json::from_slice(&plain).map_err(|_| "The project data is not valid.".to_string())?;
     Ok((payload.name, payload.variables))
 }
 
@@ -325,7 +325,7 @@ mod tests {
         let tampered = STANDARD.encode(raw);
         assert_eq!(
             open(&k, "a", &tampered).unwrap_err(),
-            "the data does not decrypt: wrong key, or the data changed"
+            "The data does not decrypt: wrong key, or the data changed."
         );
     }
 

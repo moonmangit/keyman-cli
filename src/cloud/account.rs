@@ -28,6 +28,7 @@ const LEGACY_KEY: &str = "private_key";
 const NO_CLOUD: &str = "You do not have Keyman Cloud yet. Run 'keyman login' to set it up.";
 const RECOVER_HINT: &str = "Run 'keyman recover' to use your recovery code.";
 const USER_SWITCHED: &str = "You signed in as a different user. Keyman removed the cloud links of the old user. Your local projects did not change.";
+const HAS_PROFILE: &str = "This account has a vault password already. Keyman did not change it.";
 const PASSWORD_TRIES: usize = 3;
 const CODE_TRIES: usize = 3;
 
@@ -278,7 +279,7 @@ pub fn setup_profile(
     if !confirmed {
         return Err(CODE_MISMATCH.to_string());
     }
-    api.put_profile(&profile)?;
+    api.insert_profile(&profile)?;
     let vault_id = create_personal_vault(api, &pair)?;
     Ok((pair, vault_id))
 }
@@ -428,6 +429,9 @@ pub fn setup_with(
     params: KdfParams,
 ) -> Result<(KeyPair, String), String> {
     let api = Api::new(config(), session.clone());
+    if api.my_profile()?.is_some() {
+        return Err(HAS_PROFILE.to_string());
+    }
     let mut answers = SetupAnswers {
         password: Zeroizing::new(password.to_string()),
         code: None,
@@ -586,7 +590,7 @@ fn finish_recover(
     let pair = unlock_with_recovery(&profile, &code)?;
     let password = Zeroizing::new(prompt.new_password()?);
     let updated = reseal_all(&profile, &pair, &password, &code)?;
-    api.put_profile(&updated)?;
+    api.update_profile_keys(&updated)?;
     // The session entry comes first, then the key.
     if let Some(session) = fresh {
         store_session(home, store, session)?;
@@ -608,7 +612,7 @@ pub fn change_password(
     let pair = unlock_with_password(&profile, &current)?;
     let password = Zeroizing::new(prompt.new_password()?);
     let updated = reseal_password(&profile, &pair, &password)?;
-    api.put_profile(&updated)
+    api.update_profile_keys(&updated)
 }
 
 /// Sign out on the server (network errors are ignored), then remove the

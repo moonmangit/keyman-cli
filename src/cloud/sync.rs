@@ -1202,12 +1202,12 @@ mod tests {
     #[test]
     fn a_new_key_generation_is_not_a_decrypt_error() {
         assert_eq!(
-            open_failure(1, 2, "the data is not valid".to_string()),
+            open_failure(1, 2, "The data is not valid.".to_string()),
             "The group key changed. Run 'keyman pull' again."
         );
         assert_eq!(
-            open_failure(2, 2, "the data is not valid".to_string()),
-            "Keyman cannot open this project. the data is not valid"
+            open_failure(2, 2, "The data is not valid.".to_string()),
+            "Keyman cannot open this project. The data is not valid."
         );
     }
 
