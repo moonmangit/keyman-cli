@@ -1,6 +1,9 @@
 mod cli;
 mod completions;
 
+use keyman_cli::cloud::account::{self, Prompt};
+use keyman_cli::cloud::keystore::SystemStore;
+use keyman_cli::cloud::state;
 use keyman_cli::envfile::{self, Change};
 use keyman_cli::{master, save, ui};
 
@@ -111,9 +114,98 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
                 .to_owned()
         }
         "completions" => completions::script(&positional[0].to_string_lossy())?,
+        "login" => login(&home_dir()?, &flags)?,
+        "logout" => {
+            account::logout(&home_dir()?, &SystemStore)?;
+            ui::success("Signed out. Keyman removed the keys from this computer.")
+        }
+        "recover" => {
+            account::recover(&home_dir()?, &SystemStore, &mut TerminalPrompt)?;
+            ui::success("The vault password is changed.")
+        }
+        "password" => {
+            account::change_password(&home_dir()?, &SystemStore, &mut TerminalPrompt)?;
+            ui::success("The vault password is changed.")
+        }
         other => return Err(format!("command '{other}' is not implemented")),
     };
     Ok(Outcome::Print(output))
+}
+
+/// Asks the questions in the terminal. Passwords are not shown.
+struct TerminalPrompt;
+
+fn ask_hidden(label: &str) -> Result<String, String> {
+    rpassword::prompt_password(label).map_err(|_| "Keyman cannot read your answer.".to_string())
+}
+
+impl Prompt for TerminalPrompt {
+    fn new_password(&mut self) -> Result<String, String> {
+        println!("Make a vault password. Keyman uses it to encrypt your secrets.");
+        println!("Keyman cannot reset this password.");
+        let first = ask_hidden("Vault password: ")?;
+        if first.chars().count() < 10 {
+            return Err("The password must have 10 characters or more.".to_string());
+        }
+        let second = ask_hidden("Type the password again: ")?;
+        if first != second {
+            return Err("The two passwords are not the same.".to_string());
+        }
+        Ok(first)
+    }
+
+    fn password(&mut self) -> Result<String, String> {
+        ask_hidden("Vault password: ")
+    }
+
+    fn recovery_code(&mut self) -> Result<String, String> {
+        ask_hidden("Recovery code: ")
+    }
+
+    fn show_recovery_code(&mut self, code: &str) -> Result<(), String> {
+        println!(
+            "
+Your recovery code:
+
+    {}
+",
+            bold(code)
+        );
+        println!("Write down this code and keep it in a safe place.");
+        println!("If you lose the password and this code, nobody can get your cloud data back.");
+        println!("Type the code again to confirm:");
+        Ok(())
+    }
+}
+
+/// The provider from the options, or from a question when there is no option.
+fn choose_provider(flags: &[&str]) -> Result<&'static str, String> {
+    match (flags.contains(&"--github"), flags.contains(&"--google")) {
+        (true, true) => Err("Choose one: --github or --google.".to_string()),
+        (true, false) => Ok("github"),
+        (false, true) => Ok("google"),
+        (false, false) => {
+            println!("Sign in with: 1) GitHub  2) Google");
+            let mut answer = String::new();
+            std::io::stdin()
+                .read_line(&mut answer)
+                .map_err(|_| "Keyman cannot read your answer.".to_string())?;
+            match answer.trim().to_lowercase().as_str() {
+                "1" | "github" => Ok("github"),
+                "2" | "google" => Ok("google"),
+                _ => Err("Type 1 for GitHub or 2 for Google.".to_string()),
+            }
+        }
+    }
+}
+
+fn login(home: &Path, flags: &[&str]) -> Result<String, String> {
+    let provider = choose_provider(flags)?;
+    account::login(home, &SystemStore, provider, &mut TerminalPrompt)?;
+    let email = state::load(home)?.email.unwrap_or_default();
+    Ok(ui::success(&format!(
+        "Signed in as {email}. Keyman Cloud is ready."
+    )))
 }
 
 fn loaded_message(loaded: &master::Loaded, created: bool) -> String {

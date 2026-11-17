@@ -25,7 +25,7 @@ pub const PROJECT_COMMANDS: &[&str] = &["show", "inject", "save", "diff", "expor
 
 const PROJECT: &str = "Project name in the master file. Default: the current folder name";
 
-const GROUPS: &[&str] = &["Set up", "Projects", "In a project folder", "More"];
+const GROUPS: &[&str] = &["Set up", "Projects", "In a project folder", "More", "Cloud"];
 
 pub const COMMANDS: &[Spec] = &[
     Spec {
@@ -174,6 +174,60 @@ pub const COMMANDS: &[Spec] = &[
         flags: &[],
         min: 0,
         max: 1,
+    },
+    Spec {
+        name: "login",
+        group: "Cloud",
+        args: "[--github] [--google]",
+        arguments: &[],
+        summary: "Sign in to Keyman Cloud",
+        details: "Opens your browser to sign in with GitHub or Google. If you do not add an
+option, Keyman asks which one to use.
+
+The first time, Keyman asks you to make a vault password. Keyman uses it to
+encrypt your secrets, and it cannot reset the password. Keyman also shows a
+recovery code one time. Write it down and keep it in a safe place.
+
+On a new computer, type the vault password you made before.",
+        flags: &[("--github", "Sign in with GitHub"), ("--google", "Sign in with Google")],
+        min: 0,
+        max: 0,
+    },
+    Spec {
+        name: "logout",
+        group: "Cloud",
+        args: "",
+        arguments: &[],
+        summary: "Sign out and remove the keys from this computer",
+        details: "Signs out of Keyman Cloud and removes the keys from this computer.
+Your projects stay in the master file, and their links stay too.",
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
+    Spec {
+        name: "recover",
+        group: "Cloud",
+        args: "",
+        arguments: &[],
+        summary: "Set a new vault password with your recovery code",
+        details: "Use this when you forgot the vault password. Keyman asks for your recovery
+code, then for a new vault password. You must be signed in.",
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
+    Spec {
+        name: "password",
+        group: "Cloud",
+        args: "",
+        arguments: &[],
+        summary: "Change your vault password",
+        details: "Asks for your current vault password, then for a new one. Your projects and
+your recovery code do not change.",
+        flags: &[],
+        min: 0,
+        max: 0,
     },
 ];
 
@@ -467,6 +521,30 @@ mod tests {
   <file>  required  Your existing master file"
         ));
         assert!(super::help().contains("  load <file>"));
+    }
+
+    #[test]
+    fn login_accepts_provider_flag() {
+        let login = find("login").unwrap();
+        let input = args(&["--github"]);
+        let Parsed::Args { positional, flags } = parse(login, &input).unwrap() else {
+            panic!("expected arguments");
+        };
+        assert!(positional.is_empty());
+        assert_eq!(flags, ["--github"]);
+        assert!(parse(login, &args(&["--google"])).is_ok());
+        assert!(parse(login, &args(&["--gitlab"])).is_err());
+        assert!(parse(login, &args(&["extra"])).is_err());
+    }
+
+    #[test]
+    fn cloud_group_in_help() {
+        let help = super::help();
+        assert!(help.contains("Cloud"));
+        assert!(help.contains("login"));
+        for name in ["logout", "recover", "password"] {
+            assert!(help.contains(name), "{name}");
+        }
     }
 
     #[test]

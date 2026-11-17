@@ -236,7 +236,7 @@ pub fn sign_out(cfg: &Config, session: &Session) -> Result<(), String> {
         cfg,
         Some(&session.access_token),
         "POST",
-        "/auth/v1/logout",
+        "/auth/v1/logout?scope=local",
         None,
         None,
     )
@@ -282,6 +282,14 @@ pub struct Api {
 impl Api {
     pub fn new(cfg: Config, session: Session) -> Api {
         Api { cfg, session }
+    }
+
+    pub fn user_id(&self) -> &str {
+        &self.session.user_id
+    }
+
+    pub fn email(&self) -> &str {
+        &self.session.email
     }
 
     fn call(

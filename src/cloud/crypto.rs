@@ -86,6 +86,22 @@ impl KdfParams {
         t: 3,
         p: 1,
     };
+
+    /// The server stores these settings, so they are not trusted. Refuse
+    /// values that are too weak (easy to attack) or too heavy (hang the
+    /// computer).
+    pub fn check(&self) -> Result<(), String> {
+        if self.m < 19456
+            || self.m > 1048576
+            || self.t < 2
+            || self.t > 10
+            || self.p < 1
+            || self.p > 4
+        {
+            return Err("The key settings from the server are not safe. Keyman stops.".to_string());
+        }
+        Ok(())
+    }
 }
 
 pub fn new_salt() -> [u8; 16] {
@@ -96,13 +112,13 @@ pub fn new_salt() -> [u8; 16] {
 
 pub fn derive_key(secret: &str, salt: &[u8; 16], params: KdfParams) -> Result<Key, String> {
     let argon_params = Params::new(params.m, params.t, params.p, Some(32))
-        .map_err(|e| format!("the key settings are not valid: {e}"))?;
+        .map_err(|_| "The key settings are not valid.".to_string())?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
     let mut out = [0u8; 32];
     let result = argon.hash_password_into(secret.as_bytes(), salt, &mut out);
     let key = Key::from_bytes(out);
     out.zeroize();
-    result.map_err(|e| format!("the key derivation failed: {e}"))?;
+    result.map_err(|_| "Keyman cannot make the key.".to_string())?;
     Ok(key)
 }
 
@@ -307,6 +323,29 @@ mod tests {
             derive_key("pw", &s1, FAST).unwrap().to_base64(),
             derive_key("pw", &s2, FAST).unwrap().to_base64()
         );
+    }
+
+    #[test]
+    fn kdf_params_check_bounds() {
+        assert!(KdfParams::PRODUCTION.check().is_ok());
+        let bad = |m, t, p| KdfParams { m, t, p }.check().is_err();
+        assert!(bad(8, 3, 1));
+        assert!(bad(19455, 3, 1));
+        assert!(bad(1048577, 3, 1));
+        assert!(bad(65536, 1, 1));
+        assert!(bad(65536, 11, 1));
+        assert!(bad(65536, 3, 0));
+        assert!(bad(65536, 3, 5));
+        assert!(!bad(19456, 2, 1));
+        assert!(!bad(1048576, 10, 4));
+    }
+
+    #[test]
+    fn derive_key_errors_are_fixed_text() {
+        let error = derive_key("pw", &[0u8; 16], KdfParams { m: 1, t: 1, p: 1 })
+            .err()
+            .unwrap();
+        assert_eq!(error, "The key settings are not valid.");
     }
 
     #[test]
