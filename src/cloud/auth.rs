@@ -5,7 +5,7 @@ use super::config::Config;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
@@ -89,6 +89,11 @@ fn callback_query(request_line: &str) -> Option<&str> {
     (path == "/callback").then_some(query)
 }
 
+/// Make server text safe for a terminal: no control characters, limited length.
+fn clean_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(200).collect()
+}
+
 pub fn parse_callback(request_line: &str) -> Result<String, String> {
     let query = callback_query(request_line).ok_or("The sign-in reply is not valid.")?;
     let (mut code, mut error, mut desc) = (None, None, None);
@@ -102,32 +107,39 @@ pub fn parse_callback(request_line: &str) -> Result<String, String> {
         }
     }
     if let Some(d) = desc.or(error) {
-        return Err(d);
+        return Err(format!("The sign-in failed: {}", clean_text(&d)));
     }
     code.filter(|c| !c.is_empty())
         .ok_or_else(|| "The sign-in reply has no code.".to_string())
 }
 
-fn reply(stream: &mut std::net::TcpStream, status: &str, text: &str) {
+/// A complete HTTP/1.1 reply with a small HTML page.
+fn http_response(status: &str, text: &str) -> String {
     let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Keyman</title></head>         <body style=\"font-family:sans-serif;margin:3em\"><p>{text}</p></body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Keyman</title></head><body style=\"font-family:sans-serif;margin:3em\"><p>{text}</p></body></html>"
     );
-    let _ = write!(
-        stream,
-        "HTTP/1.1 {status}
-
-Content-Type: text/html; charset=utf-8
-
-Content-Length: {}
-
-Connection: close
-
-
-
-{body}",
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
-    );
+    )
+}
+
+fn reply(stream: &mut std::net::TcpStream, status: &str, text: &str) {
+    let _ = stream.write_all(http_response(status, text).as_bytes());
     let _ = stream.flush();
+}
+
+/// Read the request line, at most 8 KiB.
+fn read_request_line(stream: &std::net::TcpStream) -> Option<String> {
+    let mut line = String::new();
+    BufReader::new(stream.take(8192))
+        .read_line(&mut line)
+        .ok()?;
+    Some(line)
+}
+
+fn is_get(request_line: &str) -> bool {
+    request_line.split_whitespace().next() == Some("GET")
 }
 
 fn bind_callback_port() -> Result<(TcpListener, u16), String> {
@@ -146,12 +158,18 @@ fn wait_for_callback(listener: &TcpListener) -> Result<String, String> {
         .map_err(|e| format!("Keyman cannot wait for sign-in: {e}"))?;
     let deadline = Instant::now() + WAIT;
     loop {
+        if Instant::now() >= deadline {
+            return Err("Sign-in took too long. Try again.".to_string());
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let mut line = String::new();
-                if BufReader::new(&stream).read_line(&mut line).is_err() {
+                let Some(line) = read_request_line(&stream) else {
+                    continue;
+                };
+                if !is_get(&line) {
+                    reply(&mut stream, "405 Method Not Allowed", "Not allowed.");
                     continue;
                 }
                 if callback_query(&line).is_none() {
@@ -173,9 +191,6 @@ fn wait_for_callback(listener: &TcpListener) -> Result<String, String> {
                 return Ok(line);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err("Sign-in took too long. Try again.".to_string());
-                }
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => return Err(format!("Keyman cannot wait for sign-in: {e}")),
@@ -188,10 +203,7 @@ pub fn sign_in_with_browser(cfg: &Config, provider: &str) -> Result<Session, Str
     let redirect = format!("http://127.0.0.1:{port}/callback");
     let pk = pkce();
     let url = authorize_url(cfg, provider, &redirect, &pk.challenge);
-    println!(
-        "Open this link to sign in:
-{url}"
-    );
+    println!("Open this link to sign in:\n{url}");
     let _ = webbrowser::open(&url);
     let line = wait_for_callback(&listener)?;
     let code = parse_callback(&line)?;
@@ -253,5 +265,33 @@ mod tests {
     #[test]
     fn parse_callback_needs_code() {
         assert!(parse_callback("GET /callback HTTP/1.1").is_err());
+    }
+
+    #[test]
+    fn http_response_is_well_formed() {
+        let r = http_response("200 OK", "hi");
+        assert!(r.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/html"));
+        assert_eq!(r.matches("\r\n\r\n").count(), 1);
+        let (head, body) = r.split_once("\r\n\r\n").unwrap();
+        assert!(body.starts_with("<!doctype"));
+        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
+    }
+
+    #[test]
+    fn parse_callback_strips_control_characters() {
+        let e = parse_callback("GET /callback?error_description=%1B%5B31mX HTTP/1.1").unwrap_err();
+        assert!(!e.contains('\u{1b}'));
+        assert!(e.starts_with("The sign-in failed: "));
+        let long = format!(
+            "GET /callback?error_description={} HTTP/1.1",
+            "a".repeat(500)
+        );
+        assert!(parse_callback(&long).unwrap_err().len() < 230);
+    }
+
+    #[test]
+    fn only_get_is_accepted() {
+        assert!(is_get("GET /callback HTTP/1.1"));
+        assert!(!is_get("POST /callback HTTP/1.1"));
     }
 }

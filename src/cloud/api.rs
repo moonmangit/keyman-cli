@@ -19,7 +19,7 @@ pub struct Session {
     pub email: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub user_id: String,
     pub email: String,
@@ -130,6 +130,7 @@ fn agent() -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .max_redirects(0)
             .timeout_global(Some(Duration::from_secs(30)))
             .build(),
     )
@@ -151,11 +152,10 @@ fn send_once(
     let mut req = ureq::http::Request::builder()
         .method(method)
         .uri(format!("{}{}", cfg.url, path))
-        .header("apikey", &cfg.key)
-        .header(
-            "Authorization",
-            format!("Bearer {}", token.unwrap_or(&cfg.key)),
-        );
+        .header("apikey", &cfg.key);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
     if let Some(p) = prefer {
         req = req.header("Prefer", p);
     }
