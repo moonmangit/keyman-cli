@@ -112,13 +112,30 @@ fn count_changes(before: &[(String, String)], after: &[(String, String)]) -> usi
     changed + removed
 }
 
+/// Fails when the project is already linked on this computer. Offline.
+pub fn ensure_unlinked(home: &Path, project: &str) -> Result<(), String> {
+    if state::load(home)?.link(project).is_some() {
+        return Err(format!("Project '{project}' is already linked."));
+    }
+    Ok(())
+}
+
+/// Refuses a name that is already in the target vault, so a second computer
+/// or a second `link` cannot make a duplicate.
+fn cloud_name_is_free(cloud_names: &[String], project: &str) -> Result<(), String> {
+    if cloud_names.iter().any(|name| name == project) {
+        return Err(format!(
+            "A project named '{project}' is in the cloud. Run 'keyman pull {project}' to get it."
+        ));
+    }
+    Ok(())
+}
+
 pub fn link(home: &Path, u: &Unlocked, project: &str, group: Option<&str>) -> Result<Link, String> {
     let (_, yaml) = master::read_master(home)?;
     let variables = master::project_variables(&yaml, project)?;
+    ensure_unlinked(home, project)?;
     let mut st = state::load(home)?;
-    if st.link(project).is_some() {
-        return Err(format!("Project '{project}' is already linked."));
-    }
     let memberships = u.api.my_memberships()?;
     let vaults = Vaults::from_memberships(u, &memberships);
     let vault_id = match group {
@@ -126,6 +143,16 @@ pub fn link(home: &Path, u: &Unlocked, project: &str, group: Option<&str>) -> Re
         None => personal_in(&memberships)?,
     };
     let (key, generation) = vaults.key(&vault_id)?;
+    let existing = u.api.projects(std::slice::from_ref(&vault_id))?;
+    let names: Vec<String> = existing
+        .iter()
+        .filter_map(|row| {
+            crypto::open_project(key, &row.id, row.version, &row.sealed)
+                .ok()
+                .map(|(name, _)| name)
+        })
+        .collect();
+    cloud_name_is_free(&names, project)?;
     let row = u.api.insert_project(&vault_id, *generation, |id| {
         crypto::seal_project(key, id, 1, project, &variables)
     })?;
@@ -135,6 +162,7 @@ pub fn link(home: &Path, u: &Unlocked, project: &str, group: Option<&str>) -> Re
         vault_id,
         version: row.version,
         base: variables,
+        cloud_name: project.to_string(),
     };
     st.set_link(link.clone());
     state::save(home, &st)?;
@@ -215,7 +243,12 @@ pub fn push(home: &Path, u: &Unlocked, project: Option<&str>) -> Result<Vec<Push
             }
         };
         let next = link.version + 1;
-        let sealed = crypto::seal_project(key, &link.cloud_id, next, &name, &local);
+        let sealed_name = if link.cloud_name.is_empty() {
+            &name
+        } else {
+            &link.cloud_name
+        };
+        let sealed = crypto::seal_project(key, &link.cloud_id, next, sealed_name, &local);
         match u
             .api
             .update_project(&link.cloud_id, link.version, *generation, &sealed)?
@@ -257,7 +290,7 @@ pub enum PullResult {
 }
 
 const CHANGED_WHILE_WORKING: &str =
-    "The master file changed while Keyman worked. Nothing was written. Run 'keyman pull' again.";
+    "The master file changed while Keyman worked. Keyman did not write anything. Run 'keyman pull' again.";
 
 pub fn pull(
     home: &Path,
@@ -331,11 +364,13 @@ pub fn pull(
                         // (b) then the link: the base is the cloud copy, not the merge.
                         let moved = link.version != row.version
                             || link.vault_id != row.vault_id
+                            || link.cloud_name != cloud_name
                             || !same_vars(&link.base, &cloud_vars);
                         if moved {
                             if let Some(stored) = st.link_mut(&name) {
                                 stored.version = row.version;
                                 stored.vault_id = row.vault_id.clone();
+                                stored.cloud_name = cloud_name.clone();
                                 stored.base = cloud_vars;
                             }
                             state::save(home, &st)?;
@@ -356,35 +391,59 @@ pub fn pull(
                     continue;
                 }
                 matched = true;
-                let target = local_name.map_or(cloud_name, str::to_string);
+                let target = local_name.map_or_else(|| cloud_name.clone(), str::to_string);
                 let taken = st.link(&target).is_some();
-                match added_step(&yaml, &target, taken, &cloud_vars)? {
+                // Only a project named on the command line, with no --as, joins a local one.
+                let adopting = project.is_some()
+                    && local_name.is_none()
+                    && !taken
+                    && master::project_names(&yaml)?.contains(&target);
+                let step = if adopting {
+                    adopt_step(&yaml, &target, &cloud_vars, resolver)?
+                } else {
+                    added_step(&yaml, &target, taken, &cloud_vars)?
+                };
+                match step {
                     Step::Skipped(reason) => results.push(PullResult::Skipped {
                         project: target,
                         reason,
                     }),
-                    Step::Done {
-                        yaml: Some(text), ..
-                    } => {
-                        if master::read_master(home)?.1 != yaml {
-                            results.push(PullResult::Skipped {
-                                project: target,
-                                reason: CHANGED_WHILE_WORKING.to_string(),
-                            });
-                            continue;
+                    Step::Stopped(conflicts) => results.push(PullResult::Stopped {
+                        project: target,
+                        conflicts,
+                    }),
+                    Step::Done { yaml: new, changes } => {
+                        if let Some(text) = new {
+                            if master::read_master(home)?.1 != yaml {
+                                results.push(PullResult::Skipped {
+                                    project: target,
+                                    reason: CHANGED_WHILE_WORKING.to_string(),
+                                });
+                                continue;
+                            }
+                            master::atomic_write(&path, text.as_bytes())?;
                         }
-                        master::atomic_write(&path, text.as_bytes())?;
+                        // The base is the cloud copy, so the next push sends local-only changes.
                         st.set_link(Link {
                             project: target.clone(),
                             cloud_id: row.id.clone(),
                             vault_id: row.vault_id.clone(),
                             version: row.version,
                             base: cloud_vars,
+                            cloud_name,
                         });
                         state::save(home, &st)?;
-                        results.push(PullResult::Added(target));
+                        results.push(if !adopting {
+                            PullResult::Added(target)
+                        } else if changes > 0 {
+                            PullResult::Updated {
+                                project: target,
+                                changes,
+                            }
+                        } else {
+                            PullResult::UpToDate(target)
+                        });
                     }
-                    Step::Done { yaml: None, .. } | Step::Stopped(_) => {}
                 }
             }
         }
@@ -512,6 +571,49 @@ enum Step {
     },
 }
 
+/// A refusal from `write_project` as one short sentence, then the detail.
+fn refused(project: &str, detail: &str) -> String {
+    format!(
+        "Keyman cannot update '{project}' safely.\n{}",
+        detail.replace("\n\n", "\n")
+    )
+}
+
+/// Merge for a project that has a base. Asks the resolver only when the
+/// master file layout allows the write.
+fn merge_step(
+    yaml: &str,
+    name: &str,
+    base: &[(String, String)],
+    local: &[(String, String)],
+    cloud: &[(String, String)],
+    resolver: &mut dyn Resolver,
+) -> Result<Step, String> {
+    let conflicts = merge::merge(base, local, cloud).conflicts.len();
+    if conflicts > 0 {
+        if let Err(detail) = write_project(yaml, name, true, local) {
+            return Ok(Step::Skipped(refused(name, &detail)));
+        }
+    }
+    let Some(merged) = pull_merge(name, base, local, cloud, resolver)? else {
+        return Ok(Step::Stopped(conflicts));
+    };
+    let changes = count_changes(local, &merged);
+    if changes == 0 {
+        return Ok(Step::Done {
+            yaml: None,
+            changes: 0,
+        });
+    }
+    Ok(match write_project(yaml, name, true, &merged) {
+        Ok(text) => Step::Done {
+            yaml: Some(text),
+            changes,
+        },
+        Err(detail) => Step::Skipped(refused(name, &detail)),
+    })
+}
+
 fn linked_step(
     yaml: &str,
     link: &Link,
@@ -533,24 +635,23 @@ fn linked_step(
             changes: 0,
         });
     }
-    let Some(merged) = pull_merge(&link.project, &link.base, &local, cloud, resolver)? else {
-        let conflicts = merge::merge(&link.base, &local, cloud).conflicts.len();
-        return Ok(Step::Stopped(conflicts));
+    merge_step(yaml, &link.project, &link.base, &local, cloud, resolver)
+}
+
+/// Joins an existing local project to a cloud project of the same name. The
+/// base is empty: equal values match, different values are conflicts, and
+/// variables on one side only are kept.
+fn adopt_step(
+    yaml: &str,
+    name: &str,
+    cloud: &[(String, String)],
+    resolver: &mut dyn Resolver,
+) -> Result<Step, String> {
+    let local = match master::project_variables(yaml, name) {
+        Ok(local) => local,
+        Err(reason) => return Ok(Step::Skipped(reason)),
     };
-    let changes = count_changes(&local, &merged);
-    if changes == 0 {
-        return Ok(Step::Done {
-            yaml: None,
-            changes: 0,
-        });
-    }
-    Ok(match write_project(yaml, &link.project, true, &merged) {
-        Ok(text) => Step::Done {
-            yaml: Some(text),
-            changes,
-        },
-        Err(reason) => Step::Skipped(reason),
-    })
+    merge_step(yaml, name, &[], &local, cloud, resolver)
 }
 
 fn added_step(
@@ -562,7 +663,7 @@ fn added_step(
     let exists = master::project_names(yaml)?.iter().any(|n| n == name);
     if exists || linked {
         return Ok(Step::Skipped(format!(
-            "A local project named '{name}' exists. Use --as <name>."
+            "A local project named '{name}' exists. Run 'keyman pull {name}' to merge it with the local project, or use --as <name>."
         )));
     }
     Ok(match write_project(yaml, name, false, cloud) {
@@ -570,7 +671,7 @@ fn added_step(
             yaml: Some(text),
             changes: cloud.len(),
         },
-        Err(reason) => Step::Skipped(reason),
+        Err(detail) => Step::Skipped(refused(name, &detail)),
     })
 }
 
@@ -637,6 +738,7 @@ mod tests {
             vault_id: "vault".to_string(),
             version: 1,
             base,
+            cloud_name: project.to_string(),
         }
     }
 
@@ -845,7 +947,10 @@ mod tests {
         let step = added_step(yaml, "app", false, &v(&[("A", "9")])).unwrap();
         assert_eq!(
             step,
-            Step::Skipped("A local project named 'app' exists. Use --as <name>.".to_string())
+            Step::Skipped(
+                "A local project named 'app' exists. Run 'keyman pull app' to merge it with the local project, or use --as <name>."
+                    .to_string()
+            )
         );
         let step = added_step("other:\n  X: \"1\"\n", "app", true, &v(&[])).unwrap();
         assert!(matches!(step, Step::Skipped(_)));
@@ -864,5 +969,96 @@ mod tests {
             master::project_variables(&out, "app").unwrap(),
             v(&[("A", "9")])
         );
+    }
+
+    #[test]
+    fn link_refuses_a_name_that_is_in_the_cloud() {
+        let names = vec!["other".to_string(), "app".to_string()];
+        let error = cloud_name_is_free(&names, "app").unwrap_err();
+        assert_eq!(
+            error,
+            "A project named 'app' is in the cloud. Run 'keyman pull app' to get it."
+        );
+        assert!(cloud_name_is_free(&names, "new").is_ok());
+        assert!(cloud_name_is_free(&[], "app").is_ok());
+    }
+
+    #[test]
+    fn ensure_unlinked_checks_state_offline() {
+        let home = home_with("app:\n  A: \"1\"\n", vec![link_of("app", v(&[]))]);
+        assert_eq!(
+            ensure_unlinked(&home, "app").unwrap_err(),
+            "Project 'app' is already linked."
+        );
+        assert!(ensure_unlinked(&home, "other").is_ok());
+    }
+
+    #[test]
+    fn adopt_merges_with_no_conflict_when_values_match() {
+        let yaml = "app:\n  A: \"1\"\n  L: \"local\"\n";
+        let mut r = Fixed(None, 0);
+        let step = adopt_step(yaml, "app", &v(&[("A", "1"), ("C", "cloud")]), &mut r).unwrap();
+        let Step::Done {
+            yaml: Some(out),
+            changes,
+        } = step
+        else {
+            panic!("expected a write");
+        };
+        assert_eq!(r.1, 0);
+        assert_eq!(changes, 1);
+        assert_eq!(
+            master::project_variables(&out, "app").unwrap(),
+            v(&[("A", "1"), ("L", "local"), ("C", "cloud")])
+        );
+    }
+
+    #[test]
+    fn adopt_sends_a_differing_value_to_the_resolver() {
+        let yaml = "app:\n  A: \"1\"\n";
+        let mut r = Fixed(Some(vec![Some("x".into())]), 0);
+        let step = adopt_step(yaml, "app", &v(&[("A", "2")]), &mut r).unwrap();
+        assert_eq!(r.1, 1);
+        let Step::Done {
+            yaml: Some(out), ..
+        } = step
+        else {
+            panic!("expected a write");
+        };
+        assert_eq!(
+            master::project_variables(&out, "app").unwrap(),
+            v(&[("A", "x")])
+        );
+        let mut stop = Fixed(None, 0);
+        assert_eq!(
+            adopt_step(yaml, "app", &v(&[("A", "2")]), &mut stop).unwrap(),
+            Step::Stopped(1)
+        );
+    }
+
+    #[test]
+    fn pull_all_still_skips_a_name_collision() {
+        let step = added_step("app:\n  A: \"1\"\n", "app", false, &v(&[("A", "2")])).unwrap();
+        let Step::Skipped(reason) = step else {
+            panic!("expected skip");
+        };
+        assert!(reason.contains("keyman pull app"), "{reason}");
+    }
+
+    #[test]
+    fn layout_is_checked_before_the_resolver_is_asked() {
+        let yaml = "app: {A: \"1\"}\n";
+        let link = link_of("app", v(&[("A", "0")]));
+        let mut r = Fixed(Some(vec![Some("x".into())]), 0);
+        let step = linked_step(yaml, &link, 2, &v(&[("A", "2")]), &mut r).unwrap();
+        let Step::Skipped(reason) = step else {
+            panic!("expected skip");
+        };
+        assert_eq!(r.1, 0);
+        assert!(
+            reason.starts_with("Keyman cannot update 'app' safely.\n"),
+            "{reason}"
+        );
+        assert!(!reason.contains("\n\n"));
     }
 }

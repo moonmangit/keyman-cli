@@ -788,6 +788,7 @@ mod tests {
             vault_id: "v1".into(),
             version: 1,
             base: vec![("K".into(), "v".into())],
+            cloud_name: "app".into(),
         });
         state::save(&home, &st).unwrap();
         // The same user keeps the links.
@@ -865,6 +866,7 @@ mod tests {
             vault_id: "v1".into(),
             version: 1,
             base: vec![],
+            cloud_name: "app".into(),
         });
         state::save(&home, &st).unwrap();
         remember_key(&store, "user-A", &KeyPair::generate()).unwrap();

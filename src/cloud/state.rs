@@ -17,6 +17,9 @@ pub struct Link {
     pub vault_id: String,
     pub version: i64,
     pub base: Variables,
+    /// The name inside the cloud copy. It can differ from `project` after `pull --as`.
+    #[serde(default)]
+    pub cloud_name: String,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
@@ -112,6 +115,7 @@ mod tests {
             vault_id: "vault-1".to_string(),
             version,
             base: vec![("KEY".to_string(), "value".to_string())],
+            cloud_name: project.to_string(),
         }
     }
 

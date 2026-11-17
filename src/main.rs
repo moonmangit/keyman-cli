@@ -141,6 +141,7 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
             let (_, yaml) = read_master(&home)?;
             let project = resolve_project(arg(0), &yaml)?;
             let group = cli::value(&flags, "--group").map(|name| name.to_string_lossy());
+            sync::ensure_unlinked(&home, &project)?;
             let unlocked = unlock(&home)?;
             sync::link(&home, &unlocked, &project, group.as_deref())?;
             ui::success(&format!("Linked {project} to Keyman Cloud."))
@@ -382,13 +383,24 @@ fn clear_value(value: &Option<String>) -> String {
     }
 }
 
+/// Reads a hidden value. The prompt goes to stderr, like all resolver text.
+fn ask_hidden_stderr(label: &str) -> Result<String, String> {
+    use std::io::Write;
+    eprint!("{label}");
+    let _ = std::io::stderr().flush();
+    let value =
+        rpassword::read_password().map_err(|_| "Keyman cannot read your answer.".to_string())?;
+    eprintln!();
+    Ok(value)
+}
+
 fn ask_new_value() -> Result<Option<String>, String> {
-    let first = ask_hidden("New value: ")?;
-    let second = ask_hidden("Type the value again: ")?;
+    let first = ask_hidden_stderr("New value: ")?;
+    let second = ask_hidden_stderr("Type the value again: ")?;
     if first == second {
         Ok(Some(first))
     } else {
-        println!("The two values are not the same.");
+        eprintln!("The two values are not the same.");
         Ok(None)
     }
 }
@@ -401,13 +413,13 @@ impl Resolver for TerminalResolver {
     ) -> Result<Option<Vec<Option<String>>>, String> {
         let mut choices = Vec::new();
         for conflict in conflicts {
-            println!("Conflict in {project}: {}", conflict.name);
-            println!("  1) This computer: {}", hidden_value(&conflict.local));
-            println!("  2) Cloud:         {}", hidden_value(&conflict.cloud));
-            println!("  3) Type a new value");
-            println!("  4) Show the values");
+            eprintln!("Conflict in {project}: {}", conflict.name);
+            eprintln!("  1) This computer: {}", hidden_value(&conflict.local));
+            eprintln!("  2) Cloud:         {}", hidden_value(&conflict.cloud));
+            eprintln!("  3) Type a new value");
+            eprintln!("  4) Show the values");
             let choice = loop {
-                println!("Select 1, 2, 3 or 4:");
+                eprintln!("Select 1, 2, 3 or 4:");
                 match read_answer()?.as_str() {
                     "1" => break conflict.local.clone(),
                     "2" => break conflict.cloud.clone(),
@@ -416,11 +428,12 @@ impl Resolver for TerminalResolver {
                             break Some(value);
                         }
                     }
-                    "4" => {
-                        println!("  This computer: {}", clear_value(&conflict.local));
-                        println!("  Cloud:         {}", clear_value(&conflict.cloud));
+                    "4" if std::io::stderr().is_terminal() => {
+                        eprintln!("  This computer: {}", clear_value(&conflict.local));
+                        eprintln!("  Cloud:         {}", clear_value(&conflict.cloud));
                     }
-                    _ => println!("Type 1, 2, 3 or 4."),
+                    "4" => eprintln!("Keyman cannot show the values here."),
+                    _ => eprintln!("Type 1, 2, 3 or 4."),
                 }
             };
             choices.push(choice);
@@ -438,8 +451,8 @@ fn ask_hidden(label: &str) -> Result<String, String> {
 
 impl Prompt for TerminalPrompt {
     fn new_password(&mut self) -> Result<String, String> {
-        println!("Make a vault password. Keyman uses it to encrypt your secrets.");
-        println!("Keyman cannot reset this password.");
+        eprintln!("Make a vault password. Keyman uses it to encrypt your secrets.");
+        eprintln!("Keyman cannot reset this password.");
         let first = ask_hidden("Vault password: ")?;
         if first.chars().count() < 10 {
             return Err("The password must have 10 characters or more.".to_string());
@@ -460,7 +473,7 @@ impl Prompt for TerminalPrompt {
     }
 
     fn show_recovery_code(&mut self, code: &str) -> Result<(), String> {
-        println!(
+        eprintln!(
             "
 Your recovery code:
 
@@ -468,9 +481,9 @@ Your recovery code:
 ",
             bold(code)
         );
-        println!("Write down this code and keep it in a safe place.");
-        println!("If you lose the password and this code, nobody can get your cloud data back.");
-        println!("Type the code again to confirm:");
+        eprintln!("Write down this code and keep it in a safe place.");
+        eprintln!("If you lose the password and this code, nobody can get your cloud data back.");
+        eprintln!("Type the code again to confirm:");
         Ok(())
     }
 }
@@ -482,7 +495,7 @@ fn choose_provider(flags: &cli::Flags) -> Result<&'static str, String> {
         (true, false) => Ok("github"),
         (false, true) => Ok("google"),
         (false, false) => {
-            println!("Sign in with: 1) GitHub  2) Google");
+            eprintln!("Sign in with: 1) GitHub  2) Google");
             let mut answer = String::new();
             std::io::stdin()
                 .read_line(&mut answer)
