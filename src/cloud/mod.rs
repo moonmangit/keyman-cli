@@ -8,3 +8,4 @@ pub mod crypto;
 pub mod keystore;
 pub mod merge;
 pub mod state;
+pub mod sync;

@@ -2,7 +2,7 @@
 //! match the commands and options. Project names come from `keyman list` at
 //! completion time, so they stay current as the master file changes.
 
-use crate::cli::{COMMANDS, PROJECT_COMMANDS, SHELLS};
+use crate::cli::{flag_name, COMMANDS, PROJECT_COMMANDS, SHELLS};
 use crate::ui::did_you_mean;
 
 /// Commands whose second argument is a directory.
@@ -14,7 +14,7 @@ fn flag_table() -> Vec<(&'static str, String)> {
         .iter()
         .filter(|spec| !spec.flags.is_empty())
         .map(|spec| {
-            let flags: Vec<&str> = spec.flags.iter().map(|(flag, _)| *flag).collect();
+            let flags: Vec<&str> = spec.flags.iter().map(|(flag, _)| flag_name(flag)).collect();
             (spec.name, flags.join(" "))
         })
         .collect()
@@ -124,10 +124,12 @@ compdef _keyman keyman keyman-cli
                     clean(spec.summary)
                 ));
                 for (flag, description) in spec.flags {
+                    let name = flag_name(flag);
+                    let needs_value = if flag.len() > name.len() { " -r" } else { "" };
                     lines.push(format!(
-                        "complete -c keyman -n '__fish_seen_subcommand_from {}' -l {} -d '{}'",
+                        "complete -c keyman -n '__fish_seen_subcommand_from {}' -l {}{needs_value} -d '{}'",
                         spec.name,
-                        flag.trim_start_matches('-'),
+                        name.trim_start_matches('-'),
                         clean(description)
                     ));
                 }

@@ -1,15 +1,19 @@
 mod cli;
 mod completions;
 
+use keyman_cli::cloud::account::Unlocked;
 use keyman_cli::cloud::account::{self, Prompt};
 use keyman_cli::cloud::keystore::SystemStore;
+use keyman_cli::cloud::merge::{choose_all, Conflict, Keep};
 use keyman_cli::cloud::state;
+use keyman_cli::cloud::sync::{self, LinkStatus, PullResult, PushResult, Resolver};
 use keyman_cli::envfile::{self, Change};
 use keyman_cli::{master, save, ui};
 
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
@@ -84,7 +88,7 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
         "list" => list(&home_dir()?)?,
         "show" => {
             let (project, variables) = project_for(arg(0))?;
-            show(&project, &variables, flags.contains(&"--reveal"))
+            show(&project, &variables, cli::has(&flags, "--reveal"))
         }
         "inject" => {
             let (project, variables) = project_for(arg(0))?;
@@ -104,7 +108,7 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
                 &variables,
                 &env_path,
                 &incoming,
-                flags.contains(&"--reveal"),
+                cli::has(&flags, "--reveal"),
             )
         }
         "export" => {
@@ -132,9 +136,297 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
             account::change_password(&home_dir()?, &SystemStore::new(), &mut TerminalPrompt)?;
             ui::success("Keyman changed the vault password.")
         }
+        "link" => {
+            let home = home_dir()?;
+            let (_, yaml) = read_master(&home)?;
+            let project = resolve_project(arg(0), &yaml)?;
+            let group = cli::value(&flags, "--group").map(|name| name.to_string_lossy());
+            let unlocked = unlock(&home)?;
+            sync::link(&home, &unlocked, &project, group.as_deref())?;
+            ui::success(&format!("Linked {project} to Keyman Cloud."))
+        }
+        "unlink" => {
+            let project = match arg(0) {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => current_folder_name()?,
+            };
+            sync::unlink(&home_dir()?, &project)?;
+            ui::success(&format!("Removed the link for {project}."))
+        }
+        "push" => return push_command(arg(0)),
+        "pull" => return pull_command(arg(0), &flags),
+        "cloud" => return cloud_command(&positional[0].to_string_lossy(), arg(1)),
         other => return Err(format!("command '{other}' is not implemented")),
     };
     Ok(Outcome::Print(output))
+}
+
+/// Unlocks the cloud account. This signs in and asks for the vault password
+/// only when it needs to.
+fn unlock(home: &Path) -> Result<Unlocked, String> {
+    account::session(home, &SystemStore::new(), &mut TerminalPrompt)
+}
+
+/// Prints the lines. A non-zero code means the command did not finish all work.
+fn finish(lines: Vec<String>, code: i32) -> Outcome {
+    if code == 0 {
+        Outcome::Print(lines.join("\n"))
+    } else {
+        println!("{}", lines.join("\n"));
+        Outcome::Exit(code)
+    }
+}
+
+fn push_command(given: Option<&OsString>) -> Result<Outcome, String> {
+    let home = home_dir()?;
+    let project = given.map(|name| name.to_string_lossy().into_owned());
+    let unlocked = unlock(&home)?;
+    let results = sync::push(&home, &unlocked, project.as_deref())?;
+    if results.is_empty() {
+        return Ok(Outcome::Print(dim(
+            "No linked projects. Run 'keyman link' to connect one.",
+        )));
+    }
+    let mut code = 0;
+    let lines = results
+        .iter()
+        .map(|result| match result {
+            PushResult::Pushed { project, version } => ui::success(&format!(
+                "Sent {} {}",
+                accent(project),
+                dim(&format!("(version {version})"))
+            )),
+            PushResult::UpToDate(project) => dim(&format!("  {project} is up to date")),
+            PushResult::CloudIsNewer(project) => {
+                code = 1;
+                red(&format!(
+                    "The cloud has newer changes for {project}. Run 'keyman pull' first."
+                ))
+            }
+            PushResult::Skipped { project, reason } => {
+                code = 1;
+                yellow(&format!("Skipped {project}. {reason}"))
+            }
+        })
+        .collect();
+    Ok(finish(lines, code))
+}
+
+fn pull_command(given: Option<&OsString>, flags: &cli::Flags) -> Result<Outcome, String> {
+    let home = home_dir()?;
+    let project = given.map(|name| name.to_string_lossy().into_owned());
+    let local_name = cli::value(flags, "--as").map(|name| name.to_string_lossy().into_owned());
+    if local_name.is_some() && project.is_none() {
+        return Err("The option --as needs a project name.".to_string());
+    }
+    let mut resolver: Box<dyn Resolver> = match (
+        cli::has(flags, "--keep-local"),
+        cli::has(flags, "--keep-cloud"),
+    ) {
+        (true, true) => return Err("Choose one: --keep-local or --keep-cloud.".to_string()),
+        (true, false) => Box::new(KeepResolver { local: true }),
+        (false, true) => Box::new(KeepResolver { local: false }),
+        (false, false) if std::io::stdin().is_terminal() => Box::new(TerminalResolver),
+        (false, false) => Box::new(NoTerminalResolver),
+    };
+    let unlocked = unlock(&home)?;
+    let results = sync::pull(
+        &home,
+        &unlocked,
+        project.as_deref(),
+        local_name.as_deref(),
+        resolver.as_mut(),
+    )?;
+    if results.is_empty() {
+        return Ok(Outcome::Print(dim("No projects in the cloud yet.")));
+    }
+    let mut code = 0;
+    let lines = results
+        .iter()
+        .map(|result| match result {
+            PullResult::Updated { project, changes } => ui::success(&format!(
+                "Updated {} {}",
+                accent(project),
+                dim(&format!("({})", plural(*changes, "change")))
+            )),
+            PullResult::Added(project) => ui::success(&format!("Added {}", accent(project))),
+            PullResult::UpToDate(project) => dim(&format!("  {project} is up to date")),
+            PullResult::Stopped { project, conflicts } => {
+                code = 1;
+                red(&format!(
+                    "Pull stopped: {} in {project}. Run 'keyman pull' in a terminal, or add --keep-local or --keep-cloud.",
+                    plural(*conflicts, "conflict")
+                ))
+            }
+            PullResult::Skipped { project, reason } => {
+                code = 1;
+                yellow(&format!("Skipped {project}. {reason}"))
+            }
+        })
+        .collect();
+    Ok(finish(lines, code))
+}
+
+fn cloud_command(action: &str, given: Option<&OsString>) -> Result<Outcome, String> {
+    let home = home_dir()?;
+    match action {
+        "status" => {
+            let links = sync::local_status(&home)?;
+            if links.is_empty() {
+                return Ok(Outcome::Print(dim(
+                    "No linked projects. Run 'keyman link' to connect one.",
+                )));
+            }
+            let width = links.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+            let mut lines: Vec<String> = links
+                .iter()
+                .map(|(name, status)| {
+                    let (mark, text) = match status {
+                        LinkStatus::Synced => (green("✓"), dim("synced")),
+                        LinkStatus::LocalChanges => (yellow("●"), "local changes".to_string()),
+                        LinkStatus::Missing => (red("✗"), red("not in master file")),
+                    };
+                    format!("  {mark} {}  {text}", accent(&ui::pad(name, width)))
+                })
+                .collect();
+            lines.push(String::new());
+            lines.push(dim("Run 'keyman pull' to check the cloud for new changes."));
+            Ok(Outcome::Print(lines.join("\n")))
+        }
+        "delete" => {
+            let project = match given {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => current_folder_name()?,
+            };
+            if state::load(&home)?.link(&project).is_none() {
+                return Err(format!(
+                    "Project '{project}' is not linked. Run 'keyman cloud status' to see the links."
+                ));
+            }
+            println!(
+                "Delete {project} from the cloud for all members? Type the project name to confirm:"
+            );
+            if read_answer()? != project {
+                return Err(
+                    "The name is not the same. Keyman did not delete anything.".to_string()
+                );
+            }
+            let unlocked = unlock(&home)?;
+            sync::delete_cloud(&home, &unlocked, &project)?;
+            Ok(Outcome::Print(ui::success(&format!(
+                "Deleted {project} from the cloud. The project stays in the master file."
+            ))))
+        }
+        other => Err(format!(
+            "unknown action '{other}' for 'keyman cloud'{}\n\nUse 'keyman cloud status' or 'keyman cloud delete <project>'.",
+            ui::did_you_mean(other, ["status", "delete"])
+        )),
+    }
+}
+
+/// On a conflict, takes the same side for every variable.
+struct KeepResolver {
+    local: bool,
+}
+
+impl Resolver for KeepResolver {
+    fn resolve(
+        &mut self,
+        _project: &str,
+        conflicts: &[Conflict],
+    ) -> Result<Option<Vec<Option<String>>>, String> {
+        let keep = if self.local { Keep::Local } else { Keep::Cloud };
+        Ok(Some(choose_all(conflicts, keep)))
+    }
+}
+
+/// With no terminal and no option, a conflict stops the pull.
+struct NoTerminalResolver;
+
+impl Resolver for NoTerminalResolver {
+    fn resolve(
+        &mut self,
+        _project: &str,
+        _conflicts: &[Conflict],
+    ) -> Result<Option<Vec<Option<String>>>, String> {
+        Ok(None)
+    }
+}
+
+/// Asks about each conflict in the terminal. Values stay hidden until the
+/// user chooses to show them.
+struct TerminalResolver;
+
+fn read_answer() -> Result<String, String> {
+    let mut answer = String::new();
+    let read = std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|_| "Keyman cannot read your answer.".to_string())?;
+    if read == 0 {
+        return Err("Keyman cannot read your answer.".to_string());
+    }
+    Ok(answer.trim().to_string())
+}
+
+fn hidden_value(value: &Option<String>) -> String {
+    match value {
+        Some(_) => "••••••••".to_string(),
+        None => "(removed)".to_string(),
+    }
+}
+
+fn clear_value(value: &Option<String>) -> String {
+    match value {
+        Some(text) => text.clone(),
+        None => "(removed)".to_string(),
+    }
+}
+
+fn ask_new_value() -> Result<Option<String>, String> {
+    let first = ask_hidden("New value: ")?;
+    let second = ask_hidden("Type the value again: ")?;
+    if first == second {
+        Ok(Some(first))
+    } else {
+        println!("The two values are not the same.");
+        Ok(None)
+    }
+}
+
+impl Resolver for TerminalResolver {
+    fn resolve(
+        &mut self,
+        project: &str,
+        conflicts: &[Conflict],
+    ) -> Result<Option<Vec<Option<String>>>, String> {
+        let mut choices = Vec::new();
+        for conflict in conflicts {
+            println!("Conflict in {project}: {}", conflict.name);
+            println!("  1) This computer: {}", hidden_value(&conflict.local));
+            println!("  2) Cloud:         {}", hidden_value(&conflict.cloud));
+            println!("  3) Type a new value");
+            println!("  4) Show the values");
+            let choice = loop {
+                println!("Select 1, 2, 3 or 4:");
+                match read_answer()?.as_str() {
+                    "1" => break conflict.local.clone(),
+                    "2" => break conflict.cloud.clone(),
+                    "3" => {
+                        if let Some(value) = ask_new_value()? {
+                            break Some(value);
+                        }
+                    }
+                    "4" => {
+                        println!("  This computer: {}", clear_value(&conflict.local));
+                        println!("  Cloud:         {}", clear_value(&conflict.cloud));
+                    }
+                    _ => println!("Type 1, 2, 3 or 4."),
+                }
+            };
+            choices.push(choice);
+        }
+        Ok(Some(choices))
+    }
 }
 
 /// Asks the questions in the terminal. Passwords are not shown.
@@ -184,8 +476,8 @@ Your recovery code:
 }
 
 /// The provider from the options, or from a question when there is no option.
-fn choose_provider(flags: &[&str]) -> Result<&'static str, String> {
-    match (flags.contains(&"--github"), flags.contains(&"--google")) {
+fn choose_provider(flags: &cli::Flags) -> Result<&'static str, String> {
+    match (cli::has(flags, "--github"), cli::has(flags, "--google")) {
         (true, true) => Err("Choose one: --github or --google.".to_string()),
         (true, false) => Ok("github"),
         (false, true) => Ok("google"),
@@ -204,7 +496,7 @@ fn choose_provider(flags: &[&str]) -> Result<&'static str, String> {
     }
 }
 
-fn login(home: &Path, flags: &[&str]) -> Result<String, String> {
+fn login(home: &Path, flags: &cli::Flags) -> Result<String, String> {
     let provider = choose_provider(flags)?;
     account::login(home, &SystemStore::new(), provider, &mut TerminalPrompt)?;
     let email = state::load(home)?.email.unwrap_or_default();
@@ -376,7 +668,7 @@ fn show(project: &str, variables: &[(String, String)], reveal: bool) -> String {
 fn save_command(
     given: Option<&OsString>,
     directory: Option<&OsString>,
-    flags: &[&str],
+    flags: &cli::Flags,
 ) -> Result<String, String> {
     let (master_path, yaml) = read_master(&home_dir()?)?;
     let names = master::project_names(&yaml)?;
@@ -385,7 +677,7 @@ fn save_command(
         None => (current_folder_name()?, true),
     };
     let exists = names.contains(&project);
-    if !exists && !flags.contains(&"--new") {
+    if !exists && !cli::has(flags, "--new") {
         if let Some(close) = ui::suggest(&project, names.iter().map(String::as_str)) {
             return Err(format!(
                 "project '{project}' does not exist, but '{close}' does\n\nTo save into '{close}', run 'keyman save {close}'.\nTo create '{project}' as a new project, run 'keyman save {project} --new'."
@@ -412,7 +704,7 @@ fn save_command(
     } else {
         Vec::new()
     };
-    let plan = save::plan(&existing, &incoming, flags.contains(&"--replace"));
+    let plan = save::plan(&existing, &incoming, cli::has(flags, "--replace"));
     let env_shown = display_path(&fs::canonicalize(&env_path).unwrap_or(env_path));
     let master_shown = display_path(&master_path);
 
@@ -462,7 +754,7 @@ fn save_command(
     }
     lines.push(String::new());
 
-    if flags.contains(&"--dry-run") {
+    if cli::has(flags, "--dry-run") {
         lines.push(dim(
             "Dry run: nothing was saved. Run again without --dry-run to save.",
         ));

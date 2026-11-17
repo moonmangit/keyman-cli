@@ -21,7 +21,9 @@ pub struct Spec {
 pub const SHELLS: &[&str] = &["bash", "zsh", "fish", "powershell"];
 
 /// Commands that take a project name as their first argument.
-pub const PROJECT_COMMANDS: &[&str] = &["show", "inject", "save", "diff", "export", "run"];
+pub const PROJECT_COMMANDS: &[&str] = &[
+    "show", "inject", "save", "diff", "export", "run", "link", "unlink", "push", "pull",
+];
 
 const PROJECT: &str = "Project name in the master file. Default: the current folder name";
 
@@ -233,6 +235,75 @@ your recovery code do not change.",
         min: 0,
         max: 0,
     },
+    Spec {
+        name: "link",
+        group: "Cloud",
+        args: "[project] [--group <name>]",
+        arguments: &[("[project]", PROJECT)],
+        summary: "Connect a project to Keyman Cloud",
+        details: "Encrypts the project on this computer and sends it to Keyman Cloud. Keyman
+remembers the link on this computer. Use 'keyman push' and 'keyman pull' to sync.",
+        flags: &[("--group <name>", "Put the project in a shared group")],
+        min: 0,
+        max: 1,
+    },
+    Spec {
+        name: "unlink",
+        group: "Cloud",
+        args: "[project]",
+        arguments: &[("[project]", PROJECT)],
+        summary: "Remove the cloud link on this computer",
+        details: "Removes the link on this computer only. The project stays in the master file
+and in the cloud. This command does not use the network.",
+        flags: &[],
+        min: 0,
+        max: 1,
+    },
+    Spec {
+        name: "push",
+        group: "Cloud",
+        args: "[project]",
+        arguments: &[("[project]", "Project to send. Default: every linked project")],
+        summary: "Send local changes to the cloud",
+        details: "Sends the local changes of linked projects to the cloud. If the cloud has newer
+changes, Keyman stops. Run 'keyman pull' first.",
+        flags: &[],
+        min: 0,
+        max: 1,
+    },
+    Spec {
+        name: "pull",
+        group: "Cloud",
+        args: "[project] [--as <name>] [--keep-local] [--keep-cloud]",
+        arguments: &[("[project]", "Project to get. Default: every project in the cloud")],
+        summary: "Get changes from the cloud and merge them",
+        details: "Gets the projects from the cloud and merges them into the master file. If both
+sides changed the same variable, Keyman asks which value to keep.
+
+Use --as to give a new project a different local name.",
+        flags: &[
+            ("--as <name>", "Local name for a project that is new on this computer"),
+            ("--keep-local", "On a conflict, keep the value on this computer"),
+            ("--keep-cloud", "On a conflict, keep the value from the cloud"),
+        ],
+        min: 0,
+        max: 1,
+    },
+    Spec {
+        name: "cloud",
+        group: "Cloud",
+        args: "<action> [project]",
+        arguments: &[
+            ("<action>", "status or delete"),
+            ("[project]", "Project for delete. Default: the current folder name"),
+        ],
+        summary: "Cloud status and cloud delete",
+        details: "  keyman cloud status           Show each link. Works without the network.
+  keyman cloud delete <project>  Delete a project from the cloud for all members.",
+        flags: &[],
+        min: 1,
+        max: 2,
+    },
 ];
 
 pub fn find(name: &str) -> Result<&'static Spec, String> {
@@ -409,8 +480,30 @@ pub enum Parsed<'a> {
     Help,
     Args {
         positional: Vec<&'a OsString>,
-        flags: Vec<&'static str>,
+        flags: Flags<'a>,
     },
+}
+
+/// Options found by `parse`. A value option carries the argument after it.
+pub type Flags<'a> = Vec<(&'static str, Option<&'a OsString>)>;
+
+/// The option name without its value placeholder: `--group <name>` is `--group`.
+pub fn flag_name(spec: &'static str) -> &'static str {
+    spec.split(' ').next().unwrap_or(spec)
+}
+
+pub fn has(flags: &[(&'static str, Option<&OsString>)], name: &str) -> bool {
+    flags.iter().any(|(flag, _)| *flag == name)
+}
+
+pub fn value<'a>(
+    flags: &[(&'static str, Option<&'a OsString>)],
+    name: &str,
+) -> Option<&'a OsString> {
+    flags
+        .iter()
+        .find(|(flag, _)| *flag == name)
+        .and_then(|(_, value)| *value)
 }
 
 /// Parses the arguments after the command name. `--` ends option parsing.
@@ -418,7 +511,8 @@ pub fn parse<'a>(spec: &Spec, args: &'a [OsString]) -> Result<Parsed<'a>, String
     let mut positional = Vec::new();
     let mut flags = Vec::new();
     let mut options_ended = false;
-    for arg in args {
+    let mut remaining = args.iter();
+    while let Some(arg) = remaining.next() {
         if !options_ended {
             match arg.to_str() {
                 Some("-h" | "--help") => return Ok(Parsed::Help),
@@ -427,14 +521,32 @@ pub fn parse<'a>(spec: &Spec, args: &'a [OsString]) -> Result<Parsed<'a>, String
                     continue;
                 }
                 Some(option) if option.starts_with('-') && option.len() > 1 => {
-                    let known = spec.flags.iter().find(|(flag, _)| *flag == option);
+                    let known = spec
+                        .flags
+                        .iter()
+                        .find(|(flag, _)| flag_name(flag) == option);
                     match known {
-                        Some((flag, _)) => flags.push(*flag),
+                        Some((flag, _)) => {
+                            let name = flag_name(flag);
+                            if flag.len() > name.len() {
+                                let Some(next) = remaining.next() else {
+                                    return Err(format!("the option '{name}' needs a value"));
+                                };
+                                flags.push((name, Some(next)));
+                            } else {
+                                flags.push((name, None));
+                            }
+                        }
                         None => {
                             return Err(format!(
-                                "unknown option '{option}' for 'keyman {}'{}\n\nUsage: {}",
+                                "unknown option '{option}' for 'keyman {}'{}
+
+Usage: {}",
                                 spec.name,
-                                did_you_mean(option, spec.flags.iter().map(|(flag, _)| *flag)),
+                                did_you_mean(
+                                    option,
+                                    spec.flags.iter().map(|(flag, _)| flag_name(flag))
+                                ),
                                 usage(spec)
                             ))
                         }
@@ -490,7 +602,7 @@ mod tests {
             panic!("expected arguments");
         };
         assert_eq!(positional, [&input[0]]);
-        assert_eq!(flags, ["--reveal"]);
+        assert_eq!(flags, [("--reveal", None)]);
         assert!(matches!(parse(show, &args(&["-h"])), Ok(Parsed::Help)));
         assert!(parse(show, &args(&["--revel"]))
             .unwrap_err()
@@ -535,10 +647,41 @@ mod tests {
             panic!("expected arguments");
         };
         assert!(positional.is_empty());
-        assert_eq!(flags, ["--github"]);
+        assert_eq!(flags, [("--github", None)]);
         assert!(parse(login, &args(&["--google"])).is_ok());
         assert!(parse(login, &args(&["--gitlab"])).is_err());
         assert!(parse(login, &args(&["extra"])).is_err());
+    }
+
+    #[test]
+    fn value_flag_takes_next_argument() {
+        let link = find("link").unwrap();
+        let input = args(&["app", "--group", "team"]);
+        let Parsed::Args { positional, flags } = parse(link, &input).unwrap() else {
+            panic!("expected arguments");
+        };
+        assert_eq!(positional, [&input[0]]);
+        assert_eq!(flags, [("--group", Some(&input[2]))]);
+        assert_eq!(value(&flags, "--group"), Some(&input[2]));
+        assert!(has(&flags, "--group"));
+        assert_eq!(value(&flags, "--other"), None);
+        let pull = find("pull").unwrap();
+        let input = args(&["--as", "x", "--keep-local"]);
+        let Parsed::Args { positional, flags } = parse(pull, &input).unwrap() else {
+            panic!("expected arguments");
+        };
+        assert!(positional.is_empty());
+        assert!(has(&flags, "--keep-local"));
+        assert_eq!(value(&flags, "--as"), Some(&input[1]));
+    }
+
+    #[test]
+    fn value_flag_without_value_is_error() {
+        let link = find("link").unwrap();
+        assert_eq!(
+            parse(link, &args(&["app", "--group"])).unwrap_err(),
+            "the option '--group' needs a value"
+        );
     }
 
     #[test]
