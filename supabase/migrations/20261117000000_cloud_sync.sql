@@ -1,6 +1,6 @@
 create table public.profiles (
   user_id uuid primary key references auth.users on delete cascade,
-  email text not null unique,
+  email text not null unique check (email = lower(email) and email <> ''),
   public_key text not null,
   kdf_salt text not null,
   kdf_params jsonb not null,
@@ -31,7 +31,7 @@ create table public.vault_members (
 create table public.invites (
   id uuid primary key default gen_random_uuid(),
   vault_id uuid not null references public.vaults on delete cascade,
-  email text not null,
+  email text not null check (email = lower(email) and email <> ''),
   invited_by uuid not null references auth.users on delete cascade,
   created_at timestamptz not null default now(),
   unique (vault_id, email)
@@ -68,6 +68,18 @@ language sql stable security definer set search_path = '' as $$
   select exists (select 1 from public.vaults where id = v and owner_id = auth.uid() and kind = 'group')
 $$;
 
+-- the caller's email as proven by the identity provider (never the JWT claim)
+create function public.my_verified_email() returns text
+language sql stable security definer set search_path = '' as $$
+  select lower(email::text) from auth.users where id = auth.uid() and email_confirmed_at is not null
+$$;
+
+-- the caller's own full profile row (the wrapped private keys are not readable through the table)
+create function public.my_profile() returns public.profiles
+language sql stable security definer set search_path = '' as $$
+  select * from public.profiles where user_id = auth.uid()
+$$;
+
 create function public.vault_generation(v uuid) returns int
 language sql stable security definer set search_path = '' as $$
   select key_generation from public.vaults where id = v
@@ -80,10 +92,10 @@ create policy profiles_select on public.profiles for select to authenticated usi
   or email in (select i.email from public.invites i where i.vault_id in (select public.my_vault_ids()))
 );
 create policy profiles_insert on public.profiles for insert to authenticated
-  with check (user_id = auth.uid() and email = (auth.jwt() ->> 'email'));
+  with check (user_id = auth.uid() and email = public.my_verified_email());
 create policy profiles_update on public.profiles for update to authenticated
   using (user_id = auth.uid())
-  with check (user_id = auth.uid() and email = (auth.jwt() ->> 'email'));
+  with check (user_id = auth.uid() and email = public.my_verified_email());
 
 -- vaults
 create policy vaults_select on public.vaults for select to authenticated
@@ -97,7 +109,7 @@ create policy members_select on public.vault_members for select to authenticated
 
 -- invites
 create policy invites_select on public.invites for select to authenticated using (
-  vault_id in (select public.my_vault_ids()) or email = (auth.jwt() ->> 'email')
+  vault_id in (select public.my_vault_ids()) or email = public.my_verified_email()
 );
 create policy invites_insert on public.invites for insert to authenticated
   with check (public.is_group_owner(vault_id) and invited_by = auth.uid());
@@ -123,18 +135,32 @@ create policy projects_update on public.projects for update to authenticated
 create policy projects_delete on public.projects for delete to authenticated
   using (vault_id in (select public.my_vault_ids()));
 
-create function public.projects_bump() returns trigger
-language plpgsql set search_path = '' as $$
+-- Runs for every client and rotate write. security definer so that it can lock the vault row.
+-- `for share` waits for a concurrent rotate_vault and then reads the committed generation, so a
+-- push cannot land on a stale generation and a removed member cannot write after removal.
+create function public.projects_guard() returns trigger
+language plpgsql security definer set search_path = '' as $$
+declare gen int;
 begin
-  if new.vault_id <> old.vault_id or new.id <> old.id then
+  if tg_op = 'UPDATE' and (new.vault_id <> old.vault_id or new.id <> old.id) then
     raise exception 'a project cannot move to a different vault';
   end if;
-  new.version := old.version + 1;
+  select key_generation into gen from public.vaults where id = new.vault_id for share;
+  if not found or not exists (
+    select 1 from public.vault_members where vault_id = new.vault_id and user_id = auth.uid()
+  ) then
+    raise exception 'not a member of this vault';
+  end if;
+  if new.key_generation <> gen then
+    raise exception 'the key generation is out of date';
+  end if;
+  new.updated_by := auth.uid();
   new.updated_at := now();
+  if tg_op = 'UPDATE' then new.version := old.version + 1; else new.version := 1; end if;
   return new;
 end $$;
-create trigger projects_bump before update on public.projects
-  for each row execute function public.projects_bump();
+create trigger projects_guard before insert or update on public.projects
+  for each row execute function public.projects_guard();
 
 create function public.create_vault(p_kind text, p_name_sealed text, p_wrapped_key text) returns uuid
 language plpgsql security definer set search_path = '' as $$
@@ -147,7 +173,7 @@ begin
   return v;
 end $$;
 
-create function public.accept_invite(p_invite uuid, p_user uuid, p_wrapped_key text) returns void
+create function public.accept_invite(p_invite uuid, p_user uuid, p_wrapped_key text, p_generation int) returns void
 language plpgsql security definer set search_path = '' as $$
 declare inv public.invites; gen int;
 begin
@@ -163,17 +189,21 @@ begin
     raise exception 'the user does not match the invite email';
   end if;
   select key_generation into gen from public.vaults where id = inv.vault_id for update;
+  if p_generation <> gen then raise exception 'the group key changed; run the command again'; end if;
+  if not exists (select 1 from public.vault_members where vault_id = inv.vault_id and user_id = auth.uid()) then
+    raise exception 'only a member can accept an invite';
+  end if;
   insert into public.vault_members (vault_id, user_id, role, wrapped_key, key_generation)
     values (inv.vault_id, p_user, 'member', p_wrapped_key, gen);
   delete from public.invites where id = p_invite;
 end $$;
 
-create function public.rotate_vault(p_vault uuid, p_remove uuid, p_keys jsonb, p_projects jsonb) returns int
+create function public.rotate_vault(p_vault uuid, p_remove uuid, p_keys jsonb, p_projects jsonb, p_name_sealed text) returns int
 language plpgsql security definer set search_path = '' as $$
 declare gen int; owner uuid; k jsonb; p jsonb; changed int;
 begin
   select owner_id, key_generation into owner, gen from public.vaults where id = p_vault for update;
-  if not found or owner <> auth.uid() then raise exception 'only the owner can remove a member'; end if;
+  if not found or owner is distinct from auth.uid() then raise exception 'only the owner can remove a member'; end if;
   if p_remove = owner then raise exception 'the owner cannot be removed'; end if;
   delete from public.vault_members where vault_id = p_vault and user_id = p_remove;
   if not found then raise exception 'the user is not a member'; end if;
@@ -192,13 +222,16 @@ begin
   if (select count(*) from public.projects where vault_id = p_vault) <> jsonb_array_length(p_projects) then
     raise exception 'all projects of the vault must be encrypted again';
   end if;
-  update public.vaults set key_generation = gen where id = p_vault;
+  update public.vaults set key_generation = gen, name_sealed = p_name_sealed where id = p_vault;
   for p in select * from jsonb_array_elements(p_projects) loop
     update public.projects set sealed = p->>'sealed', key_generation = gen, updated_by = auth.uid()
       where id = (p->>'id')::uuid and vault_id = p_vault and version = (p->>'version')::int;
     get diagnostics changed = row_count;
     if changed <> 1 then raise exception 'a project changed during the removal; try again'; end if;
   end loop;
+  if exists (select 1 from public.projects where vault_id = p_vault and key_generation <> gen) then
+    raise exception 'all projects of the vault must be encrypted again';
+  end if;
   return gen;
 end $$;
 
@@ -206,11 +239,12 @@ end $$;
 revoke execute on function
   public.create_vault, public.accept_invite, public.rotate_vault,
   public.my_vault_ids, public.is_vault_owner, public.is_group_owner, public.vault_generation,
-  public.projects_bump
+  public.my_verified_email, public.my_profile, public.projects_guard
   from anon, public;
 grant execute on function
   public.create_vault, public.accept_invite, public.rotate_vault,
-  public.my_vault_ids, public.is_vault_owner, public.is_group_owner, public.vault_generation
+  public.my_vault_ids, public.is_vault_owner, public.is_group_owner, public.vault_generation,
+  public.my_verified_email, public.my_profile
   to authenticated;
 
 -- table privileges: vaults and vault_members change only through the functions above,
@@ -221,3 +255,8 @@ revoke delete on public.vault_members from authenticated;
 revoke truncate, references, trigger on
   public.profiles, public.vaults, public.vault_members, public.invites, public.projects
   from authenticated;
+
+-- profiles: other members and invitees may read only the public columns; the wrapped private
+-- keys and KDF settings are readable only through my_profile()
+revoke select on public.profiles from authenticated;
+grant select (user_id, email, public_key) on public.profiles to authenticated;

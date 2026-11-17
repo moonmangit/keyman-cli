@@ -165,7 +165,7 @@ site_url = "http://127.0.0.1:3000"
 # The public URL that Auth serves on. Defaults to the API external URL with `/auth/v1` appended.
 # external_url = ""
 # A list of *exact* URLs that auth providers are permitted to redirect to post authentication.
-additional_redirect_urls = ["http://127.0.0.1:*/callback"]
+additional_redirect_urls = ["http://127.0.0.1:47821/callback", "http://127.0.0.1:47822/callback", "http://127.0.0.1:47823/callback", "http://127.0.0.1:47824/callback", "http://127.0.0.1:47825/callback"]
 # How long tokens are valid for, in seconds. Defaults to 3600 (1 hour), maximum 604,800 (1 week).
 jwt_expiry = 3600
 # JWT issuer URL. If not set, defaults to auth.external_url.
@@ -222,9 +222,8 @@ web3 = 30
 # secret = ""
 
 [auth.email]
-# Allow/disallow the email provider. When false, users can't sign up or sign in with email.
-# To block new signups only, set enable_signup = false under [auth] instead.
-enabled = true
+# Email/password sign-in is disabled: the product uses GitHub/Google only, so an email is never unproven.
+enabled = false
 # If enabled, a user will be required to confirm any email change on both the old, and new email
 # addresses. If disabled, only the new email is required to confirm.
 double_confirm_changes = true
@@ -354,7 +353,6 @@ secret = "env(SUPABASE_AUTH_EXTERNAL_GITHUB_SECRET)"
 enabled = true
 client_id = "env(SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID)"
 secret = "env(SUPABASE_AUTH_EXTERNAL_GOOGLE_SECRET)"
-skip_nonce_check = true
 
 # Allow Solana wallet holders to sign in to your project via the Sign in with Solana (SIWS) standard.
 # You can configure "web3" rate limit in the [auth.rate_limit] section and set up [auth.captcha] if self-hosting.
