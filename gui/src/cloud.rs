@@ -11,15 +11,16 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use keyman_cli::cloud::account::{self, Prompt};
+use keyman_cli::cloud::groups;
 use keyman_cli::cloud::keystore::{self, Store, SystemStore};
 use keyman_cli::cloud::merge::Conflict;
-use keyman_cli::cloud::sync::Resolver as CloudResolver;
+use keyman_cli::cloud::sync::{self, Resolver as CloudResolver, Vaults};
 use rune::{AppHandle, TextEdit};
 use zeroize::Zeroizing;
 
-use crate::App;
 use crate::cloud_views;
 use crate::i18n::t;
+use crate::{App, Dialog, LinkPicker};
 
 /// What a bridge question gives the library when the person cancels it.
 pub const CANCELLED: &str = "cancelled";
@@ -356,7 +357,6 @@ pub enum Done {
     #[expect(dead_code, reason = "the Sync action (a later step) makes it")]
     SyncFinished(SyncSummary),
     /// The person's groups, `(vault id, name)`, for the link picker.
-    #[expect(dead_code, reason = "the link picker (a later step) makes it")]
     Groups(Vec<(String, String)>),
 }
 
@@ -471,6 +471,18 @@ fn finish(s: &mut App, cloud: Option<CloudState>, result: Result<Done, String>) 
     if let Some(cloud) = cloud {
         s.cloud = cloud;
     }
+    // The picker waits for its groups: when they did not come, it has nothing to show.
+    let loaded = matches!(result, Ok(Done::Groups(_)));
+    if !loaded
+        && s.link_picker
+            .as_ref()
+            .is_some_and(|picker| picker.groups.is_none())
+    {
+        s.link_picker = None;
+        if s.dialog == Some(Dialog::LinkPicker) {
+            s.dialog = None;
+        }
+    }
     s.reload();
     match result {
         Ok(done) => apply(s, done),
@@ -518,8 +530,12 @@ fn apply(s: &mut App, done: Done) {
             summary.added.len(),
             summary.sent
         )),
-        // The link picker shows them (a later step).
-        Done::Groups(_) => {}
+        // The link picker was open while they loaded.
+        Done::Groups(groups) => {
+            if let Some(picker) = &mut s.link_picker {
+                picker.groups = Some(groups);
+            }
+        }
     }
 }
 
@@ -592,6 +608,94 @@ impl App {
                 Ok(Done::SignedOut)
             },
         );
+    }
+
+    /// **Link to cloud**: opens the picker and loads the person's groups (a cloud task).
+    pub fn open_link_picker(&mut self, project: &str) {
+        if !can_start(&self.busy) {
+            return;
+        }
+        self.project_menu = None;
+        self.link_picker = Some(LinkPicker {
+            project: project.to_owned(),
+            groups: None,
+            choice: None,
+        });
+        self.dialog = Some(Dialog::LinkPicker);
+        let label = t("Loading groups…", "กำลังโหลดกลุ่ม…");
+        if !start(self, label, |bridge, home| {
+            let u = account::session(home, &SystemStore::new(), bridge)?;
+            let vaults = Vaults::load(&u)?;
+            Ok(Done::Groups(groups::group_names(&vaults)))
+        }) {
+            self.link_picker = None;
+            self.dialog = None;
+        }
+    }
+
+    /// Links `project` to the personal vault (`None`) or to the group with this name.
+    pub fn cloud_link(&mut self, project: &str, group: Option<String>) {
+        self.close_dialog();
+        let project = project.to_owned();
+        let label = t("Linking to the cloud…", "กำลังเชื่อมกับคลาวด์…");
+        start(self, label, move |bridge, home| {
+            let u = account::session(home, &SystemStore::new(), bridge)?;
+            sync::link(home, &u, &project, group.as_deref())?;
+            Ok(Done::Toast(tf!(
+                "Keyman linked {} to the cloud.",
+                "Keyman เชื่อม {} กับคลาวด์แล้ว",
+                project
+            )))
+        });
+    }
+
+    /// Removes the cloud link on this computer. The cloud copy stays. Local, so no task and no
+    /// session, but not while a cloud task runs: both write the same state file.
+    pub fn cloud_unlink(&mut self, project: &str) {
+        self.project_menu = None;
+        if !cloud_views::can_unlink(&self.busy) {
+            return;
+        }
+        let result = self.home().and_then(|home| sync::unlink(&home, project));
+        self.refresh_link_status();
+        match result {
+            Ok(()) => self.ok(tf!(
+                "Keyman removed the cloud link of {} on this computer.",
+                "Keyman ลบการเชื่อมคลาวด์ของ {} บนเครื่องนี้แล้ว",
+                project
+            )),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    /// Asks for the project name before **Delete from cloud**.
+    pub fn ask_cloud_delete(&mut self, project: &str) {
+        self.project_menu = None;
+        self.delete_typed.replace_text("");
+        self.delete_confirm = Some(project.to_owned());
+        self.dialog = Some(Dialog::ConfirmDelete);
+    }
+
+    /// Deletes `project` from the cloud for all members. It runs only after the typed name
+    /// equals the project name.
+    pub fn cloud_delete(&mut self, project: &str) {
+        let confirmed = self.delete_confirm.as_deref() == Some(project)
+            && cloud_views::delete_confirmed(&self.delete_typed.text, project);
+        if !confirmed || !can_start(&self.busy) {
+            return;
+        }
+        self.close_dialog();
+        let project = project.to_owned();
+        let label = t("Deleting from the cloud…", "กำลังลบออกจากคลาวด์…");
+        start(self, label, move |bridge, home| {
+            let u = account::session(home, &SystemStore::new(), bridge)?;
+            sync::delete_cloud(home, &u, &project)?;
+            Ok(Done::Toast(tf!(
+                "Keyman deleted {} from the cloud.",
+                "Keyman ลบ {} ออกจากคลาวด์แล้ว",
+                project
+            )))
+        });
     }
 
     /// Stops the running cloud task; an open question gets `Cancel`.
@@ -1078,5 +1182,25 @@ mod tests {
             waiting.join().unwrap(),
             Reply::Text("abcd-efgh jkmn pqrs".into())
         );
+    }
+
+    #[test]
+    fn delete_waits_for_the_exact_name() {
+        let mut app = App::for_tests();
+        app.ask_cloud_delete("my-app");
+        assert_eq!(app.dialog, Some(Dialog::ConfirmDelete));
+        app.delete_typed.replace_text("My-App");
+        app.cloud_delete("my-app");
+        // No match: the dialog stays and no task starts.
+        assert_eq!(app.dialog, Some(Dialog::ConfirmDelete));
+        assert!(app.busy.is_none() && app.toast.is_none());
+    }
+
+    #[test]
+    fn unlink_does_nothing_while_busy() {
+        let mut app = App::for_tests();
+        app.busy = Some(Busy::new("Syncing…"));
+        app.cloud_unlink("my-app");
+        assert!(app.toast.is_none());
     }
 }

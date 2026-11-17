@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use keyman_cli::cloud::sync::{self, LinkStatus};
 use keyman_cli::envfile::Change;
 use keyman_cli::ui::display_path;
 use rune::prefs::Prefs;
@@ -62,6 +63,10 @@ pub enum Dialog {
     ConfirmOverwrite,
     ConfirmWriteAll,
     ConfirmSignOut,
+    /// Where to keep a project in the cloud (`App::link_picker`).
+    LinkPicker,
+    /// Type the project name to delete it from the cloud (`App::delete_confirm`).
+    ConfirmDelete,
     Resolve,
     /// The compare or save-to-master preview in `App::panel`.
     Panel,
@@ -111,6 +116,15 @@ pub struct FolderMenu {
     pub at: MenuAt,
 }
 
+/// The link picker: where to keep one project in the cloud.
+pub struct LinkPicker {
+    pub project: String,
+    /// The person's groups, `(vault id, name)`. `None` while they load.
+    pub groups: Option<Vec<(String, String)>>,
+    /// The chosen group's name. `None` is the personal vault.
+    pub choice: Option<String>,
+}
+
 pub struct Toast {
     pub id: u64,
     pub ok: bool,
@@ -149,6 +163,14 @@ pub struct App {
     pub recover_pick: bool,
     /// This computer has a credential store (read once at start).
     pub cloud_store: bool,
+    /// Each linked project and how it compares with its last sync. Local data only.
+    pub link_status: Vec<(String, LinkStatus)>,
+    pub link_picker: Option<LinkPicker>,
+    /// The project whose cloud delete waits for its typed name.
+    pub delete_confirm: Option<String>,
+    pub delete_typed: TextEdit,
+    /// The project page's ⋯ menu.
+    pub project_menu: Option<MenuAt>,
 }
 
 impl App {
@@ -206,6 +228,11 @@ impl App {
             cloud_fields: cloud::Fields::default(),
             recover_pick: false,
             cloud_store: true,
+            link_status: Vec::new(),
+            link_picker: None,
+            delete_confirm: None,
+            delete_typed: TextEdit::new(""),
+            project_menu: None,
         }
     }
 
@@ -229,6 +256,25 @@ impl App {
         {
             self.select(names.into_iter().next());
         }
+        self.refresh_link_status();
+    }
+
+    /// Reads which projects are linked to the cloud, and whether each has local changes.
+    /// Local data only: no network.
+    pub fn refresh_link_status(&mut self) {
+        self.link_status = self
+            .home()
+            .and_then(|home| sync::local_status(&home))
+            .unwrap_or_default();
+    }
+
+    /// How `project` compares with the cloud copy, or `None` when it is not linked.
+    pub fn link_of(&self, project: &str) -> Option<&LinkStatus> {
+        self.link_status
+            .iter()
+            .find(|(name, _)| name == project)
+            .map(|(_, status)| status)
+            .filter(|status| **status != LinkStatus::Missing)
     }
 
     /// Reload, then say whether the master file is valid.
@@ -267,6 +313,7 @@ impl App {
             self.selected = name;
             self.panel = Panel::None;
             self.menu = None;
+            self.project_menu = None;
             if self.settings.rehide_on_switch {
                 self.revealed.clear();
                 self.reveal_all = false;
@@ -358,6 +405,17 @@ impl App {
     pub fn close_dialog(&mut self) {
         self.dialog = None;
         self.panel = Panel::None;
+        // A group list that still loads stops with its picker.
+        if self
+            .link_picker
+            .as_ref()
+            .is_some_and(|picker| picker.groups.is_none())
+        {
+            self.cloud_cancel();
+        }
+        self.link_picker = None;
+        self.delete_confirm = None;
+        self.delete_typed.replace_text("");
         // The Account page opens on its sign-in buttons next time.
         self.recover_pick = false;
     }
@@ -830,6 +888,10 @@ fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.cloud_cancel();
         return true;
     }
+    if ev.key == Key::Escape && s.project_menu.is_some() {
+        s.project_menu = None;
+        return true;
+    }
     if ev.key == Key::Escape && s.menu.is_some() {
         s.menu = None;
         return true;
@@ -898,6 +960,44 @@ fn cloud_question(s: &mut App, ask: Ask) {
     cloud_signed_out(s);
     s.busy = Some(Busy::new(cloud::signing_in_label()));
     s.question = Some(Question::unanswered(ask));
+}
+
+/// A signed-in app whose selected project is linked (`status`), and the next project has
+/// the other state, so the sidebar shows both marks.
+fn cloud_project(s: &mut App, status: Option<LinkStatus>) {
+    s.cloud = CloudState::SignedIn {
+        email: "dana@example.com".into(),
+    };
+    s.link_status.clear();
+    let names: Vec<String> = match &s.master {
+        Ok(master) => master.projects.iter().map(|p| p.name.clone()).collect(),
+        Err(_) => Vec::new(),
+    };
+    if let (Some(status), Some(name)) = (status, s.selected.clone()) {
+        s.link_status.push((name, status));
+    }
+    // Another project in the other state, for the sidebar marks.
+    if let Some(other) = names.iter().find(|n| Some(*n) != s.selected.as_ref()) {
+        let status = match s.selected.as_ref().and_then(|n| s.link_of(n)) {
+            Some(LinkStatus::Synced) => LinkStatus::LocalChanges,
+            _ => LinkStatus::Synced,
+        };
+        s.link_status.push((other.clone(), status));
+    }
+}
+
+/// The link picker, with its groups loaded.
+fn link_picker(s: &mut App) {
+    cloud_project(s, None);
+    s.link_picker = Some(LinkPicker {
+        project: s.selected.clone().unwrap_or_default(),
+        groups: Some(vec![
+            ("v1".into(), "Backend team".into()),
+            ("v2".into(), "Design".into()),
+        ]),
+        choice: Some("Backend team".into()),
+    });
+    s.dialog = Some(Dialog::LinkPicker);
 }
 
 fn main() {
@@ -1020,6 +1120,39 @@ fn main() {
                 english(s);
                 cloud_question(s, Ask::Password { tries_left: 2 });
                 s.show_toast(false, "The vault password is not correct.".into());
+            }),
+            ("cloud-project-linked", |s| {
+                english(s);
+                cloud_project(s, Some(LinkStatus::Synced));
+                s.project_menu = Some(MenuAt::Point(960.0, 118.0));
+            }),
+            ("cloud-project-unlinked", |s| {
+                english(s);
+                cloud_project(s, None);
+            }),
+            ("cloud-link-picker", |s| {
+                english(s);
+                link_picker(s);
+            }),
+            ("cloud-link-loading", |s| {
+                english(s);
+                link_picker(s);
+                if let Some(picker) = &mut s.link_picker {
+                    picker.groups = None;
+                }
+                s.busy = Some(Busy::new("Loading groups…"));
+            }),
+            ("cloud-delete-confirm", |s| {
+                english(s);
+                cloud_project(s, Some(LinkStatus::Synced));
+                let name = s.selected.clone().unwrap_or_default();
+                s.delete_typed.replace_text(&name);
+                s.delete_confirm = Some(name);
+                s.dialog = Some(Dialog::ConfirmDelete);
+            }),
+            ("th-cloud-link-picker", |s| {
+                thai(s);
+                link_picker(s);
             }),
             ("th-cloud-signed-out", |s| {
                 thai(s);

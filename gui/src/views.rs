@@ -83,18 +83,26 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     if let Some(toast) = &s.toast {
         root = root.child(toast_view(p, toast));
     }
-    if let Some(menu) = &s.menu {
-        // Last frame's layout: the window's size, and the ⋯ button the panel drops from.
+    // Last frame's layout: the window's size, and the ⋯ button a panel drops from.
+    let drop_at = |cx: &Cx<App>, at: &MenuAt, width: f32| {
         let window = cx.layout("root").map_or((1100.0, 740.0), |r| (r[2], r[3]));
-        let at = match &menu.at {
+        let at = match at {
             MenuAt::Point(x, y) => (*x, *y),
             MenuAt::Below(key) => cx
                 .layout(key)
                 .map_or((window.0 / 2.0, window.1 / 3.0), |r| {
-                    (r[0] + r[2] - crate::menu::MENU_W, r[1] + r[3] + 4.0)
+                    (r[0] + r[2] - width, r[1] + r[3] + 4.0)
                 }),
         };
+        (at, window)
+    };
+    if let Some(menu) = &s.menu {
+        let (at, window) = drop_at(cx, &menu.at, crate::menu::MENU_W);
         root = root.child(crate::menu::folder_menu(s, p, at, window));
+    }
+    if let (Some(at), Some(name)) = (&s.project_menu, &s.selected) {
+        let (at, window) = drop_at(cx, at, crate::menu::PROJECT_MENU_W);
+        root = root.child(crate::menu::project_menu(s, p, name, at, window));
     }
     root
 }
@@ -297,6 +305,7 @@ fn sidebar(s: &App, p: Paint) -> El {
                         .min_w(0.0)
                         .a11y_hidden(),
                 )
+                .children(cloud_views::sidebar_mark(p, s.link_of(&project.name)))
                 .child(
                     text(detail)
                         .font(MONO_SMALL)
@@ -624,8 +633,30 @@ fn project_page(s: &App, p: Paint, name: &str) -> El {
     };
 
     let export = core::export_lines(&vars);
-    let actions = row()
-        .gap(8.0)
+    let linked = s.link_of(name);
+    let idle = crate::cloud::can_start(&s.busy);
+    let signed_in = matches!(s.cloud, crate::cloud::CloudState::SignedIn { .. });
+    let link_name = name.to_owned();
+    let mut actions = row().gap(8.0);
+    if linked.is_none() {
+        actions = actions.child(button(
+            p,
+            "link-cloud",
+            t("Link to cloud", "เชื่อมกับคลาวด์"),
+            Some(&ic::CLOUD_UP),
+            Kind::Secondary,
+            idle,
+            move |s, _| {
+                if signed_in {
+                    s.open_link_picker(&link_name);
+                } else {
+                    // Signing in comes first: the Account page has the buttons.
+                    s.dialog = Some(Dialog::Settings(SettingsPage::Account));
+                }
+            },
+        ));
+    }
+    let actions = actions
         .child(button(
             p,
             "reveal-all",
@@ -658,6 +689,15 @@ fn project_page(s: &App, p: Paint, name: &str) -> El {
                     secs
                 ));
             },
+        ))
+        .child(icon_button(
+            p,
+            "project-more",
+            &ic::MORE,
+            t("More actions", "การทำงานเพิ่มเติม"),
+            |s, _| {
+                s.project_menu = Some(MenuAt::Below("project-more".into()));
+            },
         ));
 
     // Variables and folders side by side; both columns grow with the window.
@@ -682,7 +722,11 @@ fn project_page(s: &App, p: Paint, name: &str) -> El {
     page.child(page_header(
         p,
         name,
-        badge(p, t("Valid", "ถูกต้อง"), p.green),
+        row()
+            .gap(10.0)
+            .center_y()
+            .child(badge(p, t("Valid", "ถูกต้อง"), p.green))
+            .child(cloud_views::status_line(p, linked)),
         format!(
             "{}{folder_note}",
             count(vars.len(), "variable", "variables", "ตัวแปร")
@@ -1292,6 +1336,8 @@ fn dialog_view(s: &App, p: Paint, dialog: Dialog) -> El {
         Dialog::ConfirmOverwrite => confirm_dialog(s, p),
         Dialog::ConfirmWriteAll => confirm_all_dialog(s, p),
         Dialog::ConfirmSignOut => cloud_views::confirm_sign_out(p),
+        Dialog::LinkPicker => cloud_views::link_picker_dialog(s, p),
+        Dialog::ConfirmDelete => cloud_views::delete_dialog(s, p),
         Dialog::Resolve => crate::resolve::resolve_dialog(s, p),
         Dialog::Panel => panel_dialog(s, p),
     };

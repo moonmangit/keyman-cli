@@ -3,6 +3,7 @@
 
 use std::sync::atomic::Ordering;
 
+use keyman_cli::cloud::sync::LinkStatus;
 use rune::{Color, El, TextEdit, TextStyle, Tx, col, el, icon, row, text, text_input};
 use zeroize::Zeroizing;
 
@@ -628,6 +629,285 @@ pub fn confirm_sign_out(p: Paint) -> El {
         )
 }
 
+// ── Project cloud state ─────────────────────────────────────────────────────
+
+/// The header status line for a project: `(English, Thai)`. `None` is a project that is not in
+/// the cloud. (`Missing` does not occur for a project that shows.)
+pub fn status_label(status: Option<&LinkStatus>) -> (&'static str, &'static str) {
+    match status {
+        Some(LinkStatus::Synced) => ("Synced", "ซิงก์แล้ว"),
+        Some(LinkStatus::LocalChanges) => ("Changes on this computer", "มีการเปลี่ยนแปลงในเครื่องนี้"),
+        // `Missing` is a linked name that is not in the master file: no page shows it.
+        Some(LinkStatus::Missing) | None => ("Not in the cloud", "ไม่ได้อยู่ในคลาวด์"),
+    }
+}
+
+/// Unlink is local, but it writes the same state file as a cloud task: not while one runs.
+pub fn can_unlink(busy: &Option<Busy>) -> bool {
+    cloud::can_start(busy)
+}
+
+/// The typed name must be the project name: spaces at the ends do not count, the case does.
+pub fn delete_confirmed(typed: &str, project: &str) -> bool {
+    !project.is_empty() && typed.trim() == project
+}
+
+/// The cloud mark after a linked project's name in the sidebar: a cloud with a check (synced) or
+/// a dot (changes on this computer). `None` for a project that is not linked.
+pub fn sidebar_mark(p: Paint, status: Option<&LinkStatus>) -> Option<El> {
+    let (glyph, tint) = match status? {
+        LinkStatus::Synced => (&ic::CLOUD_CHECK, p.green),
+        LinkStatus::LocalChanges => (&ic::CLOUD_DOT, p.yellow),
+        LinkStatus::Missing => return None,
+    };
+    Some(icon(glyph, 15.0).color(tint).a11y_hidden())
+}
+
+/// The cloud status line in the project header: an icon and the state in words.
+pub fn status_line(p: Paint, status: Option<&LinkStatus>) -> El {
+    let (glyph, tint) = match status {
+        Some(LinkStatus::Synced) => (&ic::CLOUD_CHECK, p.green),
+        Some(LinkStatus::LocalChanges) => (&ic::CLOUD_DOT, p.yellow),
+        Some(LinkStatus::Missing) | None => (&ic::CLOUD, p.muted),
+    };
+    let (en, th) = status_label(status);
+    row()
+        .key("cloud-status")
+        .gap(6.0)
+        .center_y()
+        .child(icon(glyph, 15.0).color(tint).a11y_hidden())
+        .child(
+            text(t(en, th).to_owned())
+                .font(SMALL)
+                .color(tint)
+                .role("status"),
+        )
+}
+
+/// A dialog card with its icon and title, like the sign-out confirm.
+fn sheet(p: Paint, key: &str, title: &str, glyph: &'static rune::Icon, tint: Color) -> El {
+    col()
+        .key(key)
+        .role("dialog")
+        .label(title)
+        .w(440.0)
+        .padding(22.0)
+        .gap(14.0)
+        .radius(14.0)
+        .fill(p.bg)
+        .border(1.0, p.border)
+        .shadow(20.0, 60.0, Color::BLACK.alpha(0.4))
+        .child(icon_tile(glyph, 40.0, tint, p.dark))
+        .child(text(title.to_owned()).font(H2).color(p.text).wrap())
+}
+
+/// One choice of the link picker: a radio row with the place's name.
+fn place(p: Paint, key: String, name: &str, hint: &str, chosen: bool, group: Option<String>) -> El {
+    row()
+        .key(key)
+        .role("radio")
+        .label(name)
+        .checked(chosen)
+        .focusable(true)
+        .w_full()
+        .h(44.0)
+        .px(12.0)
+        .gap(10.0)
+        .center_y()
+        .radius(8.0)
+        .fill(if chosen {
+            p.accent.alpha(if p.dark { 0.2 } else { 0.1 })
+        } else {
+            Color::TRANSPARENT
+        })
+        .border(1.0, if chosen { p.accent } else { p.border })
+        .hover(p.hover)
+        .press(p.press)
+        .on_press(move |s: &mut App| {
+            if let Some(picker) = &mut s.link_picker {
+                picker.choice = group.clone();
+            }
+        })
+        .child(
+            icon(
+                if chosen {
+                    &ic::CHECK_CIRCLE
+                } else {
+                    &ic::CLOUD
+                },
+                17.0,
+            )
+            .color(if chosen { p.accent } else { p.muted })
+            .a11y_hidden(),
+        )
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .child(
+                    text(name.to_owned())
+                        .font(BODY_STRONG)
+                        .color(p.text)
+                        .truncate()
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(hint.to_owned())
+                        .font(SMALL)
+                        .color(p.faint)
+                        .truncate()
+                        .a11y_hidden(),
+                ),
+        )
+}
+
+/// **Link to cloud**: where to keep the project. The groups load first (a cloud task).
+pub fn link_picker_dialog(s: &App, p: Paint) -> El {
+    let Some(picker) = &s.link_picker else {
+        return el();
+    };
+    let project = picker.project.clone();
+    let title = tf!(
+        "Where do you want to keep {}?",
+        "คุณต้องการเก็บ {} ไว้ที่ไหน",
+        project
+    );
+    let mut options = col().key("places").w_full().gap(8.0);
+    match &picker.groups {
+        None => {
+            options = options.child(
+                row().key("loading-groups").w_full().h(44.0).center().child(
+                    text(t("Loading groups…", "กำลังโหลดกลุ่ม…"))
+                        .font(BODY)
+                        .color(p.muted)
+                        .role("status"),
+                ),
+            );
+        }
+        Some(groups) => {
+            options = options.child(place(
+                p,
+                "place-personal".into(),
+                t("Personal", "ส่วนตัว"),
+                t("Only you can open it", "เฉพาะคุณที่เปิดได้"),
+                picker.choice.is_none(),
+                None,
+            ));
+            for (id, name) in groups {
+                options = options.child(place(
+                    p,
+                    format!("place-{id}"),
+                    name,
+                    t("Every member can open it", "สมาชิกทุกคนเปิดได้"),
+                    picker.choice.as_ref() == Some(name),
+                    Some(name.clone()),
+                ));
+            }
+        }
+    }
+    let ready = picker.groups.is_some();
+    let choice = picker.choice.clone();
+    sheet(p, "link-picker", &title, &ic::CLOUD_UP, p.accent)
+        .child(options)
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .pt(6.0)
+                .child(el().grow(1.0))
+                .child(button(
+                    p,
+                    "link-cancel",
+                    t("Cancel", "ยกเลิก"),
+                    None,
+                    Kind::Secondary,
+                    true,
+                    |s, _| s.close_dialog(),
+                ))
+                .child(button(
+                    p,
+                    "link-go",
+                    t("Link", "เชื่อม"),
+                    None,
+                    Kind::Primary,
+                    ready,
+                    move |s, _| s.cloud_link(&project, choice.clone()),
+                )),
+        )
+}
+
+/// **Delete from cloud**: the person types the project name first.
+pub fn delete_dialog(s: &App, p: Paint) -> El {
+    let Some(project) = s.delete_confirm.clone() else {
+        return el();
+    };
+    let ok = delete_confirmed(&s.delete_typed.text, &project) && cloud::can_start(&s.busy);
+    let title = tf!(
+        "Delete {} from the cloud for all members? Type the project name to confirm.",
+        "ลบ {} ออกจากคลาวด์สำหรับสมาชิกทั้งหมดไหม พิมพ์ชื่อโปรเจกต์เพื่อยืนยัน",
+        project
+    );
+    let enter_name = project.clone();
+    let input = text_input(&s.delete_typed, BODY)
+        .key("delete-name")
+        .label(t("Project name", "ชื่อโปรเจกต์"))
+        .single_line()
+        .placeholder(&project, p.faint)
+        .color(p.text)
+        .on_edit(|s: &mut App| &mut s.delete_typed)
+        // `cloud_delete` checks the typed name itself, so Return does nothing before a match.
+        .on_submit(move |s: &mut App, _| s.cloud_delete(&enter_name))
+        .grow(1.0)
+        .min_w(0.0);
+    sheet(p, "confirm-delete", &title, &ic::CLOSE, p.red)
+        .child(
+            text(t(
+                "Every member loses this project in the cloud. The copy on this computer stays, but it is no longer linked.",
+                "สมาชิกทุกคนจะไม่มีโปรเจกต์นี้ในคลาวด์ สำเนาในเครื่องนี้ยังอยู่ แต่จะไม่เชื่อมกับคลาวด์อีก",
+            ))
+            .font(BODY)
+            .color(p.muted)
+            .wrap(),
+        )
+        .child(
+            row()
+                .key("delete-name-box")
+                .w_full()
+                .h(34.0)
+                .px(10.0)
+                .center_y()
+                .radius(8.0)
+                .fill(field_fill(p))
+                .border(1.0, p.border)
+                .child(input),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .pt(6.0)
+                .child(el().grow(1.0))
+                .child(button(
+                    p,
+                    "delete-cancel",
+                    t("Cancel", "ยกเลิก"),
+                    None,
+                    Kind::Secondary,
+                    true,
+                    |s, _| s.close_dialog(),
+                ))
+                .child(button(
+                    p,
+                    "delete-go",
+                    t("Delete from cloud", "ลบออกจากคลาวด์"),
+                    None,
+                    Kind::Danger,
+                    ok,
+                    move |s, _| s.cloud_delete(&project),
+                )),
+        )
+}
+
 // ── Question dialogs ────────────────────────────────────────────────────────
 
 fn field_fill(p: Paint) -> Color {
@@ -960,6 +1240,35 @@ pub fn question_dialog(s: &App, p: Paint) -> Option<El> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_label_for_each_state() {
+        assert_eq!(status_label(None), ("Not in the cloud", "ไม่ได้อยู่ในคลาวด์"));
+        assert_eq!(
+            status_label(Some(&LinkStatus::Synced)),
+            ("Synced", "ซิงก์แล้ว")
+        );
+        assert_eq!(
+            status_label(Some(&LinkStatus::LocalChanges)),
+            ("Changes on this computer", "มีการเปลี่ยนแปลงในเครื่องนี้")
+        );
+    }
+
+    #[test]
+    fn unlink_is_blocked_while_busy() {
+        assert!(can_unlink(&None));
+        assert!(!can_unlink(&Some(Busy::new("Linking…"))));
+    }
+
+    #[test]
+    fn delete_needs_the_exact_name() {
+        assert!(delete_confirmed("my-app", "my-app"));
+        assert!(delete_confirmed("  my-app ", "my-app"));
+        assert!(!delete_confirmed("My-App", "my-app"));
+        assert!(!delete_confirmed("my-ap", "my-app"));
+        assert!(!delete_confirmed("my app", "my-app"));
+        assert!(!delete_confirmed("", ""));
+    }
 
     #[test]
     fn new_password_rules() {

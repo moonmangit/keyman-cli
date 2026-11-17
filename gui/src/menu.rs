@@ -272,3 +272,61 @@ pub fn folder_menu(s: &App, p: Paint, at: (f32, f32), window: (f32, f32)) -> El 
                 .modal(true, |s: &mut App| s.menu = None),
         )
 }
+
+pub const PROJECT_MENU_W: f32 = 230.0;
+
+/// The project page's ⋯ menu: **Unlink** (this computer only) and **Delete from cloud**.
+pub fn project_menu(s: &App, p: Paint, project: &str, at: (f32, f32), window: (f32, f32)) -> El {
+    let linked = s.link_of(project).is_some();
+    let signed_in = matches!(s.cloud, crate::cloud::CloudState::SignedIn { .. });
+    let (unlink_name, delete_name) = (project.to_owned(), project.to_owned());
+    let panel = col()
+        .key("project-menu")
+        .role("menu")
+        .label(t("Project actions", "การทำงานของโปรเจกต์"))
+        .w(PROJECT_MENU_W)
+        .padding(6.0)
+        .gap(1.0)
+        .radius(10.0)
+        .fill(p.raised)
+        .border(1.0, p.border)
+        .shadow(
+            10.0,
+            30.0,
+            Color::BLACK.alpha(if p.dark { 0.5 } else { 0.18 }),
+        )
+        .child(item(
+            p,
+            "pm-unlink",
+            &ic::CLOUD,
+            t("Unlink", "เลิกเชื่อม"),
+            None,
+            linked && crate::cloud_views::can_unlink(&s.busy),
+            move |s| s.cloud_unlink(&unlink_name),
+        ))
+        .child(separator(p, "pm-sep"))
+        .child(item(
+            p,
+            "pm-delete",
+            &ic::CLOSE,
+            t("Delete from cloud", "ลบออกจากคลาวด์"),
+            Some(p.red),
+            linked && signed_in && crate::cloud::can_start(&s.busy),
+            move |s| s.ask_cloud_delete(&delete_name),
+        ));
+    let height = 12.0 + 2.0 * ITEM_H + 9.0;
+    let (x, y) = at;
+    let x = x.min(window.0 - PROJECT_MENU_W - 12.0).max(8.0);
+    let y = if y + height > window.1 - 12.0 {
+        (y - height).max(8.0)
+    } else {
+        y
+    };
+    el().key("project-menu-layer")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .child(
+            panel
+                .absolute(x, y)
+                .modal(true, |s: &mut App| s.project_menu = None),
+        )
+}
