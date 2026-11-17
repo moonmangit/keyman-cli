@@ -3,8 +3,8 @@
 
 use std::sync::atomic::Ordering;
 
-use keyman_cli::cloud::crypto::normalize_recovery_code;
 use rune::{Color, El, TextEdit, TextStyle, Tx, col, el, icon, row, text, text_input};
+use zeroize::Zeroizing;
 
 use crate::cloud::{self, Ask, Busy, CloudState};
 use crate::i18n::{count, t};
@@ -45,10 +45,7 @@ pub fn show_first_use(loaded: bool, cloud: &CloudState, done: bool, dialog_open:
 pub fn can_answer(ask: &Ask, first: &str, second: &str) -> bool {
     match ask {
         Ask::NewPassword => new_password_error(first, second).is_none(),
-        Ask::ShowRecoveryCode(code) => {
-            !first.trim().is_empty()
-                && normalize_recovery_code(first) == normalize_recovery_code(code)
-        }
+        Ask::ShowRecoveryCode(code) => !first.trim().is_empty() && same_code(first, code),
         Ask::Password { .. } | Ask::RecoveryCode => !first.is_empty(),
         // The cloud resolver answers these.
         Ask::Resolve { .. } => false,
@@ -62,10 +59,25 @@ fn shown_password_error(a: &str, b: &str) -> Option<&'static str> {
     ((short && !a.is_empty()) || (!short && !b.is_empty())).then_some(error)
 }
 
-/// The recovery code in two lines of four groups.
-fn code_lines(code: &str) -> Vec<String> {
+/// A recovery code's characters as the library compares them (`normalize_recovery_code`:
+/// no spaces or dashes, upper case), without a copy: a dialog checks the code on each frame.
+fn code_chars(code: &str) -> impl Iterator<Item = char> + '_ {
+    code.chars()
+        .filter(|c| *c != ' ' && *c != '-')
+        .flat_map(char::to_uppercase)
+}
+
+fn same_code(typed: &str, code: &str) -> bool {
+    code_chars(typed).eq(code_chars(code))
+}
+
+/// The recovery code in two lines of four groups, wiped when dropped.
+fn code_lines(code: &str) -> Vec<Zeroizing<String>> {
     let groups: Vec<&str> = code.split('-').collect();
-    groups.chunks(4).map(|line| line.join("-")).collect()
+    groups
+        .chunks(4)
+        .map(|line| Zeroizing::new(line.join("-")))
+        .collect()
 }
 
 // ── Title bar ───────────────────────────────────────────────────────────────
@@ -519,6 +531,24 @@ fn signed_in_group(p: Paint, email: &str, idle: bool) -> El {
             ),
             setting_row(
                 p,
+                "cloud-recover",
+                t("Forgot the vault password?", "ลืมรหัสผ่านตู้นิรภัยใช่ไหม"),
+                t(
+                    "Type your recovery code and make a new vault password.",
+                    "พิมพ์รหัสกู้คืนแล้วตั้งรหัสผ่านตู้นิรภัยใหม่",
+                ),
+                button(
+                    p,
+                    "cloud-use-recovery",
+                    t("Use recovery code", "ใช้รหัสกู้คืน"),
+                    Some(&ic::KEY),
+                    Kind::Secondary,
+                    idle,
+                    |s, _| s.cloud_recover_signed_in(),
+                ),
+            ),
+            setting_row(
+                p,
                 "cloud-password",
                 t("Vault password", "รหัสผ่านตู้นิรภัย"),
                 t(
@@ -748,11 +778,15 @@ pub fn question_dialog(s: &App, p: Paint) -> Option<El> {
         }
         Ask::ShowRecoveryCode(code) => {
             let mut lines = col().key("recovery-code").gap(4.0).center();
-            for (i, line) in code_lines(code).into_iter().enumerate() {
-                lines = lines.child(text(line).key(format!("code-{i}")).font(CODE).color(p.text));
+            for (i, line) in code_lines(code).iter().enumerate() {
+                lines = lines.child(
+                    text(line.as_str())
+                        .key(format!("code-{i}"))
+                        .font(CODE)
+                        .color(p.text),
+                );
             }
-            let typed = normalize_recovery_code(a);
-            let wrong = !ready && typed.len() >= normalize_recovery_code(code).len();
+            let wrong = !ready && code_chars(a).count() >= code_chars(code).count();
             let body = col()
                 .w_full()
                 .gap(12.0)
@@ -830,7 +864,7 @@ pub fn question_dialog(s: &App, p: Paint) -> Option<El> {
                     |s: &mut App| &mut s.cloud_fields.first,
                 ))
                 // The bridge counts down after each wrong try.
-                .children((*tries_left < 3).then(|| {
+                .children((*tries_left < cloud::PASSWORD_TRIES).then(|| {
                     note(
                         "tries-left",
                         &ic::ALERT,
@@ -1006,9 +1040,32 @@ mod tests {
 
     #[test]
     fn the_code_shows_in_two_lines() {
-        assert_eq!(
-            code_lines("AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"),
-            vec!["AAAA-BBBB-CCCC-DDDD", "EEEE-FFFF-GGGG-HHHH"]
-        );
+        let lines = code_lines("AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH");
+        let lines: Vec<&str> = lines.iter().map(|line| line.as_str()).collect();
+        assert_eq!(lines, ["AAAA-BBBB-CCCC-DDDD", "EEEE-FFFF-GGGG-HHHH"]);
+    }
+
+    #[test]
+    fn the_code_check_matches_the_library() {
+        use keyman_cli::cloud::crypto::normalize_recovery_code as library;
+        let code = "7K2M-QD9T-4XWB-HN3R";
+        for typed in [
+            "7k2m qd9t 4xwb hn3r",
+            "7K2M-QD9T-4XWB-HN3",
+            "7K2MQD9T4XWBHN3R",
+            "ß-ab",
+            "",
+        ] {
+            assert_eq!(
+                same_code(typed, code),
+                library(typed) == library(code),
+                "{typed}"
+            );
+            assert_eq!(
+                code_chars(typed).collect::<String>(),
+                library(typed),
+                "{typed}"
+            );
+        }
     }
 }

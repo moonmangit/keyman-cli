@@ -1295,10 +1295,7 @@ fn dialog_view(s: &App, p: Paint, dialog: Dialog) -> El {
         Dialog::Resolve => crate::resolve::resolve_dialog(s, p),
         Dialog::Panel => panel_dialog(s, p),
     };
-    scrim(p, "scrim").child(sheet.modal(true, |s: &mut App| {
-        s.dialog = None;
-        s.panel = Panel::None;
-    }))
+    scrim(p, "scrim").child(sheet.modal(true, |s: &mut App| s.close_dialog()))
 }
 
 /// The dimmed layer under a modal sheet.
@@ -1430,7 +1427,7 @@ fn nav_dialog(
                             "dialog-close",
                             &ic::CLOSE,
                             t("Close (Esc)", "ปิด (Esc)"),
-                            |s, _| s.dialog = None,
+                            |s, _| s.close_dialog(),
                         )),
                 )
                 .child(

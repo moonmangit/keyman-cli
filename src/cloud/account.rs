@@ -29,7 +29,9 @@ const WRONG_OWNER: &str = "The profile on the server is for a different user. Ke
 const SESSION: &str = "session";
 const LEGACY_KEY: &str = "private_key";
 const NO_CLOUD: &str = "You do not have Keyman Cloud yet. Run 'keyman login' to set it up.";
-const RECOVER_HINT: &str = "Run 'keyman recover' to use your recovery code.";
+/// The end of the error after the last wrong vault password: how to use the
+/// recovery code. The app shows its own words in its place.
+pub const RECOVER_HINT: &str = "Run 'keyman recover' to use your recovery code.";
 const USER_SWITCHED: &str = "You signed in as a different user. Keyman removed the cloud links of the old user. Your local projects did not change.";
 const HAS_PROFILE: &str = "This account has a vault password already. Keyman did not change it.";
 const PASSWORD_TRIES: usize = 3;

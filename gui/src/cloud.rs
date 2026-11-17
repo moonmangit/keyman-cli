@@ -25,7 +25,7 @@ use crate::i18n::t;
 pub const CANCELLED: &str = "cancelled";
 
 /// The library asks for the vault password at most this many times in a row.
-const PASSWORD_TRIES: u8 = 3;
+pub(crate) const PASSWORD_TRIES: u8 = 3;
 
 /// Whether this computer has a cloud sign-in, from local data only.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -476,13 +476,30 @@ fn finish(s: &mut App, cloud: Option<CloudState>, result: Result<Done, String>) 
         Ok(done) => apply(s, done),
         // The person stopped the task: no error to show.
         Err(error) if error == CANCELLED || error == account::SIGN_IN_CANCELLED => {}
-        Err(error) => s.fail(error),
+        Err(error) => s.fail(app_wording(&error)),
+    }
+}
+
+/// A library error in the app's words: the hint after the last wrong vault password names the
+/// CLI command, and the app has the **Use recovery code** button instead.
+pub fn app_wording(error: &str) -> String {
+    match error.strip_suffix(account::RECOVER_HINT) {
+        Some(head) => format!(
+            "{head}{}",
+            t(
+                "Use 'Use recovery code' in Settings › Account.",
+                "ใช้ปุ่ม \"ใช้รหัสกู้คืน\" ในการตั้งค่า › บัญชี",
+            )
+        ),
+        None => error.to_owned(),
     }
 }
 
 fn apply(s: &mut App, done: Done) {
     match done {
         Done::SignedIn { email } => {
+            // Signed in once: the first-use card does not come back after a later sign-out.
+            s.update_settings(|st| st.cloud_prompt_done = true);
             s.ok(tf!("Signed in as {}.", "ลงชื่อเข้าใช้เป็น {} แล้ว", email));
             s.cloud = CloudState::SignedIn { email };
         }
@@ -535,9 +552,20 @@ impl App {
     /// Sets a new vault password with the recovery code. With no saved sign-in, it signs in
     /// with `provider` first.
     pub fn cloud_recover(&mut self, provider: &'static str) {
+        self.recover_task(Some(provider));
+    }
+
+    /// **Use recovery code** while signed in: the saved sign-in is used, so no provider is
+    /// asked. If the server no longer accepts it, the task ends as a sign-in that is not valid.
+    pub fn cloud_recover_signed_in(&mut self) {
+        self.recover_task(None);
+    }
+
+    fn recover_task(&mut self, provider: Option<&'static str>) {
         self.recover_pick = false;
         start(self, signing_in_label(), move |bridge, home| {
-            account::recover(home, &SystemStore::new(), &mut || Ok(provider), bridge)?;
+            let mut provider = || provider.ok_or_else(|| account::SIGN_IN_INVALID.to_owned());
+            account::recover(home, &SystemStore::new(), &mut provider, bridge)?;
             Ok(Done::Toast(
                 t("The new vault password is set.", "ตั้งรหัสผ่านตู้นิรภัยใหม่แล้ว").to_owned(),
             ))
@@ -914,6 +942,54 @@ mod tests {
                 .as_ref()
                 .is_some_and(|toast| !toast.ok && toast.text == "boom")
         );
+    }
+
+    #[test]
+    fn the_recovery_hint_is_in_app_words() {
+        let error = format!(
+            "The vault password is not correct.\n\n{}",
+            account::RECOVER_HINT
+        );
+        let shown = app_wording(&error);
+        assert!(shown.starts_with("The vault password is not correct.\n\n"));
+        assert!(!shown.contains("keyman recover"), "{shown}");
+        assert!(
+            shown.ends_with("Use 'Use recovery code' in Settings › Account.")
+                || shown.ends_with("ในการตั้งค่า › บัญชี"),
+            "{shown}"
+        );
+        // Other errors stay as they are.
+        assert_eq!(app_wording("boom"), "boom");
+
+        // `finish` shows the app words.
+        let mut app = App::for_tests();
+        app.busy = busy("Signing in…");
+        finish(&mut app, None, Err(error));
+        let toast = app.toast.as_ref().unwrap();
+        assert!(!toast.ok && !toast.text.contains("keyman recover"));
+    }
+
+    #[test]
+    fn a_sign_in_closes_the_first_use_card_for_good() {
+        let mut app = App::for_tests();
+        assert!(!app.settings.cloud_prompt_done);
+        app.busy = busy("Signing in…");
+        let done = Done::SignedIn {
+            email: "a@b.c".into(),
+        };
+        finish(&mut app, None, Ok(done));
+        assert!(app.settings.cloud_prompt_done);
+        // Saved, so a sign-out and a new start keep it closed.
+        assert!(crate::settings::Settings::load(&app.prefs).cloud_prompt_done);
+    }
+
+    #[test]
+    fn closing_the_settings_resets_the_recovery_picker() {
+        let mut app = App::for_tests();
+        app.dialog = Some(crate::Dialog::Settings(crate::SettingsPage::Account));
+        app.recover_pick = true;
+        app.close_dialog();
+        assert!(app.dialog.is_none() && !app.recover_pick);
     }
 
     #[test]

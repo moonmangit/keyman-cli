@@ -354,6 +354,14 @@ impl App {
         Duration::from_secs(self.settings.clipboard_secs)
     }
 
+    /// Closes the open dialog (the close button, Escape, a click outside).
+    pub fn close_dialog(&mut self) {
+        self.dialog = None;
+        self.panel = Panel::None;
+        // The Account page opens on its sign-in buttons next time.
+        self.recover_pick = false;
+    }
+
     /// Closes the compare / save modal.
     pub fn close_panel(&mut self) {
         self.panel = Panel::None;
@@ -827,8 +835,7 @@ fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return true;
     }
     if ev.key == Key::Escape && s.dialog.is_some() {
-        s.dialog = None;
-        s.panel = Panel::None;
+        s.close_dialog();
         return true;
     }
     if ev.key == Key::Function(11) || (ev.mods.ctrl && ev.mods.cmd && ev.key == Key::Command('f')) {
@@ -1032,7 +1039,16 @@ fn main() {
     });
     set_icon();
     let handle = app.handle();
+    // Scenes apply on top of this state. A headless scene starts with the first-use card
+    // closed, so the older scenes look as before; `cloud-first-use` opens it. Not saved.
+    let scene = std::env::args().any(|arg| arg == "--scene");
     app.titlebar(Titlebar::new(widgets::TITLE_H))
-        .init(move || App::new(Some(handle), Prefs::open(APP_ID)))
+        .init(move || {
+            let mut app = App::new(Some(handle), Prefs::open(APP_ID));
+            if scene {
+                app.settings.cloud_prompt_done = true;
+            }
+            app
+        })
         .run();
 }
