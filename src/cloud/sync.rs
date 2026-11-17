@@ -6,7 +6,8 @@
 
 use super::account::Unlocked;
 use super::api::Membership;
-use super::crypto::{self, Key};
+use super::crypto::{self, Key, KeyPair};
+use super::groups;
 use super::merge::{self, Conflict};
 use super::state::{self, Link};
 use crate::master::{self, Variables};
@@ -17,6 +18,7 @@ use std::path::Path;
 /// The vault keys of one user: vault ID to (vault key, key generation).
 pub struct Vaults {
     by_id: HashMap<String, (Key, i64)>,
+    memberships: Vec<Membership>,
 }
 
 impl Vaults {
@@ -27,14 +29,28 @@ impl Vaults {
     }
 
     fn from_memberships(u: &Unlocked, memberships: &[Membership]) -> Vaults {
+        Vaults::from_pair(&u.pair, memberships)
+    }
+
+    /// The same, from a key pair. The key is stored with the generation of
+    /// the membership it was unwrapped from.
+    pub(crate) fn from_pair(pair: &KeyPair, memberships: &[Membership]) -> Vaults {
         let by_id = memberships
             .iter()
             .filter_map(|member| {
-                let key = crypto::unwrap(&u.pair, &member.wrapped_key).ok()?;
+                let key = crypto::unwrap(pair, &member.wrapped_key).ok()?;
                 Some((member.vault_id.clone(), (key, member.key_generation)))
             })
             .collect();
-        Vaults { by_id }
+        Vaults {
+            by_id,
+            memberships: memberships.to_vec(),
+        }
+    }
+
+    /// The memberships that were read when the keys were loaded.
+    pub fn memberships(&self) -> &[Membership] {
+        &self.memberships
     }
 
     pub fn key(&self, vault_id: &str) -> Result<&(Key, i64), String> {
@@ -75,10 +91,20 @@ fn group_vault(memberships: &[Membership], vaults: &Vaults, name: &str) -> Resul
     Err(format!("You are not in a group named '{name}'."))
 }
 
-/// Task 8 moves this to `groups.rs`. It returns `(group, email)` for each
-/// person who got access.
-pub fn accept_pending(_u: &Unlocked, _vaults: &Vaults) -> Result<Vec<(String, String)>, String> {
-    Ok(Vec::new())
+const KEY_CHANGED: &str = "The group key changed. Run 'keyman pull' again.";
+
+/// After a removal the projects are at a new key generation. A different
+/// generation is a stale key, not a damaged project.
+fn open_failure(key_generation: i64, row_generation: i64, reason: String) -> String {
+    if key_generation != row_generation {
+        KEY_CHANGED.to_string()
+    } else {
+        cannot_open(&reason)
+    }
+}
+
+fn cannot_open(reason: &str) -> String {
+    format!("Keyman cannot open this project. {reason}")
 }
 
 pub fn skip_reason_missing(project: &str) -> String {
@@ -300,7 +326,7 @@ pub fn pull(
     resolver: &mut dyn Resolver,
 ) -> Result<Vec<PullResult>, String> {
     let vaults = Vaults::load(u)?;
-    for (group, email) in accept_pending(u, &vaults)? {
+    for (group, email) in groups::accept_pending(u, &vaults)? {
         println!("Gave {email} access to {group}.");
     }
     let mut ids: Vec<String> = vaults.by_id.keys().cloned().collect();
@@ -321,14 +347,18 @@ pub fn pull(
         }
         let opened = vaults
             .key(&row.vault_id)
-            .and_then(|(key, _)| crypto::open_project(key, &row.id, row.version, &row.sealed));
+            .map_err(|reason| cannot_open(&reason))
+            .and_then(|(key, generation)| {
+                crypto::open_project(key, &row.id, row.version, &row.sealed)
+                    .map_err(|reason| open_failure(*generation, row.key_generation, reason))
+            });
         let (cloud_name, cloud_vars) = match opened {
             Ok(opened) => opened,
             Err(reason) => {
                 matched = true;
                 results.push(PullResult::Skipped {
                     project: linked.map_or_else(|| row.id.clone(), |l| l.project),
-                    reason: format!("Keyman cannot open this project. {reason}"),
+                    reason,
                 });
                 continue;
             }
@@ -968,6 +998,18 @@ mod tests {
         assert_eq!(
             master::project_variables(&out, "app").unwrap(),
             v(&[("A", "9")])
+        );
+    }
+
+    #[test]
+    fn a_new_key_generation_is_not_a_decrypt_error() {
+        assert_eq!(
+            open_failure(1, 2, "the data is not valid".to_string()),
+            "The group key changed. Run 'keyman pull' again."
+        );
+        assert_eq!(
+            open_failure(2, 2, "the data is not valid".to_string()),
+            "Keyman cannot open this project. the data is not valid"
         );
     }
 

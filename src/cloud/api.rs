@@ -427,6 +427,31 @@ impl Api {
         parse(&text)
     }
 
+    /// Members of several vaults in one request.
+    pub fn members_for_vaults(&self, vault_ids: &[String]) -> Result<Vec<Membership>, String> {
+        if vault_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let path = format!(
+            "/rest/v1/vault_members?{MEMBER_SELECT}&vault_id={}",
+            in_list(vault_ids)
+        );
+        parse(&self.get(&path)?)
+    }
+
+    /// Only the owner of a group can set the name. The server ignores an
+    /// update that it does not allow, so no row back is an error.
+    pub fn set_vault_name(&self, vault_id: &str, name_sealed: &str) -> Result<(), String> {
+        let path = format!("/rest/v1/vaults?id=eq.{}&select=id", urlenc(vault_id));
+        let body = json!({"name_sealed": name_sealed});
+        let text = self.call("PATCH", &path, Some("return=representation"), Some(&body))?;
+        let rows: Vec<Value> = parse(&text)?;
+        if rows.is_empty() {
+            return Err("Keyman cannot save the name of the group.".to_string());
+        }
+        Ok(())
+    }
+
     pub fn delete_vault(&self, vault_id: &str) -> Result<(), String> {
         let path = format!("/rest/v1/vaults?id=eq.{}", urlenc(vault_id));
         self.call("DELETE", &path, None, None).map(|_| ())

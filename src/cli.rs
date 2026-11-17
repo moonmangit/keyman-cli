@@ -304,6 +304,27 @@ Use --as to give a new project a different local name.",
         min: 1,
         max: 2,
     },
+    Spec {
+        name: "group",
+        group: "Cloud",
+        args: "<action> [group] [email]",
+        arguments: &[
+            ("<action>", "create, invite, remove, list or delete"),
+            ("[group]", "Name of the group"),
+            ("[email]", "Email address of the person, for invite and remove"),
+        ],
+        summary: "Share projects with a group",
+        details: "  keyman group create <group>          Make a group. You are the owner.
+  keyman group invite <group> <email>  Invite a person (owner only).
+  keyman group remove <group> <email>  Remove a person and make a new group key (owner only).
+  keyman group list                    Show your groups.
+  keyman group delete <group>          Delete the group and its projects for all members (owner only).
+
+A member of the group finishes an invite when they run 'keyman pull'.",
+        flags: &[],
+        min: 1,
+        max: 3,
+    },
 ];
 
 pub fn find(name: &str) -> Result<&'static Spec, String> {
@@ -682,6 +703,15 @@ mod tests {
             parse(link, &args(&["app", "--group"])).unwrap_err(),
             "the option '--group' needs a value"
         );
+    }
+
+    #[test]
+    fn group_command_takes_an_action_and_two_names() {
+        let group = find("group").unwrap();
+        assert!(parse(group, &args(&["list"])).is_ok());
+        assert!(parse(group, &args(&["invite", "team", "a@b.c"])).is_ok());
+        assert!(parse(group, &args(&[])).is_err());
+        assert!(parse(group, &args(&["a", "b", "c", "d"])).is_err());
     }
 
     #[test]

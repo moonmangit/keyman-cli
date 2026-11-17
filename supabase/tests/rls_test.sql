@@ -1,6 +1,6 @@
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(65);
+select plan(71);
 
 -- Users: A (owner), B (invitee/member), C (unrelated), D (email not confirmed)
 insert into auth.users (id, email, email_confirmed_at) values
@@ -52,6 +52,25 @@ select throws_ok(
 select throws_ok(
   $$ update public.vault_members set role = 'owner' where vault_id = current_setting('t.v')::uuid $$,
   '42501', null, 'client cannot update vault_members directly');
+
+-- the owner may change the sealed name of a group, and only that column
+select lives_ok(
+  $$ update public.vaults set name_sealed = 'x2' where id = current_setting('t.v')::uuid $$,
+  'owner_sets_name_only (owner sets the name)');
+select is(
+  (select name_sealed from public.vaults where id = current_setting('t.v')::uuid), 'x2',
+  'owner_sets_name_only (the name changed)');
+select throws_ok(
+  $$ update public.vaults set key_generation = 7 where id = current_setting('t.v')::uuid $$,
+  '42501', null, 'owner_sets_name_only (owner cannot update key_generation)');
+select throws_ok(
+  $$ update public.vaults set owner_id = 'cccccccc-0000-0000-0000-00000000000c' where id = current_setting('t.v')::uuid $$,
+  '42501', null, 'owner_sets_name_only (owner cannot update owner_id)');
+do $$ declare n int; begin
+  update public.vaults set name_sealed = 'p' where owner_id = 'aaaaaaaa-0000-0000-0000-00000000000a' and kind = 'personal';
+  get diagnostics n = row_count; perform set_config('t.n', n::text, true);
+end $$;
+select is(current_setting('t.n')::int, 0, 'owner_sets_name_only (owner cannot rename a personal vault)');
 
 -- A adds two projects and invites B and D
 do $$ begin
@@ -203,6 +222,12 @@ do $$ declare n int; begin
   get diagnostics n = row_count; perform set_config('t.n', n::text, true);
 end $$;
 select is(current_setting('t.n')::int, 0, 'vaults_delete refuses a non-owner member');
+
+do $$ declare n int; begin
+  update public.vaults set name_sealed = 'hijack' where id = current_setting('t.v')::uuid;
+  get diagnostics n = row_count; perform set_config('t.n', n::text, true);
+end $$;
+select is(current_setting('t.n')::int, 0, 'owner_sets_name_only (a member who is not the owner updates 0 rows)');
 
 select throws_ok(
   $$ select public.rotate_vault(current_setting('t.v')::uuid, 'bbbbbbbb-0000-0000-0000-00000000000b',

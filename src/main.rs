@@ -3,6 +3,7 @@ mod completions;
 
 use keyman_cli::cloud::account::Unlocked;
 use keyman_cli::cloud::account::{self, Prompt};
+use keyman_cli::cloud::groups;
 use keyman_cli::cloud::keystore::SystemStore;
 use keyman_cli::cloud::merge::{choose_all, Conflict, Keep};
 use keyman_cli::cloud::state;
@@ -157,6 +158,7 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
         "push" => return push_command(arg(0)),
         "pull" => return pull_command(arg(0), &flags),
         "cloud" => return cloud_command(&positional[0].to_string_lossy(), arg(1)),
+        "group" => return group_command(&positional),
         other => return Err(format!("command '{other}' is not implemented")),
     };
     Ok(Outcome::Print(output))
@@ -238,11 +240,20 @@ fn pull_command(given: Option<&OsString>, flags: &cli::Flags) -> Result<Outcome,
         local_name.as_deref(),
         resolver.as_mut(),
     )?;
+    let waiting = groups::waiting(&unlocked)?;
+    let waiting_line = (waiting > 0).then(|| {
+        yellow(&format!(
+            "Waiting for access to {}. A member must run 'keyman pull'.",
+            plural(waiting, "group")
+        ))
+    });
     if results.is_empty() {
-        return Ok(Outcome::Print(dim("No projects in the cloud yet.")));
+        let mut lines = vec![dim("No projects in the cloud yet.")];
+        lines.extend(waiting_line);
+        return Ok(Outcome::Print(lines.join("\n")));
     }
     let mut code = 0;
-    let lines = results
+    let mut lines: Vec<String> = results
         .iter()
         .map(|result| match result {
             PullResult::Updated { project, changes } => ui::success(&format!(
@@ -265,7 +276,127 @@ fn pull_command(given: Option<&OsString>, flags: &cli::Flags) -> Result<Outcome,
             }
         })
         .collect();
+    lines.extend(waiting_line);
     Ok(finish(lines, code))
+}
+
+fn group_command(positional: &[&OsString]) -> Result<Outcome, String> {
+    let text = |index: usize| {
+        positional
+            .get(index)
+            .map(|v| v.to_string_lossy().into_owned())
+    };
+    let action = text(0).unwrap_or_default();
+    let (group, email) = (text(1), text(2));
+    // Check the arguments first: a mistake must not ask for the password.
+    let (usage, wanted) = match action.as_str() {
+        "create" | "delete" => (format!("{action} <group>"), 1),
+        "invite" | "remove" => (format!("{action} <group> <email>"), 2),
+        "list" => ("list".to_string(), 0),
+        other => {
+            return Err(format!(
+                "unknown action '{other}' for 'keyman group'{}
+
+Use 'keyman group create', 'invite', 'remove', 'list' or 'delete'.",
+                ui::did_you_mean(other, ["create", "invite", "remove", "list", "delete"])
+            ))
+        }
+    };
+    let given = positional.len() - 1;
+    if given < wanted {
+        return Err(format!(
+            "The action '{action}' needs more arguments. Use 'keyman group {usage}'."
+        ));
+    }
+    if given > wanted {
+        return Err(format!(
+            "The action '{action}' has too many arguments. Use 'keyman group {usage}'."
+        ));
+    }
+    let home = home_dir()?;
+    let unlocked = unlock(&home)?;
+    let group = group.unwrap_or_default();
+    let email = email.unwrap_or_default();
+    match action.as_str() {
+        "create" => {
+            groups::create(&unlocked, &group)?;
+            Ok(Outcome::Print(ui::success(&format!(
+                "Made the group {group}. Run 'keyman group invite {group} <email>' to add a person."
+            ))))
+        }
+        "invite" => {
+            groups::invite(&unlocked, &group, &email)?;
+            Ok(Outcome::Print(ui::success(&format!(
+                "Invited {} to {group}. A member of the group must run 'keyman pull' to give access.",
+                email.trim().to_lowercase()
+            ))))
+        }
+        "remove" => {
+            let vaults = sync::Vaults::load(&unlocked)?;
+            let count = groups::check_remove(&unlocked, &vaults, &group)?;
+            println!(
+                "Keyman makes a new group key and encrypts all {} again. {} keeps the data that they got before.",
+                plural(count, "project"),
+                email.trim().to_lowercase()
+            );
+            println!("Type the email address to confirm:");
+            if read_answer()?.to_lowercase() != email.trim().to_lowercase() {
+                return Err(
+                    "The email address is not the same. Keyman did not remove anyone.".to_string(),
+                );
+            }
+            groups::remove(&unlocked, &vaults, &group, &email)?;
+            Ok(Outcome::Print(ui::success(&format!(
+                "Removed {} from {group}. The group has a new key.",
+                email.trim().to_lowercase()
+            ))))
+        }
+        "list" => {
+            let vaults = sync::Vaults::load(&unlocked)?;
+            let found = groups::list(&unlocked, &vaults)?;
+            let mut lines = vec![
+                bold(&format!("Groups{}", dim(&format!(" · {}", found.len())))),
+                String::new(),
+            ];
+            if found.is_empty() {
+                lines.push(dim(
+                    "No groups yet. Run 'keyman group create <group>' to make one.",
+                ));
+            }
+            let width = found
+                .iter()
+                .map(|g| g.name.chars().count())
+                .max()
+                .unwrap_or(0);
+            for item in &found {
+                lines.push(format!(
+                    "  {}  {}",
+                    accent(&ui::pad(&item.name, width)),
+                    dim(&item.detail())
+                ));
+            }
+            Ok(Outcome::Print(lines.join("\n")))
+        }
+        "delete" => {
+            let vaults = sync::Vaults::load(&unlocked)?;
+            let vault_id = groups::check_delete(&unlocked, &vaults, &group)?;
+            println!(
+                "Delete the group {group} and all its projects from the cloud for all members? Type the group name to confirm:"
+            );
+            if read_answer()? != group {
+                return Err("The name is not the same. Keyman did not delete anything.".to_string());
+            }
+            groups::delete(&unlocked, &vaults, &group)?;
+            let links = groups::forget_links(&home, &vault_id)?;
+            let mut text =
+                format!("Deleted the group {group}. The projects stay in the master file.");
+            if links > 0 {
+                text.push_str(&format!(" Keyman removed {}.", plural(links, "link")));
+            }
+            Ok(Outcome::Print(ui::success(&text)))
+        }
+        _ => unreachable!("the action was checked above"),
+    }
 }
 
 fn cloud_command(action: &str, given: Option<&OsString>) -> Result<Outcome, String> {
