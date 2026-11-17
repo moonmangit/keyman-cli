@@ -5,7 +5,7 @@
 //! write the master file, and only then change the link and the state file.
 
 use super::account::{self, Unlocked};
-use super::api::Membership;
+use super::api::{CloudProject, Membership};
 use super::crypto::{self, Key, KeyPair};
 use super::groups;
 use super::merge::{self, Conflict};
@@ -232,6 +232,41 @@ pub fn unlink(home: &Path, project: &str) -> Result<(), String> {
     state::save(home, &st)
 }
 
+/// The server must never give a version that is older than the last sync:
+/// the old sealed copy still opens, so it is a silent roll back.
+fn older_in_cloud(project: &str, link_version: i64, cloud_version: i64) -> Option<String> {
+    (cloud_version < link_version).then(|| {
+        format!(
+            "The cloud has an older version of {project} than this computer. Keyman did not change it."
+        )
+    })
+}
+
+/// A push changes the version from `link_version` to exactly one more.
+fn check_push_reply(project: &str, link_version: i64, reply_version: i64) -> Result<(), String> {
+    if reply_version == link_version + 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "The server gave a wrong version for {project}. Keyman did not change the link. Run 'keyman pull {project}'."
+        ))
+    }
+}
+
+/// The result of a push that changed no row. `row` is the cloud project
+/// read again: when it is gone, the project was deleted or the user left.
+fn not_pushed(project: &str, row: Option<&CloudProject>) -> PushResult {
+    match row {
+        Some(_) => PushResult::CloudIsNewer(project.to_string()),
+        None => PushResult::Skipped {
+            project: project.to_string(),
+            reason: format!(
+                "The project {project} is not in the cloud now. Run 'keyman unlink {project}'."
+            ),
+        },
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum PushResult {
     Pushed { project: String, version: i64 },
@@ -308,8 +343,18 @@ pub fn push(home: &Path, u: &Unlocked, project: Option<&str>) -> Result<Vec<Push
             .api
             .update_project(&link.cloud_id, link.version, *generation, &sealed)?
         {
-            None => results.push(PushResult::CloudIsNewer(name)),
+            None => {
+                let row = u.api.project(&link.cloud_id)?;
+                results.push(not_pushed(&name, row.as_ref()));
+            }
             Some(row) => {
+                if let Err(reason) = check_push_reply(&name, link.version, row.version) {
+                    results.push(PushResult::Skipped {
+                        project: name,
+                        reason,
+                    });
+                    continue;
+                }
                 if let Some(stored) = st.link_mut(&name) {
                     stored.version = row.version;
                     stored.base = local;
@@ -375,6 +420,16 @@ pub fn pull(
         let linked = st.link_by_cloud_id(&row.id).cloned();
         if let (Some(existing), Some(wanted)) = (&linked, project) {
             if existing.project != wanted {
+                continue;
+            }
+        }
+        if let Some(link) = &linked {
+            if let Some(reason) = older_in_cloud(&link.project, link.version, row.version) {
+                matched = true;
+                results.push(PullResult::Skipped {
+                    project: link.project.clone(),
+                    reason,
+                });
                 continue;
             }
         }
@@ -862,6 +917,57 @@ mod tests {
         // The personal vault of another user is not mine.
         assert_eq!(personal_in(&one, "other", None).unwrap_err(), NO_PERSONAL);
         assert_eq!(personal_in(&[], "me", None).unwrap_err(), NO_PERSONAL);
+    }
+
+    #[test]
+    fn an_older_cloud_version_is_skipped() {
+        assert_eq!(
+            older_in_cloud("app", 5, 4),
+            Some(
+                "The cloud has an older version of app than this computer. Keyman did not change it."
+                    .to_string()
+            )
+        );
+        assert_eq!(older_in_cloud("app", 5, 5), None);
+        assert_eq!(older_in_cloud("app", 5, 6), None);
+    }
+
+    #[test]
+    fn a_push_reply_must_be_the_next_version() {
+        assert!(check_push_reply("app", 3, 4).is_ok());
+        for wrong in [1, 3, 5, 99] {
+            assert_eq!(
+                check_push_reply("app", 3, wrong).unwrap_err(),
+                "The server gave a wrong version for app. Keyman did not change the link. Run 'keyman pull app'."
+            );
+        }
+    }
+
+    fn cloud_row(version: i64) -> CloudProject {
+        CloudProject {
+            id: "c1".to_string(),
+            vault_id: "v".to_string(),
+            version,
+            key_generation: 1,
+            sealed: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_push_that_changes_nothing_says_why() {
+        assert_eq!(
+            not_pushed("app", None),
+            PushResult::Skipped {
+                project: "app".to_string(),
+                reason: "The project app is not in the cloud now. Run 'keyman unlink app'."
+                    .to_string()
+            }
+        );
+        assert_eq!(
+            not_pushed("app", Some(&cloud_row(7))),
+            PushResult::CloudIsNewer("app".to_string())
+        );
     }
 
     #[test]
