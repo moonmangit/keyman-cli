@@ -216,7 +216,7 @@ code, then for a new vault password.
 
 If you are not signed in (for example on a new computer), Keyman opens your
 browser to sign in first. If you do not add an option, Keyman asks which
-provider to use.",
+one to use.",
         flags: &[("--github", "Sign in with GitHub"), ("--google", "Sign in with Google")],
         min: 0,
         max: 0,

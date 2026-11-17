@@ -19,8 +19,9 @@ const BAD_PROFILE: &str = "The key data on the server is not valid. Keyman stops
 const KEY_MISMATCH: &str = "The key on the server does not match. Keyman stops.";
 const BAD_LOCAL_KEY: &str = "The key on this computer is not valid. Run 'keyman login' again.";
 const CODE_MISMATCH: &str =
-    "The code is not the same. Nothing is saved. Run 'keyman login' to start again.";
-const PRIVATE_KEY: &str = "private_key";
+    "The code is not the same. Keyman did not save anything. Run 'keyman login' to start again.";
+const SIGN_IN_INVALID: &str = "Your sign-in is not valid now. Run 'keyman login'.";
+const WRONG_OWNER: &str = "The profile on the server is for a different user. Keyman stops.";
 const SESSION: &str = "session";
 const NO_CLOUD: &str = "You do not have Keyman Cloud yet. Run 'keyman login' to set it up.";
 const RECOVER_HINT: &str = "Run 'keyman recover' to use your recovery code.";
@@ -174,12 +175,38 @@ pub fn unlock_with_recovery(profile: &Profile, code: &str) -> Result<KeyPair, St
     open_with_recovery(profile, code)
 }
 
-fn remember_key(store: &dyn Store, pair: &KeyPair) -> Result<(), String> {
+/// The store entry for the private key of one user.
+fn key_entry(user_id: &str) -> String {
+    format!("{user_id}/private-key")
+}
+
+fn remember_key(store: &dyn Store, user_id: &str, pair: &KeyPair) -> Result<(), String> {
     if store.available() {
         let text = Zeroizing::new(pair.secret.to_base64());
-        store.set(PRIVATE_KEY, &text)?;
+        store.set(&key_entry(user_id), &text)?;
     }
     Ok(())
+}
+
+/// The key that this computer keeps for this user, if any.
+fn stored_key(store: &dyn Store, user_id: &str) -> Result<Option<KeyPair>, String> {
+    match store.get(&key_entry(user_id))? {
+        Some(text) => {
+            let text = Zeroizing::new(text);
+            let key = Key::from_base64(&text).map_err(|_| BAD_LOCAL_KEY.to_string())?;
+            Ok(Some(KeyPair::from_secret(key)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// A profile must belong to the signed-in user.
+fn check_owner(profile: &Profile, user_id: &str) -> Result<(), String> {
+    if profile.user_id == user_id {
+        Ok(())
+    } else {
+        Err(WRONG_OWNER.to_string())
+    }
 }
 
 fn create_personal_vault(api: &Api, pair: &KeyPair) -> Result<(), String> {
@@ -193,9 +220,9 @@ fn create_personal_vault(api: &Api, pair: &KeyPair) -> Result<(), String> {
 }
 
 /// First sign-in: make the keys, the profile and the personal vault.
+/// The caller saves the session first, then the private key.
 pub fn setup_profile(
     api: &Api,
-    store: &dyn Store,
     prompt: &mut dyn Prompt,
     params: KdfParams,
 ) -> Result<KeyPair, String> {
@@ -211,13 +238,13 @@ pub fn setup_profile(
             confirmed = true;
             break;
         }
+        crate::ui::warning("The code is not the same. Try again.");
     }
     if !confirmed {
         return Err(CODE_MISMATCH.to_string());
     }
     api.put_profile(&profile)?;
     create_personal_vault(api, &pair)?;
-    remember_key(store, &pair)?;
     Ok(pair)
 }
 
@@ -273,6 +300,7 @@ fn saved_refresh_token(store: &dyn Store, st: &state::State) -> Result<Option<St
 
 fn unlock_from_server(api: &Api, prompt: &mut dyn Prompt) -> Result<KeyPair, String> {
     let profile = api.my_profile()?.ok_or_else(|| NO_PROFILE.to_string())?;
+    check_owner(&profile, api.user_id())?;
     let password = Zeroizing::new(prompt.password()?);
     unlock_with_password(&profile, &password)
 }
@@ -291,7 +319,8 @@ fn ensure_personal_vault(api: &Api, pair: &KeyPair) -> Result<(), String> {
 }
 
 /// Sign in with the browser. Then set up a new account or unlock an old one.
-/// Nothing is saved on this computer until the keys are ready.
+/// Nothing is saved on this computer until the keys are ready. If a step
+/// fails, Keyman ends the server session.
 pub fn login(
     home: &Path,
     store: &dyn Store,
@@ -300,9 +329,24 @@ pub fn login(
 ) -> Result<LoginOutcome, String> {
     let cfg = config();
     let session = auth::sign_in_with_browser(&cfg, provider)?;
-    let api = Api::new(cfg, session.clone());
+    let api = Api::new(cfg.clone(), session.clone());
+    let result = finish_login(home, store, &api, &session, prompt);
+    if result.is_err() {
+        let _ = api::sign_out(&cfg, &session);
+    }
+    result
+}
+
+fn finish_login(
+    home: &Path,
+    store: &dyn Store,
+    api: &Api,
+    session: &Session,
+    prompt: &mut dyn Prompt,
+) -> Result<LoginOutcome, String> {
     let (pair, outcome) = match api.my_profile()? {
         Some(profile) => {
+            check_owner(&profile, api.user_id())?;
             let mut attempt = 1;
             let pair = loop {
                 let password = Zeroizing::new(prompt.password()?);
@@ -313,26 +357,35 @@ pub fn login(
                         attempt += 1;
                     }
                     Err(error) if error == WRONG_PASSWORD => {
-                        return Err(format!(
-                            "{error}
-
-{RECOVER_HINT}"
-                        ))
+                        return Err(format!("{error}\n\n{RECOVER_HINT}"))
                     }
                     Err(error) => return Err(error),
                 }
             };
-            ensure_personal_vault(&api, &pair)?;
+            ensure_personal_vault(api, &pair)?;
             (pair, LoginOutcome::Unlocked)
         }
         None => (
-            setup_profile(&api, store, prompt, KdfParams::PRODUCTION)?,
+            setup_profile(api, prompt, KdfParams::PRODUCTION)?,
             LoginOutcome::Created,
         ),
     };
-    remember_key(store, &pair)?;
-    store_session(home, store, &session)?;
+    // The session entry comes first, then the key.
+    store_session(home, store, session)?;
+    remember_key(store, &session.user_id, &pair)?;
     Ok(outcome)
+}
+
+/// Remove a saved session that the server does not accept.
+fn drop_session(home: &Path, store: &dyn Store) {
+    if store.available() {
+        let _ = store.delete(SESSION);
+    }
+    if let Ok(mut st) = state::load(home) {
+        if st.refresh_token.take().is_some() {
+            let _ = state::save(home, &st);
+        }
+    }
 }
 
 /// Use the saved refresh token to get a new session, and save the new token.
@@ -341,7 +394,15 @@ fn signed_in(home: &Path, store: &dyn Store) -> Result<Api, String> {
     let st = state::load(home)?;
     let token = saved_refresh_token(store, &st)?.ok_or_else(|| NOT_SIGNED_IN.to_string())?;
     let cfg = config();
-    let session = api::refresh(&cfg, &token)?;
+    let session = match api::refresh(&cfg, &token) {
+        Ok(session) => session,
+        // A network problem is not a bad sign-in: keep the session.
+        Err(error) if error.starts_with("cannot connect") => return Err(error),
+        Err(_) => {
+            drop_session(home, store);
+            return Err(SIGN_IN_INVALID.to_string());
+        }
+    };
     store_session(home, store, &session)?;
     Ok(Api::new(cfg, session))
 }
@@ -352,24 +413,19 @@ pub fn session(
     prompt: &mut dyn Prompt,
 ) -> Result<Unlocked, String> {
     let api = signed_in(home, store)?;
+    let user_id = api.user_id().to_string();
     let pair = if store.available() {
-        match store.get(PRIVATE_KEY)? {
-            Some(text) => {
-                let text = Zeroizing::new(text);
-                KeyPair::from_secret(
-                    Key::from_base64(&text).map_err(|_| BAD_LOCAL_KEY.to_string())?,
-                )
-            }
+        match stored_key(store, &user_id)? {
+            Some(pair) => pair,
             None => {
                 let pair = unlock_from_server(&api, prompt)?;
-                remember_key(store, &pair)?;
+                remember_key(store, &user_id, &pair)?;
                 pair
             }
         }
     } else {
         unlock_from_server(&api, prompt)?
     };
-    let user_id = api.user_id().to_string();
     Ok(Unlocked { api, pair, user_id })
 }
 
@@ -382,24 +438,50 @@ pub fn recover(
     prompt: &mut dyn Prompt,
 ) -> Result<(), String> {
     let st = state::load(home)?;
-    let (api, fresh) = if needs_sign_in(store, &st)? {
-        let cfg = config();
-        let session = auth::sign_in_with_browser(&cfg, provider()?)?;
-        (Api::new(cfg, session.clone()), Some(session))
+    let saved = if needs_sign_in(store, &st)? {
+        None
     } else {
-        (signed_in(home, store)?, None)
+        match signed_in(home, store) {
+            Ok(api) => Some(api),
+            // The saved sign-in is old: sign in again with the browser.
+            Err(error) if error == SIGN_IN_INVALID => None,
+            Err(error) => return Err(error),
+        }
     };
+    let (api, fresh) = match saved {
+        Some(api) => (api, None),
+        None => {
+            let cfg = config();
+            let session = auth::sign_in_with_browser(&cfg, provider()?)?;
+            (Api::new(cfg, session.clone()), Some(session))
+        }
+    };
+    let result = finish_recover(home, store, &api, fresh.as_ref(), prompt);
+    if let (Err(_), Some(session)) = (&result, &fresh) {
+        let _ = api::sign_out(&config(), session);
+    }
+    result
+}
+
+fn finish_recover(
+    home: &Path,
+    store: &dyn Store,
+    api: &Api,
+    fresh: Option<&Session>,
+    prompt: &mut dyn Prompt,
+) -> Result<(), String> {
     let profile = api.my_profile()?.ok_or_else(|| NO_CLOUD.to_string())?;
+    check_owner(&profile, api.user_id())?;
     let code = Zeroizing::new(prompt.recovery_code()?);
     let pair = unlock_with_recovery(&profile, &code)?;
     let password = Zeroizing::new(prompt.new_password()?);
     let updated = reseal_all(&profile, &pair, &password, &code)?;
     api.put_profile(&updated)?;
-    remember_key(store, &pair)?;
+    // The session entry comes first, then the key.
     if let Some(session) = fresh {
-        store_session(home, store, &session)?;
+        store_session(home, store, session)?;
     }
-    Ok(())
+    remember_key(store, api.user_id(), &pair)
 }
 
 /// Change the vault password. The recovery copy stays as it is, so the
@@ -411,6 +493,7 @@ pub fn change_password(
 ) -> Result<(), String> {
     let api = signed_in(home, store)?;
     let profile = api.my_profile()?.ok_or_else(|| NO_PROFILE.to_string())?;
+    check_owner(&profile, api.user_id())?;
     let current = Zeroizing::new(prompt.password()?);
     let pair = unlock_with_password(&profile, &current)?;
     let password = Zeroizing::new(prompt.new_password()?);
@@ -423,6 +506,7 @@ pub fn change_password(
 pub fn logout(home: &Path, store: &dyn Store) -> Result<(), String> {
     let mut st = state::load(home)?;
     let token = saved_refresh_token(store, &st).ok().flatten();
+    let key_name = st.user_id.as_deref().map(key_entry);
     if let Some(token) = token {
         let cfg = config();
         if let Ok(session) = api::refresh(&cfg, &token) {
@@ -431,13 +515,15 @@ pub fn logout(home: &Path, store: &dyn Store) -> Result<(), String> {
     }
     let mut failure = None;
     if store.available() {
-        for name in [PRIVATE_KEY, SESSION] {
+        let names = key_name.iter().map(String::as_str).chain([SESSION]);
+        for name in names {
             if let Err(error) = store.delete(name) {
                 failure.get_or_insert(error);
             }
         }
     }
-    st.user_id = None;
+    // The user id stays (it is not secret). It lets the next sign-in see
+    // a different user and remove the old links.
     st.email = None;
     st.refresh_token = None;
     state::save(home, &st)?;
@@ -634,7 +720,7 @@ mod tests {
             Some("refresh-1")
         );
         // The private key is never kept without a store.
-        assert!(remember_key(&NoStore, &KeyPair::generate()).is_ok());
+        assert!(remember_key(&NoStore, "user-1", &KeyPair::generate()).is_ok());
     }
 
     #[test]
@@ -695,5 +781,76 @@ mod tests {
         let mut st = state::State::default();
         assert!(!switch_user(&mut st, "user-A"));
         assert_eq!(st.user_id.as_deref(), Some("user-A"));
+    }
+
+    #[test]
+    fn key_of_another_user_is_not_used() {
+        let store = crate::cloud::keystore::MemoryStore::new();
+        let b = KeyPair::generate();
+        remember_key(&store, "user-B", &b).unwrap();
+        assert!(stored_key(&store, "user-A").unwrap().is_none());
+        assert_eq!(
+            stored_key(&store, "user-B").unwrap().unwrap().public,
+            b.public
+        );
+        assert_eq!(key_entry("user-A"), "user-A/private-key");
+    }
+
+    #[test]
+    fn profile_of_another_user_is_refused() {
+        let (profile, _) = values("correct horse", "ABCD-EFGH");
+        assert!(check_owner(&profile, "user-1").is_ok());
+        assert!(check_owner(&profile, "user-2").is_err());
+    }
+
+    #[test]
+    fn stale_session_is_dropped() {
+        let home = temp_home("stale");
+        let store = crate::cloud::keystore::MemoryStore::new();
+        store_session(&home, &store, &sample_session()).unwrap();
+        drop_session(&home, &store);
+        let st = state::load(&home).unwrap();
+        assert!(needs_sign_in(&store, &st).unwrap());
+        assert_eq!(st.user_id.as_deref(), Some("user-1"));
+        let mut st = state::State {
+            refresh_token: Some("t".into()),
+            ..Default::default()
+        };
+        state::save(&home, &st).unwrap();
+        drop_session(&home, &NoStore);
+        st = state::load(&home).unwrap();
+        assert!(needs_sign_in(&NoStore, &st).unwrap());
+    }
+
+    #[test]
+    fn logout_keeps_the_user_so_a_switch_is_seen() {
+        let home = temp_home("logout");
+        let store = crate::cloud::keystore::MemoryStore::new();
+        let mut st = state::State {
+            user_id: Some("user-A".into()),
+            email: Some("a@example.com".into()),
+            ..Default::default()
+        };
+        st.set_link(state::Link {
+            project: "app".into(),
+            cloud_id: "c1".into(),
+            vault_id: "v1".into(),
+            version: 1,
+            base: vec![],
+        });
+        state::save(&home, &st).unwrap();
+        remember_key(&store, "user-A", &KeyPair::generate()).unwrap();
+        logout(&home, &store).unwrap();
+        let after = state::load(&home).unwrap();
+        assert_eq!(after.user_id.as_deref(), Some("user-A"));
+        assert_eq!(after.email, None);
+        assert_eq!(after.links.len(), 1);
+        assert!(stored_key(&store, "user-A").unwrap().is_none());
+        let mut other = sample_session();
+        other.user_id = "user-B".into();
+        store_session(&home, &store, &other).unwrap();
+        let switched = state::load(&home).unwrap();
+        assert!(switched.links.is_empty());
+        assert_eq!(switched.user_id.as_deref(), Some("user-B"));
     }
 }

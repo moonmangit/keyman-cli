@@ -1,7 +1,7 @@
 //! Secret storage on this computer: the operating system credential store
 //! (macOS Keychain, Windows Credential Manager, Linux Secret Service).
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 
 const SERVICE: &str = "keyman";
@@ -19,8 +19,16 @@ pub trait Store {
     }
 }
 
-/// The credential store of the operating system.
-pub struct SystemStore;
+/// The credential store of the operating system. It tests the store one
+/// time, so the answer cannot change during a command.
+#[derive(Default)]
+pub struct SystemStore(OnceCell<bool>);
+
+impl SystemStore {
+    pub fn new() -> SystemStore {
+        SystemStore::default()
+    }
+}
 
 fn entry(name: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(SERVICE, name).map_err(|_| STORE_ERROR.to_string())
@@ -49,7 +57,7 @@ impl Store for SystemStore {
     }
 
     fn available(&self) -> bool {
-        system_available()
+        *self.0.get_or_init(system_available)
     }
 }
 

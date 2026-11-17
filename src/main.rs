@@ -116,21 +116,21 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
         "completions" => completions::script(&positional[0].to_string_lossy())?,
         "login" => login(&home_dir()?, &flags)?,
         "logout" => {
-            account::logout(&home_dir()?, &SystemStore)?;
+            account::logout(&home_dir()?, &SystemStore::new())?;
             ui::success("Signed out. Keyman removed the keys from this computer.")
         }
         "recover" => {
             account::recover(
                 &home_dir()?,
-                &SystemStore,
+                &SystemStore::new(),
                 &mut || choose_provider(&flags),
                 &mut TerminalPrompt,
             )?;
-            ui::success("The vault password is changed.")
+            ui::success("Keyman changed the vault password.")
         }
         "password" => {
-            account::change_password(&home_dir()?, &SystemStore, &mut TerminalPrompt)?;
-            ui::success("The vault password is changed.")
+            account::change_password(&home_dir()?, &SystemStore::new(), &mut TerminalPrompt)?;
+            ui::success("Keyman changed the vault password.")
         }
         other => return Err(format!("command '{other}' is not implemented")),
     };
@@ -206,7 +206,7 @@ fn choose_provider(flags: &[&str]) -> Result<&'static str, String> {
 
 fn login(home: &Path, flags: &[&str]) -> Result<String, String> {
     let provider = choose_provider(flags)?;
-    account::login(home, &SystemStore, provider, &mut TerminalPrompt)?;
+    account::login(home, &SystemStore::new(), provider, &mut TerminalPrompt)?;
     let email = state::load(home)?.email.unwrap_or_default();
     Ok(ui::success(&format!(
         "Signed in as {email}. Keyman Cloud is ready."
