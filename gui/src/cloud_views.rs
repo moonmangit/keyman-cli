@@ -920,7 +920,9 @@ pub struct ResultRow {
 }
 
 /// The projects that need the person, in the order of the sync. A library reason stays as it is.
-pub fn attention_rows(summary: &SyncSummary) -> Vec<ResultRow> {
+/// `linked` says whether this computer's project with a name is linked: such a project cannot
+/// merge with another cloud project, so its row has no **Merge**.
+pub fn attention_rows(summary: &SyncSummary, linked: impl Fn(&str) -> bool) -> Vec<ResultRow> {
     summary
         .attention
         .iter()
@@ -938,19 +940,54 @@ pub fn attention_rows(summary: &SyncSummary) -> Vec<ResultRow> {
                     "คลาวด์มีการเปลี่ยนแปลงของ {} ที่ใหม่กว่า กดซิงก์อีกครั้ง",
                     project
                 ),
+                Attention::CanMerge(project) if linked(project) => t(
+                    "A project with this name on this computer is linked to another cloud project. Use 'keyman pull --as <name>' in a terminal, or rename the local project.",
+                    "โปรเจกต์ชื่อนี้ในเครื่องนี้เชื่อมกับโปรเจกต์อื่นบนคลาวด์อยู่แล้ว ใช้ 'keyman pull --as <ชื่อ>' ในเทอร์มินัล หรือเปลี่ยนชื่อโปรเจกต์ในเครื่อง",
+                )
+                .to_owned(),
                 Attention::CanMerge(project) => tf!(
                     "This computer has a different project with the name {}. Click Merge to join it with the cloud project.",
                     "เครื่องนี้มีโปรเจกต์อื่นชื่อ {} อยู่แล้ว กดรวมเพื่อรวมกับโปรเจกต์บนคลาวด์",
                     project
                 ),
             };
+            let merge = matches!(attention, Attention::CanMerge(p) if !linked(p));
             ResultRow {
                 project,
                 reason,
-                merge: matches!(attention, Attention::CanMerge(_)),
+                merge,
             }
         })
         .collect()
+}
+
+/// "Added to this computer: a, b".
+pub fn added_line(summary: &SyncSummary) -> String {
+    tf!(
+        "Added to this computer: {}",
+        "เพิ่มในเครื่องนี้แล้ว: {}",
+        summary.added.join(", ")
+    )
+}
+
+/// The first line of the **Sync results** dialog. The counts show only when something was
+/// done; "up to date" does not show above projects that need the person.
+pub fn results_intro(summary: &SyncSummary) -> String {
+    let done = summary.updated + summary.added.len() + summary.sent > 0;
+    let counts = done.then(|| cloud::counts_text(summary));
+    match (counts, summary.attention.is_empty()) {
+        (Some(counts), false) => format!(
+            "{counts} {}",
+            t("These projects need you:", "โปรเจกต์เหล่านี้ต้องให้คุณจัดการ:")
+        ),
+        (Some(counts), true) => counts,
+        (None, false) => t(
+            "Keyman synced your projects. These projects need you:",
+            "Keyman ซิงก์โปรเจกต์ของคุณแล้ว โปรเจกต์เหล่านี้ต้องให้คุณจัดการ:",
+        )
+        .to_owned(),
+        (None, true) => t("Read the messages below.", "อ่านข้อความด้านล่าง").to_owned(),
+    }
 }
 
 /// A line in the results: an icon and a text that wraps.
@@ -985,7 +1022,7 @@ pub fn sync_results_dialog(s: &App, p: Paint) -> El {
     };
     let idle = cloud::can_start(&s.busy);
     let mut list = col().key("sync-rows").w_full().gap(8.0);
-    for row_data in attention_rows(summary) {
+    for row_data in attention_rows(summary, |name| s.link_of(name).is_some()) {
         let ResultRow {
             project,
             reason,
@@ -1038,11 +1075,7 @@ pub fn sync_results_dialog(s: &App, p: Paint) -> El {
             "sync-added".into(),
             &ic::PLUS,
             p.green,
-            tf!(
-                "Added to this computer: {}",
-                "เพิ่มในเครื่องนี้แล้ว: {}",
-                summary.added.join(", ")
-            ),
+            added_line(summary),
         ));
     }
     for (i, (group, email)) in summary.given.iter().enumerate() {
@@ -1063,15 +1096,7 @@ pub fn sync_results_dialog(s: &App, p: Paint) -> El {
             warning.clone(),
         ));
     }
-    let intro_text = if summary.attention.is_empty() {
-        cloud::counts_text(summary)
-    } else {
-        format!(
-            "{} {}",
-            cloud::counts_text(summary),
-            t("These projects need you:", "โปรเจกต์เหล่านี้ต้องให้คุณจัดการ:")
-        )
-    };
+    let intro_text = results_intro(summary);
     sheet(
         p,
         "sync-results",
@@ -1532,7 +1557,7 @@ mod tests {
             given: Vec::new(),
             warnings: Vec::new(),
         };
-        let rows = attention_rows(&summary);
+        let rows = attention_rows(&summary, |_| false);
         assert_eq!(
             rows[0],
             ResultRow {
@@ -1565,6 +1590,51 @@ mod tests {
             [false, false, false, true]
         );
         assert_eq!(rows[3].project, "f");
+
+        // A local project with that name that is linked already cannot merge.
+        let rows = attention_rows(&summary, |name| name == "f");
+        assert!(!rows[3].merge);
+        assert!(
+            rows[3].reason.contains("keyman pull --as <name>")
+                || rows[3].reason.contains("keyman pull --as <ชื่อ>"),
+            "{}",
+            rows[3].reason
+        );
+    }
+
+    #[test]
+    fn the_results_intro_does_not_say_up_to_date_above_problems() {
+        let mut summary = SyncSummary {
+            updated: 0,
+            added: Vec::new(),
+            sent: 0,
+            attention: vec![Attention::CloudIsNewer("g".into())],
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let intro = results_intro(&summary);
+        assert!(
+            [
+                "Keyman synced your projects. These projects need you:",
+                "Keyman ซิงก์โปรเจกต์ของคุณแล้ว โปรเจกต์เหล่านี้ต้องให้คุณจัดการ:",
+            ]
+            .contains(&intro.as_str()),
+            "{intro}"
+        );
+        // Only a warning (a push that stopped): no "up to date" either.
+        summary.attention.clear();
+        summary
+            .warnings
+            .push("Keyman did not send your changes.".into());
+        let intro = results_intro(&summary);
+        assert!(
+            !intro.contains("up to date") && !intro.contains("ปัจจุบัน"),
+            "{intro}"
+        );
+        // Counts show when something was done.
+        summary.updated = 2;
+        let intro = results_intro(&summary);
+        assert!(intro.contains('2'), "{intro}");
     }
 
     #[test]

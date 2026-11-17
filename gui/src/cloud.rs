@@ -362,6 +362,9 @@ pub enum Done {
     SignedOut,
     Toast(String),
     SyncFinished(SyncSummary),
+    /// The server did not accept the sign-in during the push. The pull's results were
+    /// written; the toast lists them after the sign-in text.
+    SyncSignInRejected(SyncSummary),
     /// The pull after **Merge** of `project`.
     Merged {
         project: String,
@@ -445,15 +448,88 @@ pub fn summarize(report: &PullReport, pushed: &[PushResult]) -> SyncSummary {
                 reason: reason.clone(),
             },
         };
-        if !summary
-            .attention
-            .iter()
-            .any(|listed| listed.project() == attention.project())
-        {
+        // "Cloud is newer" for a project the pull listed says nothing new. A push reason
+        // that is different from what the pull said is kept.
+        let said = match &attention {
+            Attention::CloudIsNewer(project) => summary
+                .attention
+                .iter()
+                .any(|listed| listed.project() == project),
+            _ => summary.attention.contains(&attention),
+        };
+        if !said {
             summary.attention.push(attention);
         }
     }
     summary
+}
+
+/// What happened after the pull of a **Sync**.
+pub enum PushOutcome {
+    Sent(Vec<PushResult>),
+    /// The push stopped with this error.
+    Failed(String),
+    /// Cancel was clicked during the pull: Keyman sent nothing.
+    Cancelled,
+}
+
+/// The end of a **Sync** whose pull worked. The pull wrote its changes already, so they are
+/// always shown: a push error becomes a line in the results, and a cancel shows the pull's
+/// results without an error. A cancel with nothing to report ends as a plain cancel.
+pub fn sync_outcome(report: &PullReport, push: PushOutcome) -> Result<Done, String> {
+    match push {
+        PushOutcome::Sent(pushed) => Ok(Done::SyncFinished(summarize(report, &pushed))),
+        PushOutcome::Cancelled => {
+            let summary = summarize(report, &[]);
+            let nothing = summary.updated == 0
+                && summary.added.is_empty()
+                && summary.given.is_empty()
+                && !needs_person(&summary);
+            if nothing {
+                Err(CANCELLED.to_owned())
+            } else {
+                Ok(Done::SyncFinished(summary))
+            }
+        }
+        PushOutcome::Failed(error) if error == account::SIGN_IN_INVALID => {
+            Ok(Done::SyncSignInRejected(summarize(report, &[])))
+        }
+        PushOutcome::Failed(error) => {
+            let mut summary = summarize(report, &[]);
+            summary.warnings.push(push_failed_line(&error));
+            Ok(Done::SyncFinished(summary))
+        }
+    }
+}
+
+/// The results line for a push that stopped with `error`.
+pub fn push_failed_line(error: &str) -> String {
+    tf!(
+        "Keyman did not send your changes. {}",
+        "Keyman ไม่ได้ส่งการเปลี่ยนแปลงของคุณ {}",
+        app_wording(error)
+    )
+}
+
+/// The results of a sync as plain lines, for a toast that cannot show the dialog.
+pub fn summary_lines(summary: &SyncSummary) -> Vec<String> {
+    let mut lines = vec![counts_text(summary)];
+    lines.extend(
+        crate::cloud_views::attention_rows(summary, |_| false)
+            .into_iter()
+            .map(|row| format!("{}: {}", row.project, row.reason)),
+    );
+    if !summary.added.is_empty() {
+        lines.push(crate::cloud_views::added_line(summary));
+    }
+    lines.extend(
+        summary
+            .given
+            .iter()
+            .map(|(group, email)| given_line(group, email)),
+    );
+    lines.extend(summary.warnings.iter().cloned());
+    lines
 }
 
 /// Whether the **Sync results** dialog must open: a project needs the person, or a warning.
@@ -491,12 +567,13 @@ fn counts_words(summary: &SyncSummary, thai: bool) -> String {
     ]
     .into_iter()
     .filter(|(n, ..)| *n > 0)
-    .map(|(n, en, th)| {
-        if thai {
-            format!("{th} {n} โปรเจกต์")
-        } else {
-            format!("{n} {en}")
-        }
+    .enumerate()
+    .map(|(i, (n, en, th))| match (thai, i, n) {
+        (true, ..) => format!("{th} {n} โปรเจกต์"),
+        // The noun goes on the first part only: "2 projects updated, 1 added".
+        (false, 0, 1) => format!("1 project {en}"),
+        (false, 0, _) => format!("{n} projects {en}"),
+        (false, ..) => format!("{n} {en}"),
     })
     .collect();
     match (parts.is_empty(), thai) {
@@ -769,6 +846,16 @@ fn apply(s: &mut App, done: Done) {
             Some(text) => s.ok(text),
             None => show_results(s, summary),
         },
+        Done::SyncSignInRejected(summary) => {
+            after_failure(s, account::SIGN_IN_INVALID);
+            // The pull's changes are written: say what they are under the sign-in text.
+            if let Some(toast) = &mut s.toast {
+                for line in summary_lines(&summary) {
+                    toast.text.push('\n');
+                    toast.text.push_str(&line);
+                }
+            }
+        }
         Done::Merged { project, summary } => merged(s, &project, summary),
         // The link picker was open while they loaded.
         Done::Groups(groups) => {
@@ -805,11 +892,11 @@ fn merged(s: &mut App, project: &str, mut summary: SyncSummary) {
         Some(results) => merge_into(results, project, summary),
         None => summary,
     };
+    // Another dialog (or the old results) closes first, as for a new sync.
+    s.close_dialog();
     if needs_person(&next) {
         s.sync_results = Some(next);
         s.dialog = Some(Dialog::SyncResults);
-    } else if s.dialog == Some(Dialog::SyncResults) {
-        s.close_dialog();
     }
     if clean {
         let mut text = tf!(
@@ -997,23 +1084,37 @@ impl App {
         start(self, syncing_label(), |bridge, home| {
             let u = account::session(home, &SystemStore::new(), bridge)?;
             let report = sync::pull(home, &u, None, None, bridge)?;
-            // Cancel was clicked during the pull: do not send anything.
-            if bridge.cancelled() {
-                return Err(CANCELLED.to_owned());
-            }
-            let pushed = sync::push(home, &u, None)?;
-            Ok(Done::SyncFinished(summarize(&report, &pushed)))
+            // From here the pull's changes are written, so they are shown whatever happens.
+            let push = if bridge.cancelled() {
+                // Cancel was clicked during the pull: do not send anything.
+                PushOutcome::Cancelled
+            } else {
+                match sync::push(home, &u, None) {
+                    Ok(pushed) => PushOutcome::Sent(pushed),
+                    Err(error) => PushOutcome::Failed(error),
+                }
+            };
+            sync_outcome(&report, push)
         });
     }
 
     /// **Merge** in the Sync results: pull the cloud project into the local project with the
     /// same name (`keyman pull <project>`).
     pub fn cloud_merge(&mut self, project: &str) {
+        // Not signed in, or the local project is linked to another cloud project: the pull
+        // cannot merge (the dialog shows no Merge then).
+        if !matches!(self.cloud, CloudState::SignedIn { .. }) || self.link_of(project).is_some() {
+            return;
+        }
         let project = project.to_owned();
         let label = t("Merging…", "กำลังรวม…");
         start(self, label, move |bridge, home| {
             let u = account::session(home, &SystemStore::new(), bridge)?;
             let report = sync::pull(home, &u, Some(&project), None, bridge)?;
+            // Cancel was clicked: no results dialog.
+            if bridge.cancelled() {
+                return Err(CANCELLED.to_owned());
+            }
             Ok(Done::Merged {
                 summary: summarize(&report, &[]),
                 project,
@@ -1641,16 +1742,20 @@ mod tests {
         );
         assert_eq!(
             toast_words(&summary(2, &["n"], 1), false).as_deref(),
-            Some("2 updated, 1 added, 1 sent.")
+            Some("2 projects updated, 1 added, 1 sent.")
         );
-        // Zero parts are left out.
+        // Zero parts are left out; the noun goes on the first part shown.
         assert_eq!(
-            toast_words(&summary(0, &["n", "m"], 0), false).as_deref(),
-            Some("2 added.")
+            toast_words(&summary(0, &["n", "m"], 1), false).as_deref(),
+            Some("2 projects added, 1 sent.")
         );
         assert_eq!(
             toast_words(&summary(1, &[], 3), false).as_deref(),
-            Some("1 updated, 3 sent.")
+            Some("1 project updated, 3 sent.")
+        );
+        assert_eq!(
+            toast_words(&summary(0, &[], 1), false).as_deref(),
+            Some("1 project sent.")
         );
         assert_eq!(
             toast_words(&summary(0, &[], 0), true).as_deref(),
@@ -1884,6 +1989,172 @@ mod tests {
         };
         finish(&mut app, None, Ok(done));
         assert!(app.dialog.is_none() && app.sync_results.is_none());
+    }
+
+    /// A pull that wrote changes: one project updated, one added, access given.
+    fn wrote() -> PullReport {
+        PullReport {
+            results: vec![
+                PullResult::Updated {
+                    project: "a".into(),
+                    changes: 1,
+                },
+                PullResult::Added("b".into()),
+            ],
+            given: vec![("team".into(), "x@y.z".into())],
+            warnings: Vec::new(),
+        }
+    }
+
+    fn finished(done: Result<Done, String>) -> SyncSummary {
+        match done {
+            Ok(Done::SyncFinished(summary)) => summary,
+            Ok(_) => panic!("not SyncFinished"),
+            Err(error) => panic!("Err({error})"),
+        }
+    }
+
+    #[test]
+    fn the_pull_results_stay_when_the_push_fails_or_is_cancelled() {
+        // The push stops: the pull's results stay, and the error is a line in the results.
+        let error = "Keyman cannot connect to Keyman Cloud.";
+        let got = finished(sync_outcome(&wrote(), PushOutcome::Failed(error.into())));
+        assert_eq!((got.updated, got.sent), (1, 0));
+        assert_eq!(got.added, vec!["b".to_string()]);
+        assert_eq!(got.given, wrote().given);
+        assert_eq!(got.warnings, vec![push_failed_line(error)]);
+        assert!(got.warnings[0].contains(error));
+        assert!(needs_person(&got), "the dialog shows the error");
+
+        // Cancel during the pull: the pull's results, no push, no error line.
+        let got = finished(sync_outcome(&wrote(), PushOutcome::Cancelled));
+        assert_eq!((got.updated, got.added.len(), got.sent), (1, 1, 0));
+        assert_eq!(got.given, wrote().given);
+        assert!(got.warnings.is_empty() && got.attention.is_empty());
+        // A cancel that changed nothing is a plain cancel (no toast).
+        let empty = PullReport {
+            results: vec![PullResult::UpToDate("a".into())],
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        assert!(matches!(
+            sync_outcome(&empty, PushOutcome::Cancelled),
+            Err(error) if error == CANCELLED
+        ));
+
+        // A sent push is the normal summary.
+        let pushed = vec![PushResult::Pushed {
+            project: "a".into(),
+            version: 2,
+        }];
+        assert_eq!(
+            finished(sync_outcome(&wrote(), PushOutcome::Sent(pushed))).sent,
+            1
+        );
+    }
+
+    #[test]
+    fn a_rejected_sign_in_at_the_push_keeps_the_pull_results() {
+        let done = sync_outcome(
+            &wrote(),
+            PushOutcome::Failed(account::SIGN_IN_INVALID.into()),
+        );
+        let mut app = App::for_tests();
+        app.cloud = CloudState::SignedIn {
+            email: "a@b.c".into(),
+        };
+        app.busy = busy("Syncing…");
+        finish(&mut app, None, done);
+        assert_eq!(app.cloud, CloudState::SignedOut);
+        assert_eq!(
+            app.dialog,
+            Some(Dialog::Settings(crate::SettingsPage::Account))
+        );
+        let toast = app.toast.as_ref().unwrap();
+        assert!(!toast.ok);
+        let mut lines = toast.text.lines();
+        assert!(REJECTED.contains(&lines.next().unwrap()), "{}", toast.text);
+        // Both languages carry the counts, the added name and the access line.
+        assert!(
+            toast.text.contains('1') && toast.text.contains("b"),
+            "{}",
+            toast.text
+        );
+        assert!(toast.text.contains("x@y.z"), "{}", toast.text);
+    }
+
+    #[test]
+    fn a_different_push_reason_is_kept() {
+        let report = PullReport {
+            results: vec![PullResult::Skipped {
+                project: "e".into(),
+                reason: "pull why".into(),
+            }],
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let pushed = [
+            PushResult::Skipped {
+                project: "e".into(),
+                reason: "push why".into(),
+            },
+            PushResult::Skipped {
+                project: "e".into(),
+                reason: "pull why".into(),
+            },
+            PushResult::CloudIsNewer("e".into()),
+        ];
+        let got = summarize(&report, &pushed);
+        assert_eq!(
+            got.attention,
+            vec![
+                Attention::Skipped {
+                    project: "e".into(),
+                    reason: "pull why".into()
+                },
+                Attention::Skipped {
+                    project: "e".into(),
+                    reason: "push why".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_needs_a_sign_in_and_an_unlinked_project() {
+        let mut app = App::for_tests();
+        app.home = no_home();
+        app.cloud_merge("f");
+        assert!(app.busy.is_none() && app.toast.is_none());
+        app.cloud = CloudState::SignedIn {
+            email: "a@b.c".into(),
+        };
+        app.link_status
+            .push(("f".into(), keyman_cli::cloud::sync::LinkStatus::Synced));
+        app.cloud_merge("f");
+        assert!(app.busy.is_none() && app.toast.is_none());
+    }
+
+    #[test]
+    fn a_merge_result_replaces_another_dialog() {
+        let mut app = App::for_tests();
+        app.dialog = Some(Dialog::Settings(crate::SettingsPage::Account));
+        // State of the dialog that closes.
+        app.recover_pick = true;
+        app.busy = busy("Merging…");
+        let mut stopped = summary(0, &[], 0);
+        stopped.attention.push(Attention::Stopped {
+            project: "f".into(),
+            conflicts: 1,
+        });
+        let done = Done::Merged {
+            project: "f".into(),
+            summary: stopped.clone(),
+        };
+        finish(&mut app, None, Ok(done));
+        assert_eq!(app.dialog, Some(Dialog::SyncResults));
+        assert_eq!(app.sync_results, Some(stopped));
+        assert!(!app.recover_pick);
     }
 
     #[test]
