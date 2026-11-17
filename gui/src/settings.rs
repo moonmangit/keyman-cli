@@ -82,6 +82,8 @@ pub struct Settings {
     pub rehide_on_switch: bool,
     /// Ask before overwriting an existing .env.
     pub confirm_overwrite: bool,
+    /// The Keyman Cloud first-use card was answered (signed in or skipped).
+    pub cloud_prompt_done: bool,
 }
 
 impl Default for Settings {
@@ -96,6 +98,7 @@ impl Default for Settings {
             remember_folders: true,
             rehide_on_switch: true,
             confirm_overwrite: true,
+            cloud_prompt_done: false,
         }
     }
 }
@@ -125,6 +128,9 @@ impl Settings {
             confirm_overwrite: prefs
                 .get("confirm_overwrite")
                 .unwrap_or(d.confirm_overwrite),
+            cloud_prompt_done: prefs
+                .get("cloud_prompt_done")
+                .unwrap_or(d.cloud_prompt_done),
         }
     }
 
@@ -138,7 +144,8 @@ impl Settings {
             prefs.set("git_warning", &self.git_warning)?;
             prefs.set("remember_folders", &self.remember_folders)?;
             prefs.set("rehide_on_switch", &self.rehide_on_switch)?;
-            prefs.set("confirm_overwrite", &self.confirm_overwrite)
+            prefs.set("confirm_overwrite", &self.confirm_overwrite)?;
+            prefs.set("cloud_prompt_done", &self.cloud_prompt_done)
         })();
         result.map_err(|error| format!("cannot save settings: {error:?}"))
     }
@@ -162,9 +169,24 @@ mod tests {
             remember_folders: false,
             rehide_on_switch: false,
             confirm_overwrite: false,
+            cloud_prompt_done: true,
         };
         changed.save(&mut prefs).unwrap();
         assert_eq!(Settings::load(&prefs), changed);
+    }
+
+    #[test]
+    fn skip_is_saved() {
+        let mut prefs = Prefs::memory();
+        // Prefs from before this setting: the card shows.
+        prefs.set("theme", "dark").unwrap();
+        assert!(!Settings::load(&prefs).cloud_prompt_done);
+        let skipped = Settings {
+            cloud_prompt_done: true,
+            ..Settings::default()
+        };
+        skipped.save(&mut prefs).unwrap();
+        assert!(Settings::load(&prefs).cloud_prompt_done);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use keyman_cli::save::Edit;
 use keyman_cli::ui::display_path;
 use rune::{Color, Cx, El, ScrollSpec, col, el, icon, row, text, text_input};
 
+use crate::cloud_views;
 use crate::core::{self, DiffLine, SavePreview};
 use crate::i18n::{self, count, t};
 use crate::icons as ic;
@@ -28,11 +29,24 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
 
     let body = match &s.master {
         Ok(master) => {
-            let page = match &s.selected {
+            let mut page = match &s.selected {
                 Some(name) if master.project(name).is_some() => project_page(s, p, name),
                 Some(name) => new_project_page(s, p, name),
                 None => empty_page(p),
             };
+            if cloud_views::show_first_use(
+                true,
+                &s.cloud,
+                s.settings.cloud_prompt_done,
+                s.dialog.is_some() || s.question.is_some(),
+            ) {
+                page = col()
+                    .key("with-first-use")
+                    .w_full()
+                    .gap(20.0)
+                    .child(cloud_views::first_use_card(s, p))
+                    .child(page);
+            }
             row()
                 .key("body")
                 .w_full()
@@ -56,11 +70,18 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
         .fill(p.bg)
         .child(titlebar(s, p, cx))
         .child(body);
-    if let Some(toast) = &s.toast {
-        root = root.child(toast_view(p, toast));
-    }
     if let Some(dialog) = s.dialog {
         root = root.child(dialog_view(s, p, dialog));
+    }
+    // A cloud task's question, above any dialog (the Account page under it, say).
+    if let Some(sheet) = cloud_views::question_dialog(s, p) {
+        root = root.child(
+            scrim(p, "question-scrim").child(sheet.modal(false, |s: &mut App| s.cloud_cancel())),
+        );
+    }
+    // Above the dialogs, so a notice from a cloud task (a wrong password) is not dimmed.
+    if let Some(toast) = &s.toast {
+        root = root.child(toast_view(p, toast));
     }
     if let Some(menu) = &s.menu {
         // Last frame's layout: the window's size, and the ⋯ button the panel drops from.
@@ -179,6 +200,7 @@ fn titlebar(s: &App, p: Paint, cx: &mut Cx<App>) -> El {
             },
             |_, tx| tx.toggle_full_screen(),
         ))
+        .child(cloud_views::cloud_button(s, p))
         .child(icon_button(
             p,
             "tb-help",
@@ -1269,17 +1291,22 @@ fn dialog_view(s: &App, p: Paint, dialog: Dialog) -> El {
         Dialog::Help(page) => help_dialog(p, page),
         Dialog::ConfirmOverwrite => confirm_dialog(s, p),
         Dialog::ConfirmWriteAll => confirm_all_dialog(s, p),
+        Dialog::ConfirmSignOut => cloud_views::confirm_sign_out(p),
         Dialog::Resolve => crate::resolve::resolve_dialog(s, p),
         Dialog::Panel => panel_dialog(s, p),
     };
-    el().key("scrim")
+    scrim(p, "scrim").child(sheet.modal(true, |s: &mut App| {
+        s.dialog = None;
+        s.panel = Panel::None;
+    }))
+}
+
+/// The dimmed layer under a modal sheet.
+fn scrim(p: Paint, key: &str) -> El {
+    el().key(key)
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
         .fill(Color::BLACK.alpha(if p.dark { 0.5 } else { 0.28 }))
         .center()
-        .child(sheet.modal(true, |s: &mut App| {
-            s.dialog = None;
-            s.panel = Panel::None;
-        }))
 }
 
 /// Compare or save-to-master, as a modal over the page.
@@ -1443,6 +1470,12 @@ fn settings_dialog(s: &App, p: Paint, page: SettingsPage) -> El {
             t("Privacy", "ความเป็นส่วนตัว"),
             page == Privacy,
             Dialog::Settings(Privacy),
+        ),
+        (
+            &ic::CLOUD,
+            t("Account", "บัญชี"),
+            page == Account,
+            Dialog::Settings(Account),
         ),
         (
             &ic::INFO,
@@ -1646,6 +1679,7 @@ fn settings_dialog(s: &App, p: Paint, page: SettingsPage) -> El {
                 );
             (t("Privacy", "ความเป็นส่วนตัว"), body)
         }
+        Account => (t("Account", "บัญชี"), cloud_views::account_page(s, p)),
         About => {
             let master_path = s.master.as_ref().ok().map(|m| m.path.clone());
             let info = |key: &str, label: &str, value: String| {

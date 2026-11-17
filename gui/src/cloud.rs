@@ -11,13 +11,14 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use keyman_cli::cloud::account::{self, Prompt};
-use keyman_cli::cloud::keystore::SystemStore;
+use keyman_cli::cloud::keystore::{self, Store, SystemStore};
 use keyman_cli::cloud::merge::Conflict;
 use keyman_cli::cloud::sync::Resolver as CloudResolver;
-use rune::AppHandle;
+use rune::{AppHandle, TextEdit};
 use zeroize::Zeroizing;
 
 use crate::App;
+use crate::cloud_views;
 use crate::i18n::t;
 
 /// What a bridge question gives the library when the person cancels it.
@@ -39,6 +40,60 @@ pub struct Busy {
     pub label: &'static str,
     /// Set to stop the task at its next question or in the browser wait.
     pub cancel: Arc<AtomicBool>,
+    /// The browser sign-in link, while the task waits for the browser. Not secret, but it is
+    /// not written to a log.
+    pub link: Option<String>,
+}
+
+impl Busy {
+    pub fn new(label: &'static str) -> Busy {
+        Busy {
+            label,
+            cancel: Arc::new(AtomicBool::new(false)),
+            link: None,
+        }
+    }
+}
+
+/// The busy label while the browser sign-in waits.
+pub fn waiting_label() -> &'static str {
+    t("Waiting for the browser…", "กำลังรอเบราว์เซอร์…")
+}
+
+/// The busy label after the browser sign-in, while Keyman sets up or opens the vault.
+pub fn signing_in_label() -> &'static str {
+    t("Signing in…", "กำลังลงชื่อเข้าใช้…")
+}
+
+/// The fields of the question dialogs. They are secure fields (masked, no copy, wiped on
+/// change and drop), and they are emptied when an answer is sent, when a question is dropped,
+/// and when a new question comes. No password or code stays in the app after an answer.
+pub struct Fields {
+    pub first: TextEdit,
+    pub second: TextEdit,
+}
+
+impl Default for Fields {
+    fn default() -> Fields {
+        Fields {
+            first: TextEdit::new("").secure(),
+            second: TextEdit::new("").secure(),
+        }
+    }
+}
+
+impl Fields {
+    pub fn clear(&mut self) {
+        self.first.clear();
+        self.second.clear();
+    }
+
+    /// The first field's text, moved out so that no copy stays here; both fields are cleared.
+    fn take(&mut self) -> String {
+        let text = std::mem::take(&mut self.first.text);
+        self.clear();
+        text
+    }
 }
 
 /// A question from the library for the person. Not `Clone`: secrets are not copied.
@@ -108,6 +163,12 @@ impl Question {
         // The thread may have stopped already; then nobody needs the answer.
         let _ = self.answer.send(reply);
     }
+
+    /// A question that no task waits for: for the headless scenes.
+    pub fn unanswered(ask: Ask) -> Question {
+        let (answer, _) = mpsc::channel();
+        Question { ask, answer }
+    }
 }
 
 /// Gives `ask` to `post` (which shows it) and waits for the answer. A question that is
@@ -133,6 +194,10 @@ pub trait Ui: Send + 'static {
     fn notice(&self, text: String) {
         self.run(Box::new(move |s| s.fail(text)));
     }
+
+    fn link(&self, url: String) {
+        self.run(Box::new(move |s| show_link(s, url)));
+    }
 }
 
 impl Ui for AppHandle<App> {
@@ -145,11 +210,29 @@ impl Ui for AppHandle<App> {
 /// task running, is dropped, which answers it with `Cancel`: the thread may have read the
 /// cancel flag just before the person clicked Cancel.
 pub fn post(s: &mut App, question: Question) {
-    if s.busy
-        .as_ref()
-        .is_some_and(|busy| !busy.cancel.load(Ordering::SeqCst))
+    if let Some(busy) = s
+        .busy
+        .as_mut()
+        .filter(|busy| !busy.cancel.load(Ordering::SeqCst))
     {
+        // A question after the browser wait: the browser part is done.
+        if busy.link.take().is_some() {
+            busy.label = signing_in_label();
+        }
+        s.cloud_fields.clear();
         s.question = Some(question);
+    }
+}
+
+/// Shows the browser sign-in link on the Account page while the task waits for the browser.
+fn show_link(s: &mut App, url: String) {
+    if let Some(busy) = s
+        .busy
+        .as_mut()
+        .filter(|busy| !busy.cancel.load(Ordering::SeqCst))
+    {
+        busy.link = Some(url);
+        busy.label = waiting_label();
     }
 }
 
@@ -236,6 +319,10 @@ impl<U: Ui> Prompt for Bridge<U> {
         self.handle.notice(text.to_owned());
     }
 
+    fn sign_in_link(&mut self, url: &str) {
+        self.handle.link(url.to_owned());
+    }
+
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
     }
@@ -266,8 +353,10 @@ pub enum Done {
     },
     SignedOut,
     Toast(String),
+    #[expect(dead_code, reason = "the Sync action (a later step) makes it")]
     SyncFinished(SyncSummary),
     /// The person's groups, `(vault id, name)`, for the link picker.
+    #[expect(dead_code, reason = "the link picker (a later step) makes it")]
     Groups(Vec<(String, String)>),
 }
 
@@ -285,6 +374,7 @@ pub struct SyncSummary {
 
 /// A project that needs the person after a sync.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(dead_code, reason = "the Sync action (a later step) makes these")]
 pub enum Attention {
     Skipped { project: String, reason: String },
     Stopped { project: String, conflicts: usize },
@@ -358,7 +448,11 @@ fn start_with<U: Ui + Clone>(
         });
     match spawned {
         Ok(_) => {
-            s.busy = Some(Busy { label, cancel });
+            s.busy = Some(Busy {
+                label,
+                cancel,
+                link: None,
+            });
             true
         }
         Err(error) => {
@@ -373,6 +467,7 @@ fn finish(s: &mut App, cloud: Option<CloudState>, result: Result<Done, String>) 
     s.busy = None;
     // Drops a question that is still open, so no dialog stays after its task.
     s.question = None;
+    s.cloud_fields.clear();
     if let Some(cloud) = cloud {
         s.cloud = cloud;
     }
@@ -408,6 +503,93 @@ fn apply(s: &mut App, done: Done) {
         )),
         // The link picker shows them (a later step).
         Done::Groups(_) => {}
+    }
+}
+
+/// The email of the sign-in that this computer saved, as the task's result.
+fn signed_in_as(home: &Path, store: &dyn Store) -> Result<Done, String> {
+    let email = account::signed_in_offline(home, store)?.unwrap_or_default();
+    Ok(Done::SignedIn { email })
+}
+
+/// Whether this computer has a credential store. Without one, the library asks for the vault
+/// password at each cloud task. A local read, no network.
+pub fn store_available() -> bool {
+    keystore::system_available()
+}
+
+// ── App actions ─────────────────────────────────────────────────────────────
+
+impl App {
+    /// Signs in with the browser (`provider` is "github" or "google"), then sets up the vault
+    /// (a new account) or opens it (an old one).
+    pub fn cloud_sign_in(&mut self, provider: &'static str) {
+        self.recover_pick = false;
+        start(self, waiting_label(), move |bridge, home| {
+            let store = SystemStore::new();
+            account::login(home, &store, provider, bridge)?;
+            signed_in_as(home, &store)
+        });
+    }
+
+    /// Sets a new vault password with the recovery code. With no saved sign-in, it signs in
+    /// with `provider` first.
+    pub fn cloud_recover(&mut self, provider: &'static str) {
+        self.recover_pick = false;
+        start(self, signing_in_label(), move |bridge, home| {
+            account::recover(home, &SystemStore::new(), &mut || Ok(provider), bridge)?;
+            Ok(Done::Toast(
+                t("The new vault password is set.", "ตั้งรหัสผ่านตู้นิรภัยใหม่แล้ว").to_owned(),
+            ))
+        });
+    }
+
+    pub fn cloud_change_password(&mut self) {
+        let label = t("Changing the vault password…", "กำลังเปลี่ยนรหัสผ่านตู้นิรภัย…");
+        start(self, label, |bridge, home| {
+            account::change_password(home, &SystemStore::new(), bridge)?;
+            Ok(Done::Toast(
+                t("The vault password is changed.", "เปลี่ยนรหัสผ่านตู้นิรภัยแล้ว").to_owned(),
+            ))
+        });
+    }
+
+    /// Signs out (the Account page asks first). Links stay.
+    pub fn cloud_sign_out(&mut self) {
+        start(
+            self,
+            t("Signing out…", "กำลังออกจากระบบ…"),
+            |_, home| {
+                account::logout(home, &SystemStore::new())?;
+                Ok(Done::SignedOut)
+            },
+        );
+    }
+
+    /// Stops the running cloud task; an open question gets `Cancel`.
+    pub fn cloud_cancel(&mut self) {
+        cancel(self);
+        self.cloud_fields.clear();
+    }
+
+    /// Sends the open question's answer from the dialog fields, when they are complete, then
+    /// empties the fields.
+    pub fn cloud_answer(&mut self) {
+        let ready = self.question.as_ref().is_some_and(|question| {
+            cloud_views::can_answer(
+                &question.ask,
+                &self.cloud_fields.first.text,
+                &self.cloud_fields.second.text,
+            )
+        });
+        if ready && let Some(question) = self.question.take() {
+            question.answer(Reply::Text(self.cloud_fields.take()));
+        }
+    }
+
+    /// The first-use card's **Skip**: it does not show again.
+    pub fn skip_cloud_prompt(&mut self) {
+        self.update_settings(|st| st.cloud_prompt_done = true);
     }
 }
 
@@ -457,10 +639,7 @@ mod tests {
     }
 
     fn busy(label: &'static str) -> Option<Busy> {
-        Some(Busy {
-            label,
-            cancel: Arc::new(AtomicBool::new(false)),
-        })
+        Some(Busy::new(label))
     }
 
     fn conflict() -> Conflict {
@@ -734,6 +913,94 @@ mod tests {
             app.toast
                 .as_ref()
                 .is_some_and(|toast| !toast.ok && toast.text == "boom")
+        );
+    }
+
+    #[test]
+    fn the_sign_in_link_shows_while_the_browser_waits() {
+        let mut app = App::for_tests();
+        app.busy = busy("Signing in…");
+        let (tx, rx) = mpsc::channel();
+        let mut b = Bridge::new(QueueUi(tx), Arc::new(AtomicBool::new(false)));
+        b.sign_in_link("https://example.test/authorize?x=1");
+        rx.recv_timeout(Duration::from_secs(1)).unwrap()(&mut app);
+        let now = app.busy.as_ref().unwrap();
+        assert_eq!(
+            now.link.as_deref(),
+            Some("https://example.test/authorize?x=1")
+        );
+        assert_eq!(now.label, waiting_label());
+
+        // The first question ends the browser part.
+        let (waiting, question) = waiting_thread(Ask::NewPassword);
+        post(&mut app, question);
+        let now = app.busy.as_ref().unwrap();
+        assert!(now.link.is_none());
+        assert_eq!(now.label, signing_in_label());
+        cancel(&mut app);
+        assert_eq!(waiting.join().unwrap(), Reply::Cancel);
+
+        // After Cancel, a late link is not shown.
+        b.sign_in_link("https://example.test/late");
+        rx.recv_timeout(Duration::from_secs(1)).unwrap()(&mut app);
+        assert!(app.busy.as_ref().unwrap().link.is_none());
+    }
+
+    #[test]
+    fn an_answer_empties_the_fields() {
+        let mut app = App::for_tests();
+        app.busy = busy("Signing in…");
+        let (waiting, question) = waiting_thread(Ask::NewPassword);
+        post(&mut app, question);
+        app.cloud_fields.first.replace_text("abcdefghij");
+        app.cloud_fields.second.replace_text("abcdefghik");
+        // Not the same: nothing is sent.
+        app.cloud_answer();
+        assert!(app.question.is_some());
+        app.cloud_fields.second.replace_text("abcdefghij");
+        app.cloud_answer();
+        assert!(app.question.is_none());
+        assert!(app.cloud_fields.first.text.is_empty() && app.cloud_fields.second.text.is_empty());
+        assert_eq!(waiting.join().unwrap(), Reply::Text("abcdefghij".into()));
+
+        // Cancel empties them too, and a new question starts with empty fields.
+        let (waiting, question) = waiting_thread(Ask::Password { tries_left: 3 });
+        post(&mut app, question);
+        app.cloud_fields.first.replace_text("typed");
+        app.cloud_cancel();
+        assert!(app.cloud_fields.first.text.is_empty());
+        assert_eq!(waiting.join().unwrap(), Reply::Cancel);
+
+        app.busy = busy("Signing in…");
+        app.cloud_fields.first.replace_text("left over");
+        let (waiting, question) = waiting_thread(Ask::RecoveryCode);
+        post(&mut app, question);
+        assert!(app.cloud_fields.first.text.is_empty());
+        app.cloud_fields.first.replace_text("ABCD-EFGH");
+        app.cloud_answer();
+        assert_eq!(waiting.join().unwrap(), Reply::Text("ABCD-EFGH".into()));
+    }
+
+    #[test]
+    fn the_recovery_code_dialog_answers_with_the_typed_code() {
+        let mut app = App::for_tests();
+        app.busy = busy("Signing in…");
+        let code = "ABCD-EFGH-JKMN-PQRS";
+        let (waiting, question) =
+            waiting_thread(Ask::ShowRecoveryCode(Zeroizing::new(code.into())));
+        post(&mut app, question);
+        app.cloud_fields.first.replace_text("abcd efgh jkmn pqr");
+        app.cloud_answer();
+        assert!(
+            app.question.is_some(),
+            "a wrong code does not close the dialog"
+        );
+        app.cloud_fields.first.replace_text("abcd-efgh jkmn pqrs");
+        app.cloud_answer();
+        assert!(app.question.is_none());
+        assert_eq!(
+            waiting.join().unwrap(),
+            Reply::Text("abcd-efgh jkmn pqrs".into())
         );
     }
 }

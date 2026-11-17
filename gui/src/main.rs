@@ -6,9 +6,8 @@
 
 #[macro_use]
 mod i18n;
-// The cloud screens (sign-in, link, sync) use this; until then parts are unused.
-#[allow(dead_code)]
 mod cloud;
+mod cloud_views;
 mod core;
 mod diagram;
 mod icons;
@@ -30,7 +29,7 @@ use rune::{
     App as RuneApp, AppHandle, AppSpec, FileDialogOptions, Key, KeyEvent, TextEdit, Titlebar, Tx,
 };
 
-use crate::cloud::{Busy, CloudState, Question};
+use crate::cloud::{Ask, Busy, CloudState, Question};
 use crate::core::{Conflict, DiffLine, FolderStatus, Master, SavePreview};
 use crate::i18n::{count, t};
 use crate::settings::Settings;
@@ -45,6 +44,7 @@ pub enum SettingsPage {
     General,
     Appearance,
     Privacy,
+    Account,
     About,
 }
 
@@ -61,6 +61,7 @@ pub enum Dialog {
     Help(HelpPage),
     ConfirmOverwrite,
     ConfirmWriteAll,
+    ConfirmSignOut,
     Resolve,
     /// The compare or save-to-master preview in `App::panel`.
     Panel,
@@ -142,6 +143,12 @@ pub struct App {
     pub busy: Option<Busy>,
     /// The cloud task's question that waits for a dialog answer.
     pub question: Option<Question>,
+    /// The fields of the question dialogs; empty again after each answer.
+    pub cloud_fields: cloud::Fields,
+    /// The Account page asks GitHub or Google for **Use recovery code**.
+    pub recover_pick: bool,
+    /// This computer has a credential store (read once at start).
+    pub cloud_store: bool,
 }
 
 impl App {
@@ -151,6 +158,7 @@ impl App {
             .as_deref()
             .map_or(CloudState::SignedOut, cloud::initial_state);
         let mut app = App::build(handle, prefs, home, cloud);
+        app.cloud_store = cloud::store_available();
         i18n::set(app.settings.language);
         app.reload();
         app
@@ -195,6 +203,9 @@ impl App {
             cloud,
             busy: None,
             question: None,
+            cloud_fields: cloud::Fields::default(),
+            recover_pick: false,
+            cloud_store: true,
         }
     }
 
@@ -806,6 +817,11 @@ pub fn open_link(s: &mut App, tx: &mut Tx, url: &str) {
 
 /// App-wide shortcuts. ⌘ on macOS, Ctrl on Windows.
 fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    // A cloud question is above every dialog: Escape cancels its task.
+    if ev.key == Key::Escape && s.question.is_some() {
+        s.cloud_cancel();
+        return true;
+    }
     if ev.key == Key::Escape && s.menu.is_some() {
         s.menu = None;
         return true;
@@ -853,6 +869,28 @@ fn set_icon() {
 fn thai(s: &mut App) {
     s.settings.language = i18n::Language::Thai;
     i18n::set(i18n::Language::Thai);
+}
+
+/// A sample recovery code for the scenes (not a real one).
+const SCENE_CODE: &str = "7K2M-QD9T-4XWB-HN3R-V8JC-P6YF-1EAZ-G5SL";
+
+/// English, whatever the system language: the cloud scenes check the English text.
+fn english(s: &mut App) {
+    s.settings.language = i18n::Language::English;
+    i18n::set(i18n::Language::English);
+}
+
+/// The Account page, signed out, with no task.
+fn cloud_signed_out(s: &mut App) {
+    s.cloud = CloudState::SignedOut;
+    s.dialog = Some(Dialog::Settings(SettingsPage::Account));
+}
+
+/// A cloud question over the Account page, while a sign-in runs.
+fn cloud_question(s: &mut App, ask: Ask) {
+    cloud_signed_out(s);
+    s.busy = Some(Busy::new(cloud::signing_in_label()));
+    s.question = Some(Question::unanswered(ask));
 }
 
 fn main() {
@@ -934,6 +972,55 @@ fn main() {
             ("th-help", |s| {
                 thai(s);
                 s.dialog = Some(Dialog::Help(HelpPage::Start));
+            }),
+            ("cloud-signed-out", |s| {
+                english(s);
+                cloud_signed_out(s);
+                // Shows the line for a computer without a credential store.
+                s.cloud_store = false;
+            }),
+            ("cloud-signed-in", |s| {
+                english(s);
+                s.cloud = CloudState::SignedIn {
+                    email: "dana@example.com".into(),
+                };
+                s.dialog = Some(Dialog::Settings(SettingsPage::Account));
+            }),
+            ("cloud-busy", |s| {
+                english(s);
+                cloud_signed_out(s);
+                let mut busy = Busy::new(cloud::waiting_label());
+                busy.link = Some(
+                    "https://keyman.example.com/auth/v1/authorize?provider=github&redirect_to=http%3A%2F%2F127.0.0.1%3A47821%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into(),
+                );
+                s.busy = Some(busy);
+            }),
+            ("cloud-first-use", |s| {
+                english(s);
+                s.cloud = CloudState::SignedOut;
+                s.settings.cloud_prompt_done = false;
+            }),
+            ("cloud-new-password", |s| {
+                english(s);
+                cloud_question(s, Ask::NewPassword);
+                s.cloud_fields.first.replace_text("short");
+            }),
+            ("cloud-recovery-code", |s| {
+                english(s);
+                cloud_question(s, Ask::ShowRecoveryCode(SCENE_CODE.to_owned().into()));
+            }),
+            ("cloud-password", |s| {
+                english(s);
+                cloud_question(s, Ask::Password { tries_left: 2 });
+                s.show_toast(false, "The vault password is not correct.".into());
+            }),
+            ("th-cloud-signed-out", |s| {
+                thai(s);
+                cloud_signed_out(s);
+            }),
+            ("th-cloud-recovery-code", |s| {
+                thai(s);
+                cloud_question(s, Ask::ShowRecoveryCode(SCENE_CODE.to_owned().into()));
             }),
         ],
         ..AppSpec::new(

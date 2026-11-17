@@ -49,4 +49,8 @@ icons! {
     MERGE = r#"<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 7v10M6 9c0 3 3 3 6 3h4"/>"#;
     MORE = r#"<path d="M5.5 12h.01M12 12h.01M18.5 12h.01" stroke-width="3"/>"#;
     CHEVRON_RIGHT = r#"<path d="m9.5 6 6 6-6 6"/>"#;
+    CLOUD = r#"<path d="M7 19h10.5a4.5 4.5 0 0 0 .6-8.96A6.5 6.5 0 0 0 5.5 9.2 4.9 4.9 0 0 0 7 19z"/>"#;
+    CLOUD_CHECK = r#"<path d="M7 19h10.5a4.5 4.5 0 0 0 .6-8.96A6.5 6.5 0 0 0 5.5 9.2 4.9 4.9 0 0 0 7 19z"/><path d="m9.3 14.2 2 2 3.6-3.6"/>"#;
+    CLOUD_UP = r#"<path d="M7 19h10.5a4.5 4.5 0 0 0 .6-8.96A6.5 6.5 0 0 0 5.5 9.2 4.9 4.9 0 0 0 7 19z"/><path d="M12 16.5v-5M9.8 13.6 12 11.4l2.2 2.2"/>"#;
+    LOCK = r#"<rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/>"#;
 }
