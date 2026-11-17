@@ -450,6 +450,13 @@ pub trait Resolver {
     /// Called once, right after `pull` gave access to invited people and
     /// before any other work: `(group, email)` and warnings about invites.
     fn invites(&mut self, _given: &[(String, String)], _warnings: &[String]) {}
+
+    /// Whether the person stopped the pull. `pull` asks before each cloud
+    /// project and then stops with the results so far; the projects after it
+    /// stay as they are.
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -510,6 +517,24 @@ pub fn pull(
     let mut ids: Vec<String> = vaults.by_id.keys().cloned().collect();
     ids.sort();
     let rows = u.api.projects(&ids)?;
+    let results = pull_rows(home, &vaults, &rows, project, local_name, resolver)?;
+    Ok(PullReport {
+        results,
+        given: accepted.given,
+        warnings: accepted.warnings,
+    })
+}
+
+/// The part of `pull` after the server calls: one result per cloud row, then
+/// the links whose cloud project is gone.
+fn pull_rows(
+    home: &Path,
+    vaults: &Vaults,
+    rows: &[CloudProject],
+    project: Option<&str>,
+    local_name: Option<&str>,
+    resolver: &mut dyn Resolver,
+) -> Result<Vec<PullResult>, String> {
     let mut st = state::load(home)?;
     if let Some(wanted) = project {
         let unlinked: Vec<String> = rows
@@ -528,7 +553,12 @@ pub fn pull(
     let mut seen: HashSet<String> = HashSet::new();
     let mut matched = false;
 
-    for row in &rows {
+    for row in rows {
+        // Stopped: the results so far. The rows after this one are not read,
+        // so no link is called gone below.
+        if resolver.stopped() {
+            return Ok(results);
+        }
         seen.insert(row.id.clone());
         let linked = st.link_by_cloud_id(&row.id).cloned();
         if let (Some(existing), Some(wanted)) = (&linked, project) {
@@ -706,11 +736,7 @@ pub fn pull(
             ));
         }
     }
-    Ok(PullReport {
-        results,
-        given: accepted.given,
-        warnings: accepted.warnings,
-    })
+    Ok(results)
 }
 
 /// Merges base, local and cloud. `Ok(None)` means the resolver stopped.
@@ -1390,6 +1416,102 @@ mod tests {
         fn invites(&mut self, given: &[(String, String)], _warnings: &[String]) {
             self.0.push(format!("invites {}", given.len()));
         }
+    }
+
+    /// A resolver whose `stopped` turns true at call `after` (0 = at once).
+    struct StopAt {
+        calls: std::cell::Cell<usize>,
+        after: usize,
+    }
+
+    impl Resolver for StopAt {
+        fn resolve(
+            &mut self,
+            _project: &str,
+            _conflicts: &[Conflict],
+        ) -> Result<Option<Vec<Option<String>>>, String> {
+            Ok(None)
+        }
+        fn stopped(&self) -> bool {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            n >= self.after
+        }
+    }
+
+    /// Two cloud projects, "a" and "b", in the personal vault "vault".
+    fn two_cloud_projects() -> (Vaults, Vec<CloudProject>) {
+        let pair = KeyPair::generate();
+        let key = Key::random();
+        let rows = ["a", "b"]
+            .iter()
+            .map(|name| {
+                let id = format!("cloud-{name}");
+                CloudProject {
+                    sealed: crypto::seal_project(&key, &id, 1, name, &v(&[("A", "1")])),
+                    id,
+                    vault_id: "vault".to_string(),
+                    version: 1,
+                    key_generation: 1,
+                    updated_at: String::new(),
+                }
+            })
+            .collect();
+        let memberships = [member(&pair, "vault", "personal", "vault", &key)];
+        (Vaults::from_pair(&pair, &memberships, Some("vault")), rows)
+    }
+
+    #[test]
+    fn a_stopped_pull_leaves_the_projects_after_it() {
+        let (vaults, rows) = two_cloud_projects();
+        let home = home_with(
+            "other:
+  X: \"1\"
+",
+            Vec::new(),
+        );
+        let mut stop = StopAt {
+            calls: std::cell::Cell::new(0),
+            after: 1,
+        };
+        let results = pull_rows(&home, &vaults, &rows, None, None, &mut stop).unwrap();
+        // Only the first row is done; "b" is not written and not linked.
+        assert_eq!(results, vec![PullResult::Added("a".into())]);
+        let names = master::project_names(&master::read_master(&home).unwrap().1).unwrap();
+        assert!(names.contains(&"a".to_string()));
+        assert!(!names.contains(&"b".to_string()));
+        let st = state::load(&home).unwrap();
+        assert!(st.link("a").is_some() && st.link("b").is_none());
+
+        // Not stopped: both rows are done (the default resolver never stops).
+        let home = home_with(
+            "other:
+  X: \"1\"
+",
+            Vec::new(),
+        );
+        let mut plain = Fixed(None, 0);
+        assert!(!plain.stopped());
+        let results = pull_rows(&home, &vaults, &rows, None, None, &mut plain).unwrap();
+        assert_eq!(
+            results,
+            vec![PullResult::Added("a".into()), PullResult::Added("b".into())]
+        );
+
+        // Stopped before the first row: nothing is done, and a link whose row
+        // was not read is not called gone.
+        let home = home_with(
+            "other:
+  X: \"1\"
+",
+            vec![link_of("x", v(&[]))],
+        );
+        let mut at_once = StopAt {
+            calls: std::cell::Cell::new(0),
+            after: 0,
+        };
+        let results = pull_rows(&home, &vaults, &rows, None, None, &mut at_once).unwrap();
+        assert!(results.is_empty(), "{results:?}");
     }
 
     #[test]
