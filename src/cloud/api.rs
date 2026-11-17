@@ -223,12 +223,56 @@ pub fn exchange_code(cfg: &Config, code: &str, verifier: &str) -> Result<Session
     )
 }
 
-pub fn refresh(cfg: &Config, refresh_token: &str) -> Result<Session, String> {
-    token_request(
+/// Why a refresh did not work.
+#[derive(Debug, PartialEq)]
+pub enum RefreshError {
+    /// The server does not accept the refresh token. The sign-in is over.
+    Rejected,
+    /// A network problem, a server problem, or a reply Keyman cannot read.
+    /// The refresh token may still be good.
+    Unavailable(String),
+}
+
+const UNAVAILABLE: &str = "The Keyman server is not available now. Try again later.";
+
+/// Sort a failed refresh reply. Only a clear "bad refresh token" answer
+/// (HTTP 400, 401 or 403 with a known error code) is `Rejected`.
+pub fn classify_refresh_failure(status: u16, body: &str) -> RefreshError {
+    const REJECTED: [&str; 3] = [
+        "invalid_grant",
+        "refresh_token_not_found",
+        "refresh_token_already_used",
+    ];
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let rejected = [400, 401, 403].contains(&status)
+        && ["error", "error_code", "code"].iter().any(|key| {
+            v.get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|code| REJECTED.contains(&code))
+        });
+    if rejected {
+        RefreshError::Rejected
+    } else {
+        RefreshError::Unavailable(UNAVAILABLE.to_string())
+    }
+}
+
+pub fn refresh(cfg: &Config, refresh_token: &str) -> Result<Session, RefreshError> {
+    let body = json!({"refresh_token": refresh_token});
+    let reply = send_once(
         cfg,
+        None,
+        "POST",
         "/auth/v1/token?grant_type=refresh_token",
-        json!({"refresh_token": refresh_token}),
+        None,
+        Some(&body),
     )
+    .map_err(RefreshError::Unavailable)?;
+    if reply.status >= 400 {
+        return Err(classify_refresh_failure(reply.status, &reply.body));
+    }
+    parse_session(&reply.body, now())
+        .map_err(|_| RefreshError::Unavailable(UNAVAILABLE.to_string()))
 }
 
 pub fn sign_out(cfg: &Config, session: &Session) -> Result<(), String> {
@@ -596,5 +640,31 @@ mod tests {
         let (c, m) = error_fields(r#"{"code":"40P01","message":"deadlock detected"}"#);
         assert_eq!((c.as_str(), m.as_str()), ("40P01", "deadlock detected"));
         assert_eq!(error_fields(r#"{"code":400,"msg":"bad"}"#).1, "bad");
+    }
+
+    #[test]
+    fn refresh_failures_are_classified() {
+        let c = classify_refresh_failure;
+        let keep = |e: RefreshError| matches!(e, RefreshError::Unavailable(_));
+        assert_eq!(
+            c(400, r#"{"error":"invalid_grant"}"#),
+            RefreshError::Rejected
+        );
+        assert_eq!(
+            c(
+                400,
+                r#"{"code":400,"error_code":"refresh_token_already_used","msg":"x"}"#
+            ),
+            RefreshError::Rejected
+        );
+        assert_eq!(
+            c(401, r#"{"error_code":"refresh_token_not_found"}"#),
+            RefreshError::Rejected
+        );
+        assert!(keep(c(503, "<html>down</html>")));
+        assert!(keep(c(503, r#"{"error":"invalid_grant"}"#)));
+        assert!(keep(c(429, r#"{"error_code":"over_request_rate_limit"}"#)));
+        assert!(keep(c(500, "")));
+        assert!(keep(c(400, r#"{"error":"other"}"#)));
     }
 }

@@ -23,6 +23,7 @@ const CODE_MISMATCH: &str =
 const SIGN_IN_INVALID: &str = "Your sign-in is not valid now. Run 'keyman login'.";
 const WRONG_OWNER: &str = "The profile on the server is for a different user. Keyman stops.";
 const SESSION: &str = "session";
+const LEGACY_KEY: &str = "private_key";
 const NO_CLOUD: &str = "You do not have Keyman Cloud yet. Run 'keyman login' to set it up.";
 const RECOVER_HINT: &str = "Run 'keyman recover' to use your recovery code.";
 const USER_SWITCHED: &str = "You signed in as a different user. Keyman removed the cloud links of the old user. Your local projects did not change.";
@@ -373,6 +374,9 @@ fn finish_login(
     // The session entry comes first, then the key.
     store_session(home, store, session)?;
     remember_key(store, &session.user_id, &pair)?;
+    if store.available() {
+        forget_legacy_key(store);
+    }
     Ok(outcome)
 }
 
@@ -396,12 +400,12 @@ fn signed_in(home: &Path, store: &dyn Store) -> Result<Api, String> {
     let cfg = config();
     let session = match api::refresh(&cfg, &token) {
         Ok(session) => session,
-        // A network problem is not a bad sign-in: keep the session.
-        Err(error) if error.starts_with("cannot connect") => return Err(error),
-        Err(_) => {
+        // Only a clear "bad token" answer ends the sign-in.
+        Err(api::RefreshError::Rejected) => {
             drop_session(home, store);
             return Err(SIGN_IN_INVALID.to_string());
         }
+        Err(api::RefreshError::Unavailable(message)) => return Err(message),
     };
     store_session(home, store, &session)?;
     Ok(Api::new(cfg, session))
@@ -504,23 +508,42 @@ pub fn change_password(
 /// Sign out on the server (network errors are ignored), then remove the
 /// keys and the token from this computer. Links stay.
 pub fn logout(home: &Path, store: &dyn Store) -> Result<(), String> {
-    let mut st = state::load(home)?;
-    let token = saved_refresh_token(store, &st).ok().flatten();
-    let key_name = st.user_id.as_deref().map(key_entry);
-    if let Some(token) = token {
+    let st = state::load(home)?;
+    if let Some(token) = saved_refresh_token(store, &st).ok().flatten() {
         let cfg = config();
         if let Ok(session) = api::refresh(&cfg, &token) {
             let _ = api::sign_out(&cfg, &session);
         }
     }
+    forget_local(home, store)
+}
+
+/// Remove the session, the keys and the email from this computer.
+fn forget_local(home: &Path, store: &dyn Store) -> Result<(), String> {
+    let mut st = state::load(home)?;
     let mut failure = None;
     if store.available() {
-        let names = key_name.iter().map(String::as_str).chain([SESSION]);
-        for name in names {
+        // The key belongs to the user of the saved session. The user in the
+        // state file is the fallback. Remove both entries if they differ.
+        let from_session = store
+            .get(SESSION)
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<StoredSession>(&json).ok())
+            .map(|stored| stored.user_id);
+        let mut names: Vec<String> = [from_session, st.user_id.clone()]
+            .into_iter()
+            .flatten()
+            .map(|id| key_entry(&id))
+            .collect();
+        names.dedup();
+        names.push(SESSION.to_string());
+        for name in &names {
             if let Err(error) = store.delete(name) {
                 failure.get_or_insert(error);
             }
         }
+        forget_legacy_key(store);
     }
     // The user id stays (it is not secret). It lets the next sign-in see
     // a different user and remove the old links.
@@ -528,6 +551,11 @@ pub fn logout(home: &Path, store: &dyn Store) -> Result<(), String> {
     st.refresh_token = None;
     state::save(home, &st)?;
     failure.map_or(Ok(()), Err)
+}
+
+/// Old versions used one global key entry. Remove it (errors are ignored).
+fn forget_legacy_key(store: &dyn Store) {
+    let _ = store.delete(LEGACY_KEY);
 }
 
 #[cfg(test)]
@@ -852,5 +880,24 @@ mod tests {
         let switched = state::load(&home).unwrap();
         assert!(switched.links.is_empty());
         assert_eq!(switched.user_id.as_deref(), Some("user-B"));
+    }
+
+    #[test]
+    fn logout_removes_the_key_of_the_session_user() {
+        let home = temp_home("forget");
+        let store = crate::cloud::keystore::MemoryStore::new();
+        let mut other = sample_session();
+        other.user_id = "user-B".into();
+        store_session(&home, &store, &other).unwrap();
+        remember_key(&store, "user-B", &KeyPair::generate()).unwrap();
+        store.set(LEGACY_KEY, "old").unwrap();
+        // The state file has no user.
+        let mut st = state::load(&home).unwrap();
+        st.user_id = None;
+        state::save(&home, &st).unwrap();
+        forget_local(&home, &store).unwrap();
+        assert!(stored_key(&store, "user-B").unwrap().is_none());
+        assert_eq!(store.get(SESSION).unwrap(), None);
+        assert_eq!(store.get(LEGACY_KEY).unwrap(), None);
     }
 }
