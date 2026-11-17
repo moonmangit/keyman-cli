@@ -263,6 +263,9 @@ pub struct Bridge<U: Ui = AppHandle<App>> {
     tries: u8,
     /// The code typed in the recovery code dialog: the answer to the next `recovery_code`.
     typed_code: Option<Zeroizing<String>>,
+    /// Notices that show with the task's result, for example a user switch. A toast now would
+    /// go at once: the result's toast takes its place.
+    kept: Vec<String>,
 }
 
 impl<U: Ui> Bridge<U> {
@@ -272,6 +275,7 @@ impl<U: Ui> Bridge<U> {
             cancel,
             tries: 0,
             typed_code: None,
+            kept: Vec::new(),
         }
     }
 
@@ -323,8 +327,14 @@ impl<U: Ui> Prompt for Bridge<U> {
         }
     }
 
+    /// A "try again" notice shows at once, above the next question. Other notices show with
+    /// the task's result.
     fn notice(&mut self, text: &str) {
-        self.handle.notice(text.to_owned());
+        if is_retry(text) {
+            self.handle.notice(text.to_owned());
+        } else {
+            self.kept.push(app_wording(text));
+        }
     }
 
     fn sign_in_link(&mut self, url: &str) {
@@ -336,7 +346,17 @@ impl<U: Ui> Prompt for Bridge<U> {
     }
 }
 
+/// Whether a library notice asks the person to try again now (a wrong password or code).
+fn is_retry(text: &str) -> bool {
+    text == account::WRONG_PASSWORD || text == account::CODE_RETRY
+}
+
 impl<U: Ui> CloudResolver for Bridge<U> {
+    /// Cancel stops the pull before its next project.
+    fn stopped(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
     fn resolve(
         &mut self,
         project: &str,
@@ -361,6 +381,8 @@ pub enum Done {
     },
     SignedOut,
     Toast(String),
+    /// A new vault password is set with the recovery code.
+    Recovered,
     SyncFinished(SyncSummary),
     /// The server did not accept the sign-in during the push. The pull's results were
     /// written; the toast lists them after the sign-in text.
@@ -384,6 +406,8 @@ pub struct SyncSummary {
     /// `(group, email)` of the people who got access.
     pub given: Vec<(String, String)>,
     pub warnings: Vec<String>,
+    /// The sync stopped after the pull: Keyman did not send this computer's changes.
+    pub not_sent: bool,
 }
 
 /// A project that needs the person after a sync.
@@ -414,6 +438,7 @@ pub fn summarize(report: &PullReport, pushed: &[PushResult]) -> SyncSummary {
         attention: Vec::new(),
         given: report.given.clone(),
         warnings: report.warnings.clone(),
+        not_sent: false,
     };
     for result in &report.results {
         match result {
@@ -480,7 +505,7 @@ pub fn sync_outcome(report: &PullReport, push: PushOutcome) -> Result<Done, Stri
     match push {
         PushOutcome::Sent(pushed) => Ok(Done::SyncFinished(summarize(report, &pushed))),
         PushOutcome::Cancelled => {
-            let summary = summarize(report, &[]);
+            let mut summary = summarize(report, &[]);
             let nothing = summary.updated == 0
                 && summary.added.is_empty()
                 && summary.given.is_empty()
@@ -488,6 +513,7 @@ pub fn sync_outcome(report: &PullReport, push: PushOutcome) -> Result<Done, Stri
             if nothing {
                 Err(CANCELLED.to_owned())
             } else {
+                summary.not_sent = true;
                 Ok(Done::SyncFinished(summary))
             }
         }
@@ -519,6 +545,9 @@ pub fn summary_lines(summary: &SyncSummary) -> Vec<String> {
         .then(|| counts_text(summary))
         .into_iter()
         .collect();
+    if summary.not_sent {
+        lines.push(not_sent_line().to_owned());
+    }
     lines.extend(
         crate::cloud_views::attention_rows(summary, |_| false)
             .into_iter()
@@ -571,6 +600,10 @@ fn toast_words(summary: &SyncSummary, thai: bool) -> Option<String> {
         return None;
     }
     let mut text = counts_words(summary, thai);
+    if summary.not_sent {
+        text.push('\n');
+        text.push_str(not_sent_words(thai));
+    }
     for (group, email) in &summary.given {
         text.push('\n');
         text.push_str(&given_words(group, email, thai));
@@ -633,6 +666,7 @@ pub fn merge_into(mut results: SyncSummary, project: &str, merged: SyncSummary) 
     results.attention.extend(merged.attention);
     results.given.extend(merged.given);
     results.warnings.extend(merged.warnings);
+    results.not_sent |= merged.not_sent;
     results
 }
 
@@ -644,21 +678,36 @@ pub fn sign_in_rejected_text() -> &'static str {
     )
 }
 
-/// A cloud task failed: back to idle, then tell the person. A sign-in that the server does
-/// not accept signs the app out and opens Settings › Account. A cancel shows nothing.
+/// The text when the server did not accept the sign-in for one call, but this computer still
+/// has the saved sign-in (for example, an access token that expired during the task).
+pub fn sign_in_expired_text() -> &'static str {
+    t(
+        "The sign-in expired. Click the action again.",
+        "การลงชื่อเข้าใช้หมดเวลาแล้ว กดปุ่มเดิมอีกครั้ง",
+    )
+}
+
+/// A cloud task failed: back to idle, then tell the person. A cancel shows nothing.
+///
+/// A sign-in that the server does not accept: `s.cloud` is the state that `finish` read from
+/// this computer after the task. When the saved sign-in is gone, the app signs out and opens
+/// Settings › Account. When it is still saved, the app stays signed in and asks the person to
+/// try again.
 pub fn after_failure(s: &mut App, error: &str) {
     s.busy = None;
     drop_question(s);
     if error == CANCELLED || error == account::SIGN_IN_CANCELLED {
         return;
     }
-    if error == account::SIGN_IN_INVALID {
+    if error != account::SIGN_IN_INVALID {
+        s.fail(app_wording(error));
+    } else if matches!(s.cloud, CloudState::SignedIn { .. }) {
+        s.fail(sign_in_expired_text());
+    } else {
         s.cloud = CloudState::SignedOut;
         s.close_dialog();
         s.dialog = Some(Dialog::Settings(SettingsPage::Account));
         s.fail(sign_in_rejected_text());
-    } else {
-        s.fail(app_wording(error));
     }
 }
 
@@ -787,10 +836,11 @@ fn start_with<U: Ui + Clone>(
                     )
                     .to_owned())
                 });
+            let notices = std::mem::take(&mut bridge.kept);
             drop(bridge);
             // On a panic here, keep the state the app shows.
             let cloud = panic::catch_unwind(AssertUnwindSafe(|| refresh(&home))).ok();
-            handle.run(Box::new(move |s| finish(s, cloud, result)));
+            handle.run(Box::new(move |s| finish(s, cloud, result, notices)));
         });
     match spawned {
         Ok(_) => {
@@ -808,8 +858,15 @@ fn start_with<U: Ui + Clone>(
     }
 }
 
-/// The end of a cloud task, on the UI thread: back to idle, then show the result.
-fn finish(s: &mut App, cloud: Option<CloudState>, result: Result<Done, String>) {
+/// The end of a cloud task, on the UI thread: back to idle, then show the result. `cloud` is
+/// the sign-in state read from this computer after the task (`None` when it could not be read).
+/// `notices` show with the result, in one toast that stays until dismissed.
+fn finish(
+    s: &mut App,
+    cloud: Option<CloudState>,
+    result: Result<Done, String>,
+    notices: Vec<String>,
+) {
     s.busy = None;
     // Drops a question that is still open, so no dialog stays after its task.
     drop_question(s);
@@ -829,25 +886,104 @@ fn finish(s: &mut App, cloud: Option<CloudState>, result: Result<Done, String>) 
         }
     }
     s.reload();
+    let before = s.toast.as_ref().map(|toast| toast.id);
     match result {
         Ok(done) => apply(s, done),
         Err(error) => after_failure(s, &error),
     }
+    if !notices.is_empty() {
+        // The result's own toast (if it made one) comes first, then the notices. The new
+        // toast gets a new id, so the timer of a success toast does not hide it.
+        let mut lines: Vec<String> = s
+            .toast
+            .as_ref()
+            .filter(|toast| Some(toast.id) != before)
+            .map(|toast| toast.text.clone())
+            .into_iter()
+            .collect();
+        lines.extend(notices);
+        s.fail(lines.join(
+            "
+",
+        ));
+    }
 }
 
-/// A library error in the app's words: the hint after the last wrong vault password names the
-/// CLI command, and the app has the **Use recovery code** button instead.
+/// The start of the library's hint to remove a link: "Run 'keyman unlink <project>'…".
+const UNLINK_HINT: &str = "Run 'keyman unlink ";
+
+/// The end of a library text that asks for a new pull.
+const PULL_AGAIN: &str = "Run 'keyman pull' again.";
+
+/// A library error or reason in the app's words. Texts that name a CLI command get the app's
+/// button or page instead. The CLI keeps its own texts.
 pub fn app_wording(error: &str) -> String {
-    match error.strip_suffix(account::RECOVER_HINT) {
-        Some(head) => format!(
+    let whole = [
+        (
+            account::NOT_SIGNED_IN,
+            t(
+                "You are not signed in. Sign in on the Account page first.",
+                "คุณยังไม่ได้ลงชื่อเข้าใช้ ลงชื่อเข้าใช้ในหน้าบัญชีก่อน",
+            ),
+        ),
+        (
+            account::NO_CLOUD,
+            t(
+                "You do not have Keyman Cloud yet. Sign in on the Account page to set it up.",
+                "คุณยังไม่มี Keyman Cloud ลงชื่อเข้าใช้ในหน้าบัญชีเพื่อตั้งค่า",
+            ),
+        ),
+        (
+            account::NO_PROFILE,
+            t(
+                "This account has no vault password yet. Sign in on the Account page first.",
+                "บัญชีนี้ยังไม่มีรหัสผ่านตู้นิรภัย ลงชื่อเข้าใช้ในหน้าบัญชีก่อน",
+            ),
+        ),
+        (
+            account::BAD_LOCAL_KEY,
+            t(
+                "The key on this computer is not valid. Sign out, then sign in again on the Account page.",
+                "คีย์ในเครื่องนี้ใช้ไม่ได้ ออกจากระบบ แล้วลงชื่อเข้าใช้อีกครั้งในหน้าบัญชี",
+            ),
+        ),
+        (
+            account::CODE_MISMATCH,
+            t(
+                "The code is not the same. Keyman did not save anything. To start again, sign in on the Account page.",
+                "รหัสไม่ตรงกัน Keyman ไม่ได้บันทึกอะไร ลงชื่อเข้าใช้ในหน้าบัญชีเพื่อเริ่มใหม่",
+            ),
+        ),
+    ];
+    if let Some((_, words)) = whole.iter().find(|(library, _)| error == *library) {
+        return (*words).to_owned();
+    }
+    if let Some(head) = error.strip_suffix(account::RECOVER_HINT) {
+        return format!(
             "{head}{}",
             t(
                 "Use 'Use recovery code' in Settings › Account.",
                 "ใช้ปุ่ม \"ใช้รหัสกู้คืน\" ในการตั้งค่า › บัญชี",
             )
-        ),
-        None => error.to_owned(),
+        );
     }
+    // The unlink hint is the last sentence: the app has ⋯ › Unlink on the project page.
+    if let Some(at) = error.find(UNLINK_HINT)
+        && !error[at..].contains('\n')
+    {
+        return format!(
+            "{}{}",
+            &error[..at],
+            t(
+                "Use ⋯ › Unlink on the project page to remove the link.",
+                "ใช้ ⋯ › เลิกเชื่อม ในหน้าโปรเจกต์เพื่อลบการเชื่อม",
+            )
+        );
+    }
+    if let Some(head) = error.strip_suffix(PULL_AGAIN) {
+        return format!("{head}{}", t("Click Sync again.", "กดซิงก์อีกครั้ง"));
+    }
+    error.to_owned()
 }
 
 fn apply(s: &mut App, done: Done) {
@@ -866,6 +1002,11 @@ fn apply(s: &mut App, done: Done) {
             ));
         }
         Done::Toast(text) => s.ok(text),
+        Done::Recovered => {
+            // Signed in, as after a sign-in: the first-use card does not come back.
+            s.update_settings(|st| st.cloud_prompt_done = true);
+            s.ok(t("The new vault password is set.", "ตั้งรหัสผ่านตู้นิรภัยใหม่แล้ว"));
+        }
         Done::SyncFinished(summary) => match toast_text(&summary) {
             Some(text) => s.ok(text),
             None => show_results(s, summary),
@@ -936,6 +1077,40 @@ fn merged(s: &mut App, project: &str, mut summary: SyncSummary) {
     }
 }
 
+/// The line when a sync stopped after its pull.
+pub fn not_sent_line() -> &'static str {
+    not_sent_words(crate::i18n::thai())
+}
+
+fn not_sent_words(thai: bool) -> &'static str {
+    if thai {
+        "Keyman ไม่ได้ส่งการเปลี่ยนแปลงของคุณ"
+    } else {
+        "Keyman did not send your changes."
+    }
+}
+
+/// The red toast when the folder resolver must wait for a cloud task.
+pub fn folder_waits_text() -> &'static str {
+    t(
+        "Keyman cannot resolve the differences while a cloud action runs. Try again when it ends.",
+        "Keyman แก้ไขความต่างระหว่างที่คลาวด์กำลังทำงานไม่ได้ ลองอีกครั้งเมื่อทำงานเสร็จ",
+    )
+}
+
+/// The end of **Merge** of `project`. A merge that was cancelled after its pull did something
+/// still shows what it did.
+fn merge_outcome(project: String, report: &PullReport, cancelled: bool) -> Result<Done, String> {
+    // Cancel before the pull read the project: nothing to show.
+    if cancelled && report.results.is_empty() {
+        return Err(CANCELLED.to_owned());
+    }
+    Ok(Done::Merged {
+        summary: summarize(report, &[]),
+        project,
+    })
+}
+
 /// The busy label while **Sync** runs.
 pub fn syncing_label() -> &'static str {
     t("Syncing…", "กำลังซิงก์…")
@@ -984,9 +1159,7 @@ impl App {
         start(self, signing_in_label(), move |bridge, home| {
             let mut provider = || provider.ok_or_else(|| account::SIGN_IN_INVALID.to_owned());
             account::recover(home, &SystemStore::new(), &mut provider, bridge)?;
-            Ok(Done::Toast(
-                t("The new vault password is set.", "ตั้งรหัสผ่านตู้นิรภัยใหม่แล้ว").to_owned(),
-            ))
+            Ok(Done::Recovered)
         });
     }
 
@@ -1135,14 +1308,7 @@ impl App {
         start(self, label, move |bridge, home| {
             let u = account::session(home, &SystemStore::new(), bridge)?;
             let report = sync::pull(home, &u, Some(&project), None, bridge)?;
-            // Cancel was clicked: no results dialog.
-            if bridge.cancelled() {
-                return Err(CANCELLED.to_owned());
-            }
-            Ok(Done::Merged {
-                summary: summarize(&report, &[]),
-                project,
-            })
+            merge_outcome(project, &report, bridge.cancelled())
         });
     }
 
@@ -1518,13 +1684,18 @@ mod tests {
         let (waiting, question) = waiting_thread(Ask::NewPassword);
         app.question = Some(question);
         app.busy = busy("Signing in…");
-        finish(&mut app, Some(CloudState::SignedOut), Err(CANCELLED.into()));
+        finish(
+            &mut app,
+            Some(CloudState::SignedOut),
+            Err(CANCELLED.into()),
+            Vec::new(),
+        );
         assert!(app.busy.is_none() && app.question.is_none());
         assert_eq!(waiting.join().unwrap(), Reply::Cancel);
         // A cancel is not an error for the person.
         assert!(app.toast.is_none());
 
-        finish(&mut app, None, Err("boom".into()));
+        finish(&mut app, None, Err("boom".into()), Vec::new());
         assert!(
             app.toast
                 .as_ref()
@@ -1552,7 +1723,7 @@ mod tests {
         // `finish` shows the app words.
         let mut app = App::for_tests();
         app.busy = busy("Signing in…");
-        finish(&mut app, None, Err(error));
+        finish(&mut app, None, Err(error), Vec::new());
         let toast = app.toast.as_ref().unwrap();
         assert!(!toast.ok && !toast.text.contains("keyman recover"));
     }
@@ -1565,7 +1736,7 @@ mod tests {
         let done = Done::SignedIn {
             email: "a@b.c".into(),
         };
-        finish(&mut app, None, Ok(done));
+        finish(&mut app, None, Ok(done), Vec::new());
         assert!(app.settings.cloud_prompt_done);
         // Saved, so a sign-out and a new start keep it closed.
         assert!(crate::settings::Settings::load(&app.prefs).cloud_prompt_done);
@@ -1688,6 +1859,7 @@ mod tests {
             attention: Vec::new(),
             given: Vec::new(),
             warnings: Vec::new(),
+            not_sent: false,
         }
     }
 
@@ -1815,9 +1987,8 @@ mod tests {
     #[test]
     fn rejected_sign_in_signs_out() {
         let mut app = App::for_tests();
-        app.cloud = CloudState::SignedIn {
-            email: "a@b.c".into(),
-        };
+        // `finish` read the saved state after the task: the sign-in is gone.
+        app.cloud = CloudState::SignedOut;
         app.busy = busy("Syncing…");
         let (waiting, question) = waiting_thread(Ask::Password { tries_left: 3 });
         app.question = Some(question);
@@ -1838,7 +2009,12 @@ mod tests {
             email: "a@b.c".into(),
         };
         app.busy = busy("Linking…");
-        finish(&mut app, None, Err(account::SIGN_IN_INVALID.into()));
+        finish(
+            &mut app,
+            Some(CloudState::SignedOut),
+            Err(account::SIGN_IN_INVALID.into()),
+            Vec::new(),
+        );
         assert_eq!(app.cloud, CloudState::SignedOut);
         assert_eq!(
             app.dialog,
@@ -1936,7 +2112,7 @@ mod tests {
         app.busy = busy("Syncing…");
         let (waiting, question) = waiting_thread(resolve_ask());
         post(&mut app, question);
-        finish(&mut app, None, Err("boom".into()));
+        finish(&mut app, None, Err("boom".into()), Vec::new());
         assert!(app.cloud_picks.is_none());
         assert_eq!(waiting.join().unwrap(), Reply::Cancel);
     }
@@ -1945,7 +2121,12 @@ mod tests {
     fn a_sync_opens_the_results_only_when_needed() {
         let mut app = App::for_tests();
         app.busy = busy("Syncing…");
-        finish(&mut app, None, Ok(Done::SyncFinished(summary(1, &[], 0))));
+        finish(
+            &mut app,
+            None,
+            Ok(Done::SyncFinished(summary(1, &[], 0))),
+            Vec::new(),
+        );
         assert!(app.dialog.is_none() && app.sync_results.is_none());
         assert!(app.toast.as_ref().is_some_and(|toast| toast.ok));
 
@@ -1954,7 +2135,12 @@ mod tests {
         needs.given.push(("team".into(), "x@y.z".into()));
         app.toast = None;
         app.busy = busy("Syncing…");
-        finish(&mut app, None, Ok(Done::SyncFinished(needs.clone())));
+        finish(
+            &mut app,
+            None,
+            Ok(Done::SyncFinished(needs.clone())),
+            Vec::new(),
+        );
         assert_eq!(app.dialog, Some(Dialog::SyncResults));
         assert_eq!(app.sync_results.as_ref(), Some(&needs));
         // The invite lines are in the dialog, not also in a toast.
@@ -1994,7 +2180,7 @@ mod tests {
             project: "f".into(),
             summary: summary(1, &[], 0),
         };
-        finish(&mut app, None, Ok(done));
+        finish(&mut app, None, Ok(done), Vec::new());
         assert_eq!(app.dialog, Some(Dialog::SyncResults));
         assert_eq!(
             app.sync_results.as_ref().unwrap().attention,
@@ -2011,7 +2197,7 @@ mod tests {
             project: "f".into(),
             summary: summary(1, &[], 0),
         };
-        finish(&mut app, None, Ok(done));
+        finish(&mut app, None, Ok(done), Vec::new());
         assert!(app.dialog.is_none() && app.sync_results.is_none());
     }
 
@@ -2088,7 +2274,7 @@ mod tests {
             email: "a@b.c".into(),
         };
         app.busy = busy("Syncing…");
-        finish(&mut app, None, done);
+        finish(&mut app, Some(CloudState::SignedOut), done, Vec::new());
         assert_eq!(app.cloud, CloudState::SignedOut);
         assert_eq!(
             app.dialog,
@@ -2124,10 +2310,10 @@ mod tests {
         );
         let mut app = App::for_tests();
         app.busy = busy("Syncing…");
-        finish(&mut app, None, done);
+        finish(&mut app, None, done, Vec::new());
         assert_eq!(app.cloud, CloudState::SignedOut);
         let text = &app.toast.as_ref().unwrap().text;
-        assert!(text.contains(reason), "{text}");
+        assert!(text.contains(&app_wording(reason)), "{text}");
         assert!(
             !text.contains("All projects are up to date.")
                 && !text.contains("ทุกโปรเจกต์เป็นปัจจุบันแล้ว"),
@@ -2235,7 +2421,7 @@ mod tests {
             project: "f".into(),
             summary: stopped.clone(),
         };
-        finish(&mut app, None, Ok(done));
+        finish(&mut app, None, Ok(done), Vec::new());
         assert_eq!(app.dialog, Some(Dialog::SyncResults));
         assert_eq!(app.sync_results, Some(stopped));
         assert!(!app.recover_pick);
@@ -2247,5 +2433,269 @@ mod tests {
         app.busy = Some(Busy::new("Syncing…"));
         app.cloud_unlink("my-app");
         assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn a_user_switch_notice_shows_with_the_result() {
+        let mut app = App::for_tests();
+        app.home = no_home();
+        let (tx, rx) = mpsc::channel();
+        let refresh: fn(&Path) -> CloudState = |_| CloudState::SignedIn {
+            email: "b@c.d".into(),
+        };
+        let work = |bridge: &mut Bridge<QueueUi>, _: &Path| {
+            bridge.notice(account::WRONG_PASSWORD);
+            bridge.notice(account::USER_SWITCHED);
+            Ok(Done::SignedIn {
+                email: "b@c.d".into(),
+            })
+        };
+        assert!(start_with(
+            &mut app,
+            Some(QueueUi(tx)),
+            refresh,
+            "Signing in…",
+            work
+        ));
+        // A wrong password shows at once: the person tries again.
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()(&mut app);
+        let toast = app.toast.as_ref().unwrap();
+        assert!(!toast.ok && toast.text == account::WRONG_PASSWORD);
+        // The switch notice shows with the result, not before it.
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()(&mut app);
+        let toast = app.toast.as_ref().unwrap();
+        assert!(toast.text.contains("b@c.d"), "{}", toast.text);
+        assert!(
+            toast.text.contains(account::USER_SWITCHED),
+            "{}",
+            toast.text
+        );
+        assert!(
+            !toast.text.contains(account::WRONG_PASSWORD),
+            "{}",
+            toast.text
+        );
+        // It stays until dismissed.
+        assert!(!toast.ok);
+
+        // A task with no toast at its end still shows the notice.
+        let mut app = App::for_tests();
+        app.busy = busy("Signing in…");
+        finish(
+            &mut app,
+            None,
+            Err(CANCELLED.into()),
+            vec![account::USER_SWITCHED.into()],
+        );
+        assert_eq!(app.toast.as_ref().unwrap().text, account::USER_SWITCHED);
+    }
+
+    #[test]
+    fn the_bridge_stops_the_pull_after_cancel() {
+        let (b, _) = bridge(|_| Reply::Cancel);
+        assert!(!CloudResolver::stopped(&b));
+        b.cancel.store(true, Ordering::SeqCst);
+        assert!(CloudResolver::stopped(&b));
+    }
+
+    #[test]
+    fn a_cancelled_sync_says_what_it_did_and_did_not_send() {
+        // The pull stopped after its first project.
+        let partial = PullReport {
+            results: vec![PullResult::Added("a".into())],
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let got = finished(sync_outcome(&partial, PushOutcome::Cancelled));
+        assert_eq!(got.added, vec!["a".to_string()]);
+        assert!(got.not_sent);
+        assert_eq!(
+            toast_words(&got, false).as_deref(),
+            Some("1 project added.\nKeyman did not send your changes.")
+        );
+        assert_eq!(
+            toast_words(&got, true).as_deref(),
+            Some("เพิ่ม 1 โปรเจกต์\nKeyman ไม่ได้ส่งการเปลี่ยนแปลงของคุณ")
+        );
+        assert!(summary_lines(&got).contains(&not_sent_line().to_owned()));
+        // Shown through `finish` as a toast.
+        let mut app = App::for_tests();
+        app.busy = busy("Syncing…");
+        finish(
+            &mut app,
+            None,
+            Ok(Done::SyncFinished(got.clone())),
+            Vec::new(),
+        );
+        assert!(app.toast.as_ref().unwrap().text.contains(not_sent_line()));
+        // A full sync does not say it.
+        let sent = finished(sync_outcome(&partial, PushOutcome::Sent(Vec::new())));
+        assert!(!sent.not_sent);
+        assert!(!toast_text(&sent).unwrap().contains(not_sent_line()));
+    }
+
+    #[test]
+    fn a_merge_cancelled_after_its_pull_shows_what_it_did() {
+        let adopted = PullReport {
+            results: vec![PullResult::Updated {
+                project: "f".into(),
+                changes: 1,
+            }],
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        match merge_outcome("f".into(), &adopted, true) {
+            Ok(Done::Merged { project, summary }) => {
+                assert_eq!(project, "f");
+                assert_eq!(summary.updated, 1);
+            }
+            _ => panic!("expected Merged"),
+        }
+        let empty = PullReport {
+            results: Vec::new(),
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        assert!(matches!(
+            merge_outcome("f".into(), &empty, true),
+            Err(error) if error == CANCELLED
+        ));
+        assert!(matches!(
+            merge_outcome("f".into(), &adopted, false),
+            Ok(Done::Merged { .. })
+        ));
+    }
+
+    const EXPIRED: [&str; 2] = [
+        "The sign-in expired. Click the action again.",
+        "การลงชื่อเข้าใช้หมดเวลาแล้ว กดปุ่มเดิมอีกครั้ง",
+    ];
+
+    #[test]
+    fn an_expired_sign_in_that_is_still_saved_does_not_sign_out() {
+        let signed_in = CloudState::SignedIn {
+            email: "a@b.c".into(),
+        };
+        let mut app = App::for_tests();
+        app.cloud = signed_in.clone();
+        app.busy = busy("Syncing…");
+        // The saved sign-in is still on this computer after the task.
+        finish(
+            &mut app,
+            Some(signed_in.clone()),
+            Err(account::SIGN_IN_INVALID.into()),
+            Vec::new(),
+        );
+        assert_eq!(app.cloud, signed_in);
+        assert!(app.dialog.is_none());
+        let toast = app.toast.as_ref().unwrap();
+        assert!(
+            !toast.ok && EXPIRED.contains(&toast.text.as_str()),
+            "{}",
+            toast.text
+        );
+
+        // The saved sign-in is gone: sign out.
+        app.busy = busy("Syncing…");
+        finish(
+            &mut app,
+            Some(CloudState::SignedOut),
+            Err(account::SIGN_IN_INVALID.into()),
+            Vec::new(),
+        );
+        assert_eq!(app.cloud, CloudState::SignedOut);
+        assert_eq!(
+            app.dialog,
+            Some(Dialog::Settings(crate::SettingsPage::Account))
+        );
+        assert!(REJECTED.contains(&app.toast.as_ref().unwrap().text.as_str()));
+    }
+
+    #[test]
+    fn a_recovery_closes_the_first_use_card_for_good() {
+        let mut app = App::for_tests();
+        assert!(!app.settings.cloud_prompt_done);
+        app.busy = busy("Signing in…");
+        finish(&mut app, None, Ok(Done::Recovered), Vec::new());
+        assert!(app.settings.cloud_prompt_done);
+        assert!(app.toast.as_ref().is_some_and(|toast| toast.ok));
+    }
+
+    #[test]
+    fn cli_commands_are_in_app_words() {
+        let library = [
+            account::NOT_SIGNED_IN,
+            account::NO_CLOUD,
+            account::NO_PROFILE,
+            account::BAD_LOCAL_KEY,
+            account::CODE_MISMATCH,
+        ];
+        for error in library {
+            let shown = app_wording(error);
+            assert!(!shown.contains("keyman"), "{shown}");
+            assert_ne!(shown, error);
+        }
+        assert!(
+            [
+                "You do not have Keyman Cloud yet. Sign in on the Account page to set it up.",
+                "คุณยังไม่มี Keyman Cloud ลงชื่อเข้าใช้ในหน้าบัญชีเพื่อตั้งค่า",
+            ]
+            .contains(&app_wording(account::NO_CLOUD).as_str())
+        );
+        // The unlink hint names the ⋯ menu, for each library text with it.
+        let unlink = [
+            sync::skip_reason_missing("web"),
+            "The project web is not in the cloud now. Run 'keyman unlink web'.".to_owned(),
+            "Project 'web' is not in the cloud now. Run 'keyman unlink web' to remove the link."
+                .to_owned(),
+        ];
+        for reason in &unlink {
+            let shown = app_wording(reason);
+            assert!(!shown.contains("keyman"), "{shown}");
+            let head = &reason[..reason.find("Run ").unwrap()];
+            assert!(shown.starts_with(head), "{shown}");
+            assert!(
+                shown.ends_with("Use ⋯ › Unlink on the project page to remove the link.")
+                    || shown.ends_with("ใช้ ⋯ › เลิกเชื่อม ในหน้าโปรเจกต์เพื่อลบการเชื่อม"),
+                "{shown}"
+            );
+        }
+        // "Run 'keyman pull' again." is the Sync button in the app.
+        let shown = app_wording("The group key changed. Run 'keyman pull' again.");
+        assert!(
+            shown == "The group key changed. Click Sync again."
+                || shown == "The group key changed. กดซิงก์อีกครั้ง",
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_folder_resolver_waits_for_a_cloud_task() {
+        let mut app = App::for_tests();
+        app.busy = busy("Syncing…");
+        app.selected = Some("my-app".into());
+        app.resolver = Some(crate::Resolver {
+            folder: std::env::temp_dir().join("keyman-app-test-no-folder"),
+            items: Vec::new(),
+            reveal: false,
+        });
+        app.dialog = Some(Dialog::Resolve);
+        app.apply_resolution();
+        // Nothing is written: the resolver and its dialog stay.
+        assert!(app.resolver.is_some());
+        assert_eq!(app.dialog, Some(Dialog::Resolve));
+        let waits = |app: &App| {
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| !toast.ok && toast.text == folder_waits_text())
+        };
+        assert!(waits(&app));
+        // It does not open while the task runs.
+        app.resolver = None;
+        app.dialog = None;
+        app.toast = None;
+        app.open_resolver(&std::env::temp_dir());
+        assert!(app.resolver.is_none() && app.dialog.is_none());
+        assert!(waits(&app));
     }
 }

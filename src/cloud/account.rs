@@ -12,14 +12,19 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zeroize::Zeroizing;
 
-const WRONG_PASSWORD: &str = "The vault password is not correct.";
+/// The notice after a wrong vault password, before the next try.
+pub const WRONG_PASSWORD: &str = "The vault password is not correct.";
 const WRONG_RECOVERY: &str = "The recovery code is not correct.";
-const NOT_SIGNED_IN: &str = "You are not signed in. Run 'keyman login' first.";
-const NO_PROFILE: &str = "This account has no vault password yet. Run 'keyman login' first.";
+/// The error when this computer has no saved sign-in.
+pub const NOT_SIGNED_IN: &str = "You are not signed in. Run 'keyman login' first.";
+/// The error when the account has no profile on the server.
+pub const NO_PROFILE: &str = "This account has no vault password yet. Run 'keyman login' first.";
 const BAD_PROFILE: &str = "The key data on the server is not valid. Keyman stops.";
 const KEY_MISMATCH: &str = "The key on the server does not match. Keyman stops.";
-const BAD_LOCAL_KEY: &str = "The key on this computer is not valid. Run 'keyman login' again.";
-const CODE_MISMATCH: &str =
+/// The error when the saved private key does not open.
+pub const BAD_LOCAL_KEY: &str = "The key on this computer is not valid. Run 'keyman login' again.";
+/// The error after the last wrong recovery code at the first sign-in.
+pub const CODE_MISMATCH: &str =
     "The code is not the same. Keyman did not save anything. Run 'keyman login' to start again.";
 /// The error when the saved sign-in is not valid now.
 pub const SIGN_IN_INVALID: &str = "Your sign-in is not valid now. Run 'keyman login'.";
@@ -28,11 +33,15 @@ pub const SIGN_IN_CANCELLED: &str = "Sign-in was cancelled.";
 const WRONG_OWNER: &str = "The profile on the server is for a different user. Keyman stops.";
 const SESSION: &str = "session";
 const LEGACY_KEY: &str = "private_key";
-const NO_CLOUD: &str = "You do not have Keyman Cloud yet. Run 'keyman login' to set it up.";
+/// The error for a recovery on an account with no Keyman Cloud.
+pub const NO_CLOUD: &str = "You do not have Keyman Cloud yet. Run 'keyman login' to set it up.";
 /// The end of the error after the last wrong vault password: how to use the
 /// recovery code. The app shows its own words in its place.
 pub const RECOVER_HINT: &str = "Run 'keyman recover' to use your recovery code.";
-const USER_SWITCHED: &str = "You signed in as a different user. Keyman removed the cloud links of the old user. Your local projects did not change.";
+/// The notice when a different user signs in on this computer.
+pub const USER_SWITCHED: &str = "You signed in as a different user. Keyman removed the cloud links of the old user. Your local projects did not change.";
+/// The notice after a wrong recovery code, before the next try.
+pub const CODE_RETRY: &str = "The code is not the same. Try again.";
 const HAS_PROFILE: &str = "This account has a vault password already. Keyman did not change it.";
 const PASSWORD_TRIES: usize = 3;
 const CODE_TRIES: usize = 3;
@@ -283,7 +292,7 @@ fn confirm_code(prompt: &mut dyn Prompt, code: &str) -> Result<bool, String> {
         if crypto::normalize_recovery_code(&typed) == wanted {
             return Ok(true);
         }
-        prompt.notice("The code is not the same. Try again.");
+        prompt.notice(CODE_RETRY);
     }
     Ok(false)
 }

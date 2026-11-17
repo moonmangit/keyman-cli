@@ -919,7 +919,8 @@ pub struct ResultRow {
     pub merge: bool,
 }
 
-/// The projects that need the person, in the order of the sync. A library reason stays as it is.
+/// The projects that need the person, in the order of the sync. A library reason is in the
+/// app's words (`cloud::app_wording`).
 /// `linked` says whether this computer's project with a name is linked: such a project cannot
 /// merge with another cloud project, so its row has no **Merge**.
 pub fn attention_rows(summary: &SyncSummary, linked: impl Fn(&str) -> bool) -> Vec<ResultRow> {
@@ -929,7 +930,7 @@ pub fn attention_rows(summary: &SyncSummary, linked: impl Fn(&str) -> bool) -> V
         .map(|attention| {
             let project = attention.project().to_owned();
             let reason = match attention {
-                Attention::Skipped { reason, .. } => reason.clone(),
+                Attention::Skipped { reason, .. } => cloud::app_wording(reason),
                 Attention::Stopped { project, .. } => tf!(
                     "You stopped the sync of {}. Keyman did not change it.",
                     "คุณหยุดการซิงก์ {} แล้ว Keyman ไม่ได้เปลี่ยนโปรเจกต์นี้",
@@ -958,6 +959,24 @@ pub fn attention_rows(summary: &SyncSummary, linked: impl Fn(&str) -> bool) -> V
                 merge,
             }
         })
+        .collect()
+}
+
+/// The keys of result row `i` and of its **Merge** button. A project can have two rows (a pull
+/// and a push reason), so the index is in the key.
+fn row_keys(i: usize, project: &str) -> (String, String) {
+    (
+        format!("sync-row-{i}-{project}"),
+        format!("merge-{i}-{project}"),
+    )
+}
+
+/// The lines about the sync itself under the projects (now: that nothing was sent).
+fn result_lines(summary: &SyncSummary) -> Vec<String> {
+    summary
+        .not_sent
+        .then(|| cloud::not_sent_line().to_owned())
+        .into_iter()
         .collect()
 }
 
@@ -1021,14 +1040,16 @@ pub fn sync_results_dialog(s: &App, p: Paint) -> El {
     };
     let idle = cloud::can_start(&s.busy);
     let mut list = col().key("sync-rows").w_full().gap(8.0);
-    for row_data in attention_rows(summary, |name| s.link_of(name).is_some()) {
+    let rows = attention_rows(summary, |name| s.link_of(name).is_some());
+    for (i, row_data) in rows.into_iter().enumerate() {
         let ResultRow {
             project,
             reason,
             merge,
         } = row_data;
+        let (row_key, merge_key) = row_keys(i, &project);
         let mut entry = row()
-            .key(format!("sync-row-{project}"))
+            .key(row_key)
             .w_full()
             .padding(12.0)
             .gap(12.0)
@@ -1058,7 +1079,7 @@ pub fn sync_results_dialog(s: &App, p: Paint) -> El {
         if merge {
             entry = entry.child(button(
                 p,
-                &format!("merge-{project}"),
+                &merge_key,
                 t("Merge", "รวม"),
                 Some(&ic::MERGE),
                 Kind::Secondary,
@@ -1084,6 +1105,15 @@ pub fn sync_results_dialog(s: &App, p: Paint) -> El {
             &ic::CHECK_CIRCLE,
             p.green,
             cloud::given_line(group, email),
+        ));
+    }
+    for (i, line) in result_lines(summary).into_iter().enumerate() {
+        list = list.child(result_line(
+            p,
+            format!("sync-note-{i}"),
+            &ic::ALERT,
+            p.yellow,
+            line,
         ));
     }
     for (i, warning) in summary.warnings.iter().enumerate() {
@@ -1555,15 +1585,22 @@ mod tests {
             ],
             given: Vec::new(),
             warnings: Vec::new(),
+            not_sent: false,
         };
         let rows = attention_rows(&summary, |_| false);
+        // A library reason is in the app's words: no CLI command.
         assert_eq!(
             rows[0],
             ResultRow {
                 project: "e".into(),
-                reason: library.into(),
+                reason: cloud::app_wording(library),
                 merge: false
             }
+        );
+        assert!(
+            !rows[0].reason.contains("keyman pull"),
+            "{}",
+            rows[0].reason
         );
         // Either language: another test may switch it meanwhile.
         assert!(
@@ -1610,6 +1647,7 @@ mod tests {
             attention: vec![Attention::CloudIsNewer("g".into())],
             given: Vec::new(),
             warnings: Vec::new(),
+            not_sent: false,
         };
         let intro = results_intro(&summary);
         assert!(
@@ -1634,6 +1672,53 @@ mod tests {
         summary.updated = 2;
         let intro = results_intro(&summary);
         assert!(intro.contains('2'), "{intro}");
+    }
+
+    #[test]
+    fn two_rows_of_one_project_have_their_own_keys() {
+        let rows = [
+            Attention::Skipped {
+                project: "e".into(),
+                reason: "pull why".into(),
+            },
+            Attention::Skipped {
+                project: "e".into(),
+                reason: "The project e is not in the cloud now. Run 'keyman unlink e'.".into(),
+            },
+        ];
+        let summary = SyncSummary {
+            updated: 0,
+            added: Vec::new(),
+            sent: 0,
+            attention: rows.to_vec(),
+            given: Vec::new(),
+            warnings: Vec::new(),
+            not_sent: false,
+        };
+        let shown = attention_rows(&summary, |_| false);
+        assert!(!shown[1].reason.contains("keyman"), "{}", shown[1].reason);
+        assert_ne!(row_keys(0, "e"), row_keys(1, "e"));
+        let (row, merge) = row_keys(1, "e");
+        assert_ne!(row, merge);
+    }
+
+    #[test]
+    fn a_stopped_push_is_a_line_in_the_results() {
+        let mut summary = SyncSummary {
+            updated: 1,
+            added: Vec::new(),
+            sent: 0,
+            attention: vec![Attention::CloudIsNewer("g".into())],
+            given: Vec::new(),
+            warnings: Vec::new(),
+            not_sent: false,
+        };
+        assert!(result_lines(&summary).is_empty());
+        summary.not_sent = true;
+        assert_eq!(
+            result_lines(&summary),
+            vec![cloud::not_sent_line().to_owned()]
+        );
     }
 
     #[test]

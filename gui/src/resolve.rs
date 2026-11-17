@@ -416,6 +416,14 @@ pub fn resolve_dialog(s: &App, p: Paint) -> El {
         )
     };
 
+    // A cloud task may change the master file while this dialog is open: Apply waits for it.
+    let idle = crate::cloud::can_start(&s.busy);
+    let outcome = if idle {
+        outcome
+    } else {
+        crate::cloud::folder_waits_text().to_owned()
+    };
+
     sheet(
         p,
         Sheet {
@@ -478,7 +486,7 @@ pub fn resolve_dialog(s: &App, p: Paint) -> El {
                     ),
                     Some(&ic::MERGE),
                     Kind::Primary,
-                    true,
+                    idle,
                     |s, _| s.apply_resolution(),
                 ),
             ],

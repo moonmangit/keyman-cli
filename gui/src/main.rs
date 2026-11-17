@@ -650,6 +650,11 @@ impl App {
 
     /// Opens the conflict resolver for a folder whose .env differs from the master file.
     pub fn open_resolver(&mut self, folder: &Path) {
+        // A cloud task may change the master file: the dialog would show old values.
+        if !cloud::can_start(&self.busy) {
+            self.fail(cloud::folder_waits_text());
+            return;
+        }
         let Some(Ok(vars)) = self.variables() else {
             return;
         };
@@ -692,6 +697,11 @@ impl App {
 
     /// Writes the chosen values into both the master file and the folder's .env.
     pub fn apply_resolution(&mut self) {
+        // A cloud task may change the master file: the dialog's master values may be old.
+        if !cloud::can_start(&self.busy) {
+            self.fail(cloud::folder_waits_text());
+            return;
+        }
         let (Some(project), Some(resolver)) = (self.selected.clone(), self.resolver.take()) else {
             return;
         };
@@ -1031,6 +1041,7 @@ fn sync_results(s: &mut App) {
         ],
         given: vec![("Backend team".into(), "sam@example.com".into())],
         warnings: vec!["Keyman cannot give lee@example.com access to Design now.".into()],
+        not_sent: false,
     });
     s.dialog = Some(Dialog::SyncResults);
 }
