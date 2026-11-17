@@ -17,6 +17,7 @@ winresource = "0.1"
 keyman-cli = { path = ".." }
 rune = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a", features = ["native-file-dialog"] }
 rune-i18n = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a" }
+zeroize = "1"
 
 # Its own workspace, so the CLI keeps building on stable without Rune's toolchain.
 [workspace]

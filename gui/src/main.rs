@@ -6,6 +6,9 @@
 
 #[macro_use]
 mod i18n;
+// The cloud screens (sign-in, link, sync) use this; until then parts are unused.
+#[allow(dead_code)]
+mod cloud;
 mod core;
 mod diagram;
 mod icons;
@@ -27,6 +30,7 @@ use rune::{
     App as RuneApp, AppHandle, AppSpec, FileDialogOptions, Key, KeyEvent, TextEdit, Titlebar, Tx,
 };
 
+use crate::cloud::{Busy, CloudState, Question};
 use crate::core::{Conflict, DiffLine, FolderStatus, Master, SavePreview};
 use crate::i18n::{count, t};
 use crate::settings::Settings;
@@ -132,6 +136,12 @@ pub struct App {
     pub resolver: Option<Resolver>,
     /// Backs a resolver field for the one frame it may outlive its resolver.
     pub scratch: TextEdit,
+    /// The cloud sign-in on this computer, from local data.
+    pub cloud: CloudState,
+    /// The cloud task that runs now; only one at a time.
+    pub busy: Option<Busy>,
+    /// The cloud task's question that waits for a dialog answer.
+    pub question: Option<Question>,
 }
 
 impl App {
@@ -143,8 +153,12 @@ impl App {
         } else {
             Ties::default()
         };
+        let home = keyman_cli::master::home_dir().ok();
+        let cloud = home
+            .as_deref()
+            .map_or(CloudState::SignedOut, cloud::initial_state);
         let mut app = App {
-            home: keyman_cli::master::home_dir().ok(),
+            home,
             handle,
             prefs,
             settings,
@@ -161,6 +175,9 @@ impl App {
             search: TextEdit::new(""),
             resolver: None,
             scratch: TextEdit::new(""),
+            cloud,
+            busy: None,
+            question: None,
         };
         app.reload();
         app
