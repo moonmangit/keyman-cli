@@ -134,6 +134,94 @@ keyman list          # project names only, one per line
   ✓ other-app  1 variable
 ```
 
+## Cloud sync (optional)
+
+Cloud sync lets you use your projects on more than one computer. It also lets you share projects with a group. If you do not sign in, Keyman does not change and does not use the network.
+
+### What the cloud keeps
+
+Keyman encrypts your projects on your computer. The server keeps only encrypted data. This includes project names, variable names, and values.
+
+The server can see these items:
+
+- Email addresses.
+- Who is in which group.
+- The number and size of your projects.
+- The times of changes.
+
+Sync is manual. Keyman syncs only when you run `keyman push` or `keyman pull`. Keyman does not sync `.env` files. It syncs only the projects in the master file.
+
+### Sign in
+
+```sh
+keyman login
+```
+
+Keyman opens your browser. Sign in with GitHub or Google. You can add `--github` or `--google` to skip the question.
+
+The first time, Keyman asks you to make a vault password. Keyman uses it to encrypt your secrets. Keyman cannot reset it. Then Keyman shows a recovery code one time. Write the code down and keep it in a safe place.
+
+**Warning:** If you lose the vault password and the recovery code, nobody can get your cloud data back.
+
+On a new computer, run `keyman login` and type your vault password. If you forget the password, run `keyman recover` and type the recovery code. To change the password, run `keyman password`. Run `keyman logout` to remove the keys from this computer. Your projects and links stay.
+
+### Send a project to the cloud
+
+```sh
+keyman link my-app
+keyman push
+```
+
+`keyman link` encrypts the project and sends it. Keyman remembers the link on this computer. `keyman push` sends later changes. It sends every linked project, or only the project you name. If the cloud has newer changes, Keyman stops. Run `keyman pull` first.
+
+### Get a project from the cloud
+
+On another computer, sign in, then run:
+
+```sh
+keyman pull
+```
+
+Keyman adds new cloud projects to the master file. It also merges the changes of projects that are linked. If the master file has a project with the same name, run `keyman pull my-app` to merge the two. Use `--as <name>` to give a new project a different local name.
+
+### Conflicts
+
+Keyman merges changes variable by variable. A conflict occurs when you and another person change the same variable. Keyman then asks which value to keep. The values stay hidden unless you ask to see them.
+
+To choose without questions, add `--keep-local` or `--keep-cloud`. If Keyman cannot ask you and you add no option, Keyman stops and changes nothing.
+
+### Share with a group
+
+```sh
+keyman group create team
+keyman group invite team sam@example.com
+keyman link my-app --group team
+```
+
+You are the owner of a group you make. Only the owner can invite and remove people. All members can read and change the projects of the group.
+
+The invited person signs in with the same email address and runs `keyman pull`. The person then waits. Keyman gives the person access when a member of the group runs `keyman pull`. Then the invited person runs `keyman pull` again.
+
+Other group commands:
+
+```sh
+keyman group list                          # your groups
+keyman group remove team sam@example.com   # remove a person or cancel an invite
+keyman group delete team                   # delete the group and its projects
+```
+
+When you remove a person, Keyman makes a new key and encrypts the projects again.
+
+**Accepted risk:** Keyman gives access when the email address matches. A person who controls the server could give a false key.
+
+### Check and remove links
+
+```sh
+keyman cloud status         # each link and its state, without the network
+keyman unlink my-app        # remove the link on this computer only
+keyman cloud delete my-app  # delete the project from the cloud for all members
+```
+
 ## Commands
 
 | Command | What it does |
@@ -149,6 +237,16 @@ keyman list          # project names only, one per line
 | `keyman save [project] [directory]` | Save `.env` back into the master file (`--dry-run`, `--replace`, `--new`) |
 | `keyman export [project]` | Print `export` lines for your shell |
 | `keyman run [project] [--] <command>...` | Run a command with the project's variables |
+| `keyman login [--github] [--google]` | Sign in to Keyman Cloud |
+| `keyman logout` | Sign out and remove the keys from this computer |
+| `keyman recover [--github] [--google]` | Set a new vault password with your recovery code |
+| `keyman password` | Change your vault password |
+| `keyman link [project] [--group <name>]` | Connect a project to Keyman Cloud |
+| `keyman unlink [project]` | Remove the cloud link on this computer |
+| `keyman push [project]` | Send local changes to the cloud |
+| `keyman pull [project] [--as <name>] [--keep-local] [--keep-cloud]` | Get changes from the cloud and merge them |
+| `keyman cloud <status\|delete> [project]` | Show the cloud links, or delete a project from the cloud |
+| `keyman group <create\|invite\|remove\|list\|delete> [group] [email]` | Share projects with a group |
 | `keyman completions <shell>` | Print a shell completion script |
 | `keyman help [command]` | Show help; `keyman <command> --help` also works |
 

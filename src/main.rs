@@ -1362,4 +1362,71 @@ mod tests {
         assert!(run(&variables, &[]).is_err());
         assert!(run(&variables, &[OsString::from("keyman-no-such-program")]).is_err());
     }
+
+    /// Restores an environment variable when dropped.
+    struct EnvGuard(&'static str, Option<OsString>);
+
+    impl EnvGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let old = env::var_os(name);
+            env::set_var(name, value);
+            EnvGuard(name, old)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(old) => env::set_var(self.0, old),
+                None => env::remove_var(self.0),
+            }
+        }
+    }
+
+    /// A user who linked a project and kept a session must still work offline:
+    /// the server address does not answer, so any network call would hang.
+    #[test]
+    fn existing_commands_do_no_network() {
+        let fixture = Fixture::new("my-app:\n  API_KEY: \"secret\"\n");
+        fixture.load();
+        let target = fixture.root.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join(".env"), "API_KEY=\"changed\"\n").unwrap();
+        fs::write(
+            fixture.home.join(".keyman_sync"),
+            r#"{"user_id":"u1","email":"a@example.com","refresh_token":"token","links":[{"project":"my-app","cloud_id":"c1","vault_id":"v1","version":1,"base":[["API_KEY","secret"]],"cloud_name":"my-app"}]}"#,
+        )
+        .unwrap();
+
+        let _home = EnvGuard::set("HOME", &fixture.home);
+        let _profile = EnvGuard::set("USERPROFILE", &fixture.home);
+        let _url = EnvGuard::set("KEYMAN_SUPABASE_URL", "http://192.0.2.1:9");
+        let target_arg = target.as_os_str().to_owned();
+        let app = OsString::from("my-app");
+        let commands: Vec<Vec<OsString>> = vec![
+            vec!["status".into()],
+            vec!["show".into(), app.clone()],
+            vec!["inject".into(), app.clone(), target_arg.clone()],
+            vec!["diff".into(), app.clone(), target_arg.clone()],
+            vec![
+                "save".into(),
+                app.clone(),
+                target_arg.clone(),
+                "--dry-run".into(),
+            ],
+            vec!["export".into(), app],
+        ];
+
+        let start = std::time::Instant::now();
+        for command in &commands {
+            if let Err(error) = execute(command) {
+                panic!("{command:?} failed: {error}");
+            }
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "the commands took {:?}, so they may use the network",
+            start.elapsed()
+        );
+    }
 }
