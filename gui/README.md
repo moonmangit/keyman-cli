@@ -30,13 +30,15 @@ The window draws its own title bar (breadcrumb, Reload, Full screen, Help, Setti
 
 - **First use**: a card asks if you want to use the cloud. Choose **Skip** to continue without it. You can sign in later.
 - **Account**: open Settings › Account. Sign in with GitHub or Google. The browser opens. The first time, make a vault password. The app then shows a recovery code one time. Write it down and keep it safe. Nobody can reset the vault password.
-- **Recovery and password**: if you forget the vault password, use **Use recovery code**. You can also use it when you are signed in. **Change vault password** sets a new one. **Sign out** ends the session on this computer. The title bar shows a cloud icon and the **Sync** button.
-- **Link**: on a project's page, **Link to cloud** asks where to keep it: Personal or one of your groups. A status line shows the state of the link. The sidebar marks linked projects with ☁ ✓ (in sync) or ☁ ● (local changes). The ⋯ menu on the project page has **Unlink** and **Delete from cloud**. Delete asks you to type the project name.
-- **Sync**: **Sync** gets the changes from the cloud first. Then it sends your changes. A message tells you the result, for example "2 projects updated, 1 added, 1 sent." If a project needs your attention, the **Sync results** dialog lists it. A project with the same name on this computer and in the cloud can be joined with **Merge**.
+- **Recovery and password**: if you forget the vault password, use **Use recovery code**. You can also use it when you are signed in. **Change vault password** sets a new one. **Sign out** ends the session on this computer.
+- **Link**: on a project's page, **Link to cloud** asks where to keep it: Personal or one of your groups. A status line shows the state of the link. In the sidebar, a linked project has a cloud icon with a check mark (in sync) or a dot (changes on this computer). The ⋯ menu on the project page has **Unlink** and **Delete from cloud**. Delete asks you to type the project name.
+- **Sync**: the title bar shows a cloud icon and the **Sync** button. **Sync** gets the changes from the cloud first. Then it sends your changes. A message tells you the result, for example "2 projects updated, 1 added, 1 sent." If a project needs your attention, the **Sync results** dialog lists it. If this computer and the cloud have different projects with the same name, click **Merge** to join them. If you cancel a sync after Keyman got the cloud changes, the message tells you that Keyman did not send your changes.
 - **Conflicts**: if the same variable changed in both places, **Resolve differences** opens. For each variable, choose **This computer**, **Cloud**, or **Type a new value**.
-- **Rejected sign-in**: if the server does not accept your sign-in, the app signs you out and opens the Account page. Sign in again.
+- **Rejected sign-in**: if the server does not accept your saved sign-in, the app signs you out and opens the Account page. Sign in again. If the sign-in expired during one action, the app stays signed in. Click the action again.
 
-Groups stay in the CLI: create, invite, remove, list and delete a group with `keyman group ...`. Also, `keyman pull --as <name>` is only in the CLI.
+If you close Keyman while a cloud action runs, the action stops. Run it again; Keyman continues safely.
+
+Use the CLI to create, invite, remove, list and delete groups (`keyman group ...`) and to get a cloud project with a different name (`keyman pull --as <name>`).
 
 **Languages**: the whole interface is in English and Thai (ไทย). It follows the system's preferred language, or pick one in Settings › Appearance › Language. Thai text uses the system's Thai font with Thai line breaking. Error details passed through from the master-file library stay in English.
 
