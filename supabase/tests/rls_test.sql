@@ -1,6 +1,6 @@
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(71);
+select plan(80);
 
 -- Users: A (owner), B (invitee/member), C (unrelated), D (email not confirmed)
 insert into auth.users (id, email, email_confirmed_at) values
@@ -29,14 +29,23 @@ select throws_ok(
   $$ update public.profiles set email = 'other@example.com' where user_id = 'aaaaaaaa-0000-0000-0000-00000000000a' $$,
   '42501', null, 'profile_update_requires_verified_email');
 
-do $$ begin perform set_config('t.v', public.create_vault('group', 'x', 'k')::text, true); end $$;
+do $$ begin perform set_config('t.v', public.create_vault(gen_random_uuid(), 'group', 'x', 'k')::text, true); end $$;
 select is(
   (select role || ':' || key_generation from public.vault_members
     where vault_id = current_setting('t.v')::uuid and user_id = 'aaaaaaaa-0000-0000-0000-00000000000a'),
   'owner:1', 'create_vault_makes_owner_member');
 
-select lives_ok($$ select public.create_vault('personal', 'x', 'k') $$, 'first personal vault works');
-select throws_ok($$ select public.create_vault('personal', 'x', 'k') $$, '23505', null, 'second_personal_vault_refused');
+select lives_ok($$ select public.create_vault(gen_random_uuid(), 'personal', 'x', 'k') $$, 'first personal vault works');
+select throws_ok($$ select public.create_vault(gen_random_uuid(), 'personal', 'x', 'k') $$, '23505', null, 'second_personal_vault_refused');
+do $$ begin perform set_config('t.ve', public.create_vault('eeeeeeee-0000-0000-0000-00000000000e', 'group', 'x', 'k')::text, true); end $$;
+select is(
+  (select current_setting('t.ve') || ':' || count(*) from public.vault_members
+    where vault_id = 'eeeeeeee-0000-0000-0000-00000000000e' and user_id = 'aaaaaaaa-0000-0000-0000-00000000000a'),
+  'eeeeeeee-0000-0000-0000-00000000000e:1', 'create_vault_uses_client_id');
+select throws_ok($$ select public.create_vault(null, 'group', 'x', 'k') $$, 'P0001', 'the vault needs an id',
+  'create_vault_refuses_null_id');
+select throws_ok($$ select public.create_vault('group', 'x', 'k') $$, '42883', null,
+  'create_vault_old_signature_removed');
 
 -- direct writes to server-owned tables are refused
 select throws_ok(
@@ -103,6 +112,19 @@ select is((select email from public.profiles where user_id = 'aaaaaaaa-0000-0000
   'own_public_columns_readable');
 select is((select (public.my_profile()).private_key_pw), 'pw', 'my_profile_returns_own_row');
 select throws_ok(
+  $$ insert into public.profiles (user_id, email, public_key, kdf_salt, kdf_params, private_key_pw, private_key_recovery)
+     values ('aaaaaaaa-0000-0000-0000-00000000000a', 'a@example.com', 'pk2', 's', '{}', 'pw', 'rec') $$,
+  '23505', null, 'profile_insert_twice_refused (setup on a second computer)');
+select throws_ok(
+  $$ update public.profiles set public_key = 'pk2' where user_id = 'aaaaaaaa-0000-0000-0000-00000000000a' $$,
+  'P0001', 'the public key cannot change', 'public_key_is_immutable');
+select lives_ok(
+  $$ update public.profiles set private_key_pw = 'pw2', kdf_salt = 's2', private_key_recovery = 'rec2'
+     where user_id = 'aaaaaaaa-0000-0000-0000-00000000000a' $$,
+  'profile_patch_of_wrapped_keys_works');
+select is((select (public.my_profile()).private_key_pw || ':' || (public.my_profile()).public_key), 'pw2:pk',
+  'profile_patch_keeps_public_key');
+select throws_ok(
   $$ select private_key_pw from public.profiles where user_id = 'bbbbbbbb-0000-0000-0000-00000000000b' $$,
   '42501', null, 'member_or_inviter_cannot_read_private_key_columns');
 
@@ -158,6 +180,9 @@ set local role authenticated;
 select throws_ok(
   $$ select public.accept_invite(current_setting('t.inv')::uuid, 'cccccccc-0000-0000-0000-00000000000c', 'k', 1) $$,
   'P0001', 'the user does not match the invite email', 'accept_invite_needs_matching_email');
+select throws_ok(
+  $$ select public.accept_invite(current_setting('t.inv')::uuid, 'bbbbbbbb-0000-0000-0000-00000000000b', 'kb', null) $$,
+  'P0001', 'the group key changed; run the command again', 'accept_invite_refuses_null_generation');
 select lives_ok(
   $$ select public.accept_invite(current_setting('t.inv')::uuid, 'bbbbbbbb-0000-0000-0000-00000000000b', 'kb', 1) $$,
   'accept_invite_by_member runs');
@@ -332,14 +357,14 @@ end $$;
 select is(current_setting('t.n')::int, 0, 'vaults_delete refuses a personal vault');
 
 do $$ declare n int; begin
-  perform set_config('t.v3', public.create_vault('group', 'z', 'k')::text, true);
+  perform set_config('t.v3', public.create_vault(gen_random_uuid(), 'group', 'z', 'k')::text, true);
   delete from public.vaults where id = current_setting('t.v3')::uuid;
   get diagnostics n = row_count; perform set_config('t.n', n::text, true);
 end $$;
 select is(current_setting('t.n')::int, 1, 'vaults_delete lets the owner delete a group vault');
 
 -- ===== duplicate-key hole: keys [A, A] must not leave B on a stale key =====
-do $$ begin perform set_config('t.v2', public.create_vault('group', 'y', 'k')::text, true); end $$;
+do $$ begin perform set_config('t.v2', public.create_vault(gen_random_uuid(), 'group', 'y', 'k')::text, true); end $$;
 reset role;
 -- add B and C as members of V2 (setup as postgres; the client path is covered by accept_invite above)
 insert into public.vault_members (vault_id, user_id, role, wrapped_key, key_generation) values
@@ -368,6 +393,9 @@ select throws_ok(
 -- ===== emails must be lowercase (as postgres) =====
 reset role;
 select throws_ok(
+  $$ update public.profiles set public_key = 'pk3' where user_id = 'bbbbbbbb-0000-0000-0000-00000000000b' $$,
+  'P0001', 'the public key cannot change', 'public_key_is_immutable (also for the service role)');
+select throws_ok(
   $$ insert into public.profiles (user_id, email, public_key, kdf_salt, kdf_params, private_key_pw, private_key_recovery)
      values ('dddddddd-0000-0000-0000-00000000000d', 'Up@Example.com', 'pk', 's', '{}', 'pw', 'rec') $$,
   '23514', null, 'profile_email_must_be_lowercase');
@@ -383,7 +411,7 @@ select throws_ok($$ select * from public.vaults $$, '42501', null, 'anon_denied_
 select throws_ok($$ select * from public.vault_members $$, '42501', null, 'anon_denied_vault_members');
 select throws_ok($$ select * from public.invites $$, '42501', null, 'anon_denied_invites');
 select throws_ok($$ select * from public.projects $$, '42501', null, 'anon_denied_projects');
-select throws_ok($$ select public.create_vault('group', 'x', 'k') $$, '42501', null, 'anon_denied_create_vault');
+select throws_ok($$ select public.create_vault(gen_random_uuid(), 'group', 'x', 'k') $$, '42501', null, 'anon_denied_create_vault');
 
 reset role;
 select * from finish();
