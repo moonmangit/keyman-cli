@@ -210,6 +210,8 @@ jobs:
           mkdir -p dist/assets
           for binary_dir in dist/native/*; do
             target="${binary_dir##*/}"
+            # The pattern also matches the app artifacts CI uploads; only the CLI is released.
+            [[ "$target" == keyman-app-* ]] && continue
             if test -f "$binary_dir/keyman.exe"; then
               cp "$binary_dir/keyman.exe" "dist/assets/keyman-$target.exe"
             else
