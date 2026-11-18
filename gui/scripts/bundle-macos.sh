@@ -2,6 +2,7 @@
 # Builds Keyman.app (release, with its icon) into target/release/bundle/.
 #   scripts/bundle-macos.sh            build for this Mac
 #   scripts/bundle-macos.sh --universal  Apple silicon + Intel in one app
+#   scripts/bundle-macos.sh --target x86_64-apple-darwin  one target (the release builds each in its own job)
 # Signs ad hoc; set KEYMAN_SIGN_IDENTITY to sign with a Developer ID instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -16,6 +17,10 @@ if [[ "${1:-}" == "--universal" ]]; then
   bin=$(mktemp -d)/keyman-app
   lipo -create -output "$bin" \
     target/aarch64-apple-darwin/release/keyman-app target/x86_64-apple-darwin/release/keyman-app
+elif [[ "${1:-}" == "--target" ]]; then
+  rustup target add "$2" >/dev/null
+  cargo build --locked --release --target "$2"
+  bin=target/$2/release/keyman-app
 else
   cargo build --release
   bin=target/release/keyman-app

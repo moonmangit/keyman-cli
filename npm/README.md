@@ -38,4 +38,4 @@ keyman completions bash           # also zsh, fish, powershell
 
 Run `keyman help <command>` for details. Keep the master file private and ignore `.env` in Git.
 
-Prebuilt binaries are included for Windows x64, macOS Intel and Apple Silicon, and Linux x64 and ARM64. No Rust installation is needed. On Windows systems that block the native executable, the command can use WSL if it is installed. The executable is available as both `keyman` and `keyman-cli`. [Source and full documentation](https://github.com/moonmangit/keyman-cli).
+Prebuilt binaries are included for Windows x64 and macOS Intel and Apple Silicon. No Rust installation is needed. For Linux, build from source: `cargo install --git https://github.com/moonmangit/keyman-cli`. The executable is available as both `keyman` and `keyman-cli`. [Source and full documentation](https://github.com/moonmangit/keyman-cli).

@@ -44,7 +44,7 @@ Use the CLI to create, invite, remove, list and delete groups (`keyman group ...
 
 **Languages**: the whole interface is in English and Thai (ไทย). It follows the system's preferred language, or pick one in Settings › Appearance › Language. Thai text uses the bundled Noto Sans Thai (`assets/fonts`, alongside Inter, both under the SIL Open Font License) with Thai line breaking. Error details passed through from the master-file library stay in English.
 
-**Settings** (⌘, / Ctrl+,): window size presets, remembered folders, overwrite confirmation and Git warning (General); language, System/Light/Dark theme, accent colour and interface size (Appearance); clipboard clear time and re-hiding values (Privacy); version, paths and links (About). Settings and tied folders are saved between launches.
+**Settings** (⌘, / Ctrl+,): window size presets, remembered folders, overwrite confirmation and Git warning (General); language, System/Light/Dark theme, accent colour and interface size (Appearance); clipboard clear time and re-hiding values (Privacy); version, paths, links and updates (About). Settings and tied folders are saved between launches.
 
 **Help** (F1): getting started, keyboard shortcuts and the CLI-to-app mapping.
 
@@ -66,6 +66,12 @@ gui/scripts/try-stages.sh
 
 It builds the CLI and the app, makes a demo master file with a staged project and three tied folders (one in sync, one that differs, one without a `.env`), prints CLI commands to try, and opens the app on it. The demo has its own home folder and app settings, so `~/.keyman.yml` and your settings stay as they are, and Keyman Cloud points at an address that does not answer. Add `--reset` to start again, or `--cli` to skip opening the app.
 
+## Updates
+
+**Settings › About › Updates** asks GitHub for the newest release. When it is newer, **Update now** downloads the zip for this system (`Keyman-windows-x64.zip`, `Keyman-macos-arm64.zip` or `Keyman-macos-x64.zip`), checks it against the release's `SHA256SUMS.txt`, and puts it in place of the running copy. Then **Restart now** opens the new version. Your settings stay. If Keyman is installed for all users, Windows asks for administrator permission and macOS asks for your password. A build that runs from `target/` does not replace itself.
+
+**Check for updates automatically** (on by default) checks once a day when Keyman starts and shows a message when a newer version is available. Keyman installs an update only when you click **Update now**. The code is in `src/update.rs`.
+
 ## App icon and packaging
 
 `assets/icon.svg` is the source artwork. `assets/make-icons.sh` regenerates every format from it (needs macOS and ImageMagick):
@@ -84,7 +90,7 @@ cd gui && scripts/bundle-macos.sh
 cd gui && scripts/bundle-macos.sh --universal
 ```
 
-The app lands in `target/release/bundle/Keyman.app`; `--universal` builds one app for Apple silicon and Intel.
+The app lands in `target/release/bundle/Keyman.app`; `--universal` builds one app for Apple silicon and Intel, and `--target <triple>` builds one target (the release builds each in its own job).
 
 **Windows**: build with the MSVC toolchain. The executable carries its icon and version details, and release builds open no console window.
 

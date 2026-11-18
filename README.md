@@ -15,7 +15,7 @@ No more copying `.env` files between machines, digging through chat history for 
 npm install -g keyman-cli
 ```
 
-Works on Windows, macOS (Intel and Apple Silicon), and Linux (x64 and ARM64). Rust is not needed. The command is `keyman` (or `keyman-cli`).
+Works on Windows x64 and macOS (Intel and Apple Silicon). Rust is not needed. For Linux, build it from source: `cargo install --git https://github.com/moonmangit/keyman-cli`. The command is `keyman` (or `keyman-cli`).
 
 ## Quick start
 
@@ -367,15 +367,13 @@ Every pull request runs [CI](.github/workflows/ci.yml):
 - the CLI's format, lint and tests on Linux, macOS and Windows
 - a shell completion check
 - the cloud end-to-end and database tests against a local Supabase stack
-- the desktop app's lint, tests and build on macOS and Windows
+- the desktop app's lint and tests on macOS and Windows
 
-The app builds are kept as downloadable run artifacts for 14 days.
-
-Every merge to `main` runs the [release workflow](.github/workflows/release.yml). It runs the same CI, builds the CLI for five targets, and smoke tests the npm package on Linux and Windows. When the version in `Cargo.toml` has no `vX.Y.Z` tag yet, the same run releases it: it tags the merged commit, creates the GitHub release with the notes from `CHANGELOG.md`, and publishes the npm package through the configured npm trusted publisher.
+Every merge to `main` runs the [release workflow](.github/workflows/release.yml). It runs the same CI and, at the same time, builds the CLI and the desktop app for Windows x64, macOS Apple silicon and macOS Intel, then smoke tests the npm package on macOS and Windows. When the version in `Cargo.toml` has no `vX.Y.Z` tag yet, the same run releases it after CI and all builds pass: it tags the merged commit, creates the GitHub release with the notes from `CHANGELOG.md`, the CLI binaries, the app zips (`Keyman-windows-x64.zip`, `Keyman-macos-arm64.zip`, `Keyman-macos-x64.zip`) and `SHA256SUMS.txt`, and publishes the npm package through the configured npm trusted publisher. The desktop app's updater reads these zips and checks them against `SHA256SUMS.txt`.
 
 To release:
 
-1. Set the new version in `Cargo.toml` and `npm/package.json`. They must match.
+1. Set the new version in `Cargo.toml`, `gui/Cargo.toml` and `npm/package.json`. All three must match.
 2. Add a `## X.Y.Z` section to `CHANGELOG.md`.
 3. Merge to `main`.
 

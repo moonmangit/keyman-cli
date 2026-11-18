@@ -22,7 +22,8 @@ if (!target) {
 
 const binary = path.join(__dirname, 'native', target, `keyman${process.platform === 'win32' ? '.exe' : ''}`);
 if (!fs.existsSync(binary)) {
-  console.error(`keyman: binary for ${platform} is missing from this package`);
+  // Releases have Windows and macOS builds only for now.
+  console.error(`keyman: this package has no build for ${platform}. Build it from source: cargo install --git https://github.com/moonmangit/keyman-cli`);
   process.exit(1);
 }
 

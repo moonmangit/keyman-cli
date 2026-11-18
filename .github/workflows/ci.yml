@@ -63,9 +63,10 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup update stable
       - uses: Swatinem/rust-cache@v2
+      # An exact version: "latest" asks the GitHub API each run and fails at its rate limit.
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
+          version: 3.2.0
       - name: Start the local Supabase stack
         run: supabase start
       - name: Database tests
@@ -78,16 +79,13 @@ jobs:
         if: always()
         run: supabase stop --no-backup
 
+  # Lint and test only: the release workflow builds the app bundles.
   app:
     name: App · ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-15
-            artifact: keyman-app-macos
-          - os: windows-2022
-            artifact: keyman-app-windows
+        os: [macos-15, windows-2022]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -101,19 +99,3 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      - name: Build Keyman.app (ad hoc signed)
-        if: runner.os == 'macOS'
-        run: |
-          scripts/bundle-macos.sh --universal
-          cd target/release/bundle && ditto -c -k --keepParent Keyman.app ../Keyman-macos.zip
-      - name: Build keyman-app.exe
-        if: runner.os == 'Windows'
-        run: cargo build --locked --release
-      - uses: actions/upload-artifact@v6
-        with:
-          name: ${{ matrix.artifact }}
-          path: |
-            gui/target/release/Keyman-macos.zip
-            gui/target/release/keyman-app.exe
-          if-no-files-found: error
-          retention-days: 14

@@ -1921,9 +1921,13 @@ dependencies = [
 name = "keyman-app"
 version = "0.3.0"
 dependencies = [
+ "base64 0.22.1",
  "keyman-cli",
  "rune",
  "rune-i18n",
+ "serde_json",
+ "sha2",
+ "ureq",
  "winresource",
  "zeroize",
 ]
