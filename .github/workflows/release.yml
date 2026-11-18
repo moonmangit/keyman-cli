@@ -1,13 +1,17 @@
-name: Build
+name: Release
 
-# Releases are made on a Windows PC with scripts/release-windows.ps1, not here.
-# Every merge to main checks the release build: it builds the CLI and the desktop
-# app for Windows x64 with the release profile, and packs and smoke tests the npm
-# package. It does not run CI again (the pull request already passed it); a manual
-# run does. Nothing is tagged or published.
+# Builds Keyman for Windows x64 and publishes it as a GitHub release, like Sigit.
+# To release: set the same version in Cargo.toml, gui/Cargo.toml and npm/package.json,
+# add its "## X.Y.Z" section to CHANGELOG.md, merge, then push the tag:
+#   git tag v0.3.2 && git push origin v0.3.2
+# A merge to main, or a manual run (Actions › Release › Run workflow), builds everything
+# without publishing. macOS and Linux build from source for now.
+#
+# The npm trusted publisher is tied to this file's name: keep it release.yml.
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -18,14 +22,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  plan:
-    name: Check versions
-    runs-on: ubuntu-24.04
+  build:
+    name: Build · Windows x64
+    runs-on: windows-2022
     outputs:
-      version: ${{ steps.plan.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - id: plan
+
+      - id: version
+        name: Check the versions (and the tag and changelog on a release)
         shell: bash
         run: |
           set -euo pipefail
@@ -36,27 +42,21 @@ jobs:
             echo "::error::Cargo.toml has $version, gui/Cargo.toml has $app_version and npm/package.json has $npm_version. Set all three to the same version."
             exit 1
           fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::The tag $GITHUB_REF_NAME does not agree with the version $version."
+              exit 1
+            fi
+            if ! grep -qx "## $version" CHANGELOG.md; then
+              echo "::error::CHANGELOG.md has no '## $version' section."
+              exit 1
+            fi
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  # A merge to main skips CI: the pull request already passed the same CI. A manual
-  # run still runs it.
-  ci:
-    name: CI
-    needs: plan
-    if: github.ref != 'refs/heads/main'
-    uses: ./.github/workflows/ci.yml
-
-  # Windows only for now: macOS runners wait in a long queue (a release job waited
-  # 15 minutes and never started). macOS builds from source.
-  build:
-    name: Build · Windows x64
-    needs: plan
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@v7
       - run: rustup update stable
-      # The same key on every run, so each run starts from the cache that the last
-      # run on main saved. Only main and tags save it.
+      # The same key on every run, so each run starts from the cache that the last run on
+      # main or a tag saved.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-Windows
@@ -64,64 +64,54 @@ jobs:
           workspaces: |
             . -> target
             gui -> target
-      - name: CLI and app
+
+      - name: Build the CLI and the app
         shell: pwsh
         run: |
-          cargo build --locked --release --target x86_64-pc-windows-msvc
+          cargo build --locked --release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Push-Location gui
-          cargo build --locked --release --target x86_64-pc-windows-msvc
+          cargo build --locked --release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
-          New-Item -ItemType Directory dist/cli-x86_64-pc-windows-msvc, dist/app | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release/keyman.exe dist/cli-x86_64-pc-windows-msvc/
-          Copy-Item gui/target/x86_64-pc-windows-msvc/release/keyman-app.exe dist/app/Keyman.exe
-          Compress-Archive -Path dist/app/Keyman.exe -DestinationPath dist/app/Keyman-windows-x64.zip
-          Remove-Item dist/app/Keyman.exe
-      - uses: actions/upload-artifact@v6
-        with:
-          name: build-Windows
-          path: dist/
-          if-no-files-found: error
 
-  # Packs the npm package and runs it, on Windows (no macOS runner to wait for).
-  package:
-    needs: [plan, build]
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: build-*
-          path: built
-          merge-multiple: true
+      - name: Package the CLI and the app zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist, dist/app | Out-Null
+          Copy-Item target/release/keyman.exe dist/keyman-x86_64-pc-windows-msvc.exe
+          Copy-Item gui/target/release/keyman-app.exe dist/app/Keyman.exe
+          # The app's updater downloads this zip.
+          Compress-Archive -Path dist/app/Keyman.exe -DestinationPath dist/Keyman-windows-x64.zip
+          Remove-Item -Recurse dist/app
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $exe = (Resolve-Path gui/target/release/keyman-app.exe).Path
+          & $iscc /Q "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceExe=$exe" "/O$((Resolve-Path dist).Path)" installer/windows/keyman.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist/Keyman-setup-windows-x64.exe
+
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-      - name: Verify and pack
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(node -p "require('./npm/package.json').version")" = "${{ needs.plan.outputs.version }}"
-          for dir in built/cli-*; do
-            target="${dir#built/cli-}"
-            mkdir -p "npm/bin/native/$target"
-            cp "$dir"/* "npm/bin/native/$target/"
-          done
-          test -f npm/bin/native/x86_64-pc-windows-msvc/keyman.exe
-          test -f built/app/Keyman-windows-x64.zip
-          mkdir -p dist
-          npm pack ./npm --pack-destination dist
-      - name: Install and run the npm command
+      - name: Pack and smoke test the npm package
         shell: pwsh
         run: |
+          New-Item -ItemType Directory npm/bin/native/x86_64-pc-windows-msvc -Force | Out-Null
+          Copy-Item target/release/keyman.exe npm/bin/native/x86_64-pc-windows-msvc/keyman.exe
+          npm pack ./npm --pack-destination dist
+          if ($LASTEXITCODE -ne 0) { throw 'npm pack failed' }
           $installRoot = Join-Path $env:RUNNER_TEMP 'keyman-install'
           $packagePath = (Get-ChildItem -Path dist -Filter '*.tgz' | Select-Object -First 1).FullName
           npm install --prefix $installRoot $packagePath
           if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
           $command = Join-Path $installRoot 'node_modules/.bin/keyman.cmd'
-          $version = & $command --version
-          if ($version -notmatch [regex]::Escape('${{ needs.plan.outputs.version }}')) { throw "keyman --version said $version" }
+          $said = & $command --version
+          if ($said -notmatch [regex]::Escape('${{ steps.version.outputs.version }}')) { throw "keyman --version said $said" }
           $project = Join-Path $env:RUNNER_TEMP 'keyman-project'
           New-Item -ItemType Directory -Path $project | Out-Null
           $master = Join-Path $env:RUNNER_TEMP 'keyman-master.yml'
@@ -130,12 +120,74 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'keyman load failed' }
           & $command inject smoke:staging $project
           if ($LASTEXITCODE -ne 0) { throw 'keyman inject failed' }
-          $env_text = Get-Content -LiteralPath (Join-Path $project '.env') -Raw
-          if ($env_text -notmatch 'KEY="ok"' -or $env_text -notmatch 'STAGE="s"') {
-            throw 'The .env contents did not match'
-          }
+          $text = Get-Content -LiteralPath (Join-Path $project '.env') -Raw
+          if ($text -notmatch 'KEY="ok"' -or $text -notmatch 'STAGE="s"') { throw 'The .env contents did not match' }
+
       - uses: actions/upload-artifact@v6
         with:
-          name: npm-package
-          path: dist/*.tgz
+          name: release-files
+          path: dist/
           if-no-files-found: error
+
+  github-release:
+    name: Publish the GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    # Add required reviewers to the "release" environment (Settings › Environments) to
+    # approve each release by hand before it is published.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-files
+          path: dist
+      - name: Checksums and release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The changelog section for this version, without its heading.
+          awk -v heading="## $VERSION" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          # The app's updater checks each download against this file.
+          (cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Keyman $VERSION" --notes-file notes.md
+
+  npm-publish:
+    name: Publish to npm
+    needs: [build, github-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-files
+          path: dist
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - name: Publish with npm trusted publishing
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          if npm view "keyman-cli@$VERSION" version >/dev/null 2>&1; then
+            echo "keyman-cli@$VERSION is already published"
+          else
+            npm publish ./dist/*.tgz --access public
+          fi

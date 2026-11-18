@@ -66,6 +66,10 @@ gui/scripts/try-stages.sh
 
 It builds the CLI and the app, makes a demo master file with a staged project and three tied folders (one in sync, one that differs, one without a `.env`), prints CLI commands to try, and opens the app on it. The demo has its own home folder and app settings, so `~/.keyman.yml` and your settings stay as they are, and Keyman Cloud points at an address that does not answer. Add `--reset` to start again, or `--cli` to skip opening the app.
 
+## Install on Windows
+
+Download `Keyman-setup-windows-x64.exe` from the [newest release](https://github.com/moonmangit/keyman-cli/releases/latest) and double-click it. It installs for your user only (no administrator permission) into `%LOCALAPPDATA%\Programs\Keyman`, with a Start menu entry, an optional desktop shortcut and an uninstaller (Settings › Apps). The uninstaller keeps your settings and your master file. The installer is built from `../installer/windows/keyman.iss` with Inno Setup.
+
 ## Updates
 
 **Settings › About › Updates** asks GitHub for the newest release. When it is newer, **Update now** downloads the zip for this system (`Keyman-windows-x64.zip`; releases have a Windows build only for now, so on macOS the page links to the release page), checks it against the release's `SHA256SUMS.txt`, and puts it in place of the running copy. Then **Restart now** opens the new version. Your settings stay. If Keyman is installed for all users, Windows asks for administrator permission and macOS asks for your password. A build that runs from `target/` does not replace itself.
