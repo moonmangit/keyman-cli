@@ -20,7 +20,7 @@ The window draws its own title bar (breadcrumb, Reload, Full screen, Help, Setti
 
 **Sync on tie**: tying a folder syncs it straight away. A folder with no `.env` gets one written; one that already matches is left alone. When its `.env` disagrees with the master file, **Resolve differences** opens: for each variable, keep the master value (the default), keep the `.env` value, or type a new one. Applying writes the result into both the master file and the folder's `.env`, so they end in sync. The same resolver is available later from a folder's action panel and from the overwrite warning.
 
-**Languages**: the whole interface is in English and Thai (ไทย). It follows the system's preferred language, or pick one in Settings › Appearance › Language. Thai text uses the system's Thai font with Thai line breaking. Error details passed through from the master-file library stay in English.
+**Languages**: the whole interface is in English and Thai (ไทย). It follows the system's preferred language, or pick one in Settings › Appearance › Language. Thai text uses the bundled Noto Sans Thai (`assets/fonts`, alongside Inter, both under the SIL Open Font License) with Thai line breaking. Error details passed through from the master-file library stay in English.
 
 **Settings** (⌘, / Ctrl+,): window size presets, remembered folders, overwrite confirmation and Git warning (General); language, System/Light/Dark theme, accent colour and interface size (Appearance); clipboard clear time and re-hiding values (Privacy); version, paths and links (About). Settings and tied folders are saved between launches.
 

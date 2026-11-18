@@ -823,6 +823,16 @@ fn thai(s: &mut App) {
     i18n::set(i18n::Language::Thai);
 }
 
+/// The weights the views use (400, 500, 600) of Inter and of Noto Sans Thai.
+const FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../assets/fonts/Inter-Medium.ttf"),
+    include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/NotoSansThai-Regular.ttf"),
+    include_bytes!("../assets/fonts/NotoSansThai-Medium.ttf"),
+    include_bytes!("../assets/fonts/NotoSansThai-SemiBold.ttf"),
+];
+
 fn main() {
     let app = RuneApp::new(AppSpec::<App> {
         min_size: Some((820.0, 560.0)),
@@ -904,6 +914,10 @@ fn main() {
                 s.dialog = Some(Dialog::Help(HelpPage::Start));
             }),
         ],
+        // Registering our own fonts replaces Rune's built-in Inter, so Inter ships here too.
+        // Latin draws in Inter; Thai, which Inter lacks, falls through to Noto Sans Thai.
+        fonts: FONTS,
+        families: ("Inter, Noto Sans Thai", "Inter, Noto Sans Thai"),
         ..AppSpec::new(
             "Keyman",
             (1100.0, 740.0),
