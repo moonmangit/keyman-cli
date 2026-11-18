@@ -1,8 +1,9 @@
 name: Build and release
 
-# Every merge to main runs the full CI and, at the same time, builds the CLI and the
-# desktop app for Windows and macOS. When the version in Cargo.toml has no tag yet,
-# the same run releases, but only after CI and every build pass: it tags the merged
+# Every merge to main builds the CLI and the desktop app for Windows and macOS. (It
+# does not run CI again: the pull request already passed it. A tag push or a manual
+# run does run CI.) When the version in Cargo.toml has no tag yet, the same run
+# releases, but only after every build (and CI, when it runs) passes: it tags the merged
 # commit, creates the GitHub release from CHANGELOG.md (with the app zips and
 # SHA256SUMS.txt, which the app's updater reads), and publishes to npm. So releasing
 # is: bump the version (Cargo.toml, gui/Cargo.toml, npm/package.json), add its
@@ -68,12 +69,17 @@ jobs:
             echo "### v$version is already released: testing and packaging only" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  # A merge to main skips CI: the pull request already passed the same CI. (Set
+  # "Require status checks to pass" on main, so that no merge skips it.) A tag push
+  # or a manual run still runs CI first.
   ci:
     name: CI
     needs: plan
+    if: github.ref != 'refs/heads/main'
     uses: ./.github/workflows/ci.yml
 
-  # Starts with CI, not after it. The release jobs below wait for both.
+  # Two build jobs only, one of them on macOS: GitHub has few macOS runners, and each
+  # more macOS job can wait in its queue.
   build:
     name: Build · ${{ matrix.name }}
     needs: plan
@@ -83,114 +89,90 @@ jobs:
         include:
           - name: Windows x64
             os: windows-2022
-            target: x86_64-pc-windows-msvc
-            app: Keyman-windows-x64.zip
-          - name: macOS Apple silicon
-            os: macos-15
-            target: aarch64-apple-darwin
-            app: Keyman-macos-arm64.zip
-          - name: macOS Intel
-            # Built on the faster Apple silicon runners, for the Intel target.
-            os: macos-15
-            target: x86_64-apple-darwin
-            app: Keyman-macos-x64.zip
+          - name: macOS universal
+            # Intel runners: GitHub's macOS arm64 runners have capacity limits, and a
+            # release job waited 15 minutes for one and never started. The Intel
+            # runner builds the Apple silicon part too.
+            os: macos-15-intel
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - run: rustup update stable && rustup target add ${{ matrix.target }}
-      - name: App toolchain target
-        working-directory: gui
-        run: rustup target add ${{ matrix.target }}
+      - run: rustup update stable
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+        if: runner.os == 'macOS'
+      # The same key on every run of a job, so each run starts from the cache that the
+      # last run on main saved. Only main and tags save it.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          shared-key: release-${{ runner.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
           workspaces: |
             . -> target
             gui -> target
-      - name: CLI
-        run: cargo build --locked --release --target ${{ matrix.target }}
-      - name: App (Windows)
+      - name: CLI and app (Windows)
         if: runner.os == 'Windows'
-        working-directory: gui
         shell: pwsh
         run: |
-          cargo build --locked --release --target ${{ matrix.target }}
+          cargo build --locked --release --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          New-Item -ItemType Directory dist | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/keyman-app.exe dist/Keyman.exe
-          Compress-Archive -Path dist/Keyman.exe -DestinationPath ${{ matrix.app }}
-      - name: App (macOS)
+          Push-Location gui
+          cargo build --locked --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          New-Item -ItemType Directory dist/cli-x86_64-pc-windows-msvc, dist/app | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/keyman.exe dist/cli-x86_64-pc-windows-msvc/
+          Copy-Item gui/target/x86_64-pc-windows-msvc/release/keyman-app.exe dist/app/Keyman.exe
+          Compress-Archive -Path dist/app/Keyman.exe -DestinationPath dist/app/Keyman-windows-x64.zip
+          Remove-Item dist/app/Keyman.exe
+      - name: CLI and app (macOS)
         if: runner.os == 'macOS'
-        working-directory: gui
         run: |
-          scripts/bundle-macos.sh --target ${{ matrix.target }}
-          ditto -c -k --keepParent target/release/bundle/Keyman.app ${{ matrix.app }}
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --locked --release --target "$target"
+            mkdir -p "dist/cli-$target"
+            cp "target/$target/release/keyman" "dist/cli-$target/"
+          done
+          # One app for Apple silicon and Intel.
+          (cd gui && scripts/bundle-macos.sh --universal)
+          mkdir -p dist/app
+          ditto -c -k --keepParent gui/target/release/bundle/Keyman.app dist/app/Keyman-macos.zip
       - uses: actions/upload-artifact@v6
         with:
-          name: cli-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/keyman${{ runner.os == 'Windows' && '.exe' || '' }}
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v6
-        with:
-          name: app-${{ matrix.target }}
-          path: gui/${{ matrix.app }}
+          name: build-${{ runner.os }}
+          path: dist/
           if-no-files-found: error
 
+  # Packs the npm package and runs it, on Windows (no macOS runner to wait for).
   package:
     needs: [plan, build]
-    # Apple silicon: the smoke test runs the macOS arm64 binary.
-    runs-on: macos-15
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          pattern: cli-*
-          path: native
+          pattern: build-*
+          path: built
+          merge-multiple: true
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-      - name: Verify and package npm release
+      - name: Verify and pack
         shell: bash
         run: |
           set -euo pipefail
           test "$(node -p "require('./npm/package.json').version")" = "${{ needs.plan.outputs.version }}"
-          for dir in native/cli-*; do
-            target="${dir#native/cli-}"
+          for dir in built/cli-*; do
+            target="${dir#built/cli-}"
             mkdir -p "npm/bin/native/$target"
             cp "$dir"/* "npm/bin/native/$target/"
           done
           test -f npm/bin/native/x86_64-pc-windows-msvc/keyman.exe
           test -f npm/bin/native/x86_64-apple-darwin/keyman
           test -f npm/bin/native/aarch64-apple-darwin/keyman
-          chmod +x npm/bin/native/*/keyman
+          test -f built/app/Keyman-windows-x64.zip
+          test -f built/app/Keyman-macos.zip
           mkdir -p dist
           npm pack ./npm --pack-destination dist
-          mkdir -p "$RUNNER_TEMP/keyman-home" "$RUNNER_TEMP/keyman-project"
-          npm install --prefix "$RUNNER_TEMP/keyman-install" ./dist/*.tgz
-          printf 'smoke:\n  KEY: "ok"\n  staging:\n    STAGE: "s"\n' > "$RUNNER_TEMP/keyman-master.yml"
-          keyman="$RUNNER_TEMP/keyman-install/node_modules/.bin/keyman"
-          HOME="$RUNNER_TEMP/keyman-home" "$keyman" --version | grep -F "${{ needs.plan.outputs.version }}"
-          HOME="$RUNNER_TEMP/keyman-home" "$keyman" load "$RUNNER_TEMP/keyman-master.yml"
-          HOME="$RUNNER_TEMP/keyman-home" "$keyman" inject smoke:staging "$RUNNER_TEMP/keyman-project"
-          grep -Fx 'KEY="ok"' "$RUNNER_TEMP/keyman-project/.env"
-          grep -Fx 'STAGE="s"' "$RUNNER_TEMP/keyman-project/.env"
-      - uses: actions/upload-artifact@v6
-        with:
-          name: npm-package
-          path: dist/*.tgz
-          if-no-files-found: error
-
-  windows-package-smoke:
-    needs: package
-    runs-on: windows-2022
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: npm-package
-          path: dist
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
       - name: Install and run the npm command
         shell: pwsh
         run: |
@@ -198,22 +180,31 @@ jobs:
           $packagePath = (Get-ChildItem -Path dist -Filter '*.tgz' | Select-Object -First 1).FullName
           npm install --prefix $installRoot $packagePath
           if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
+          $command = Join-Path $installRoot 'node_modules/.bin/keyman.cmd'
+          $version = & $command --version
+          if ($version -notmatch [regex]::Escape('${{ needs.plan.outputs.version }}')) { throw "keyman --version said $version" }
           $project = Join-Path $env:RUNNER_TEMP 'keyman-project'
           New-Item -ItemType Directory -Path $project | Out-Null
           $master = Join-Path $env:RUNNER_TEMP 'keyman-master.yml'
-          [System.IO.File]::WriteAllText($master, "smoke:`n  KEY: `"ok`"`n")
-          $command = Join-Path $installRoot 'node_modules/.bin/keyman.cmd'
+          [System.IO.File]::WriteAllText($master, "smoke:`n  KEY: `"ok`"`n  staging:`n    STAGE: `"s`"`n")
           & $command load $master
           if ($LASTEXITCODE -ne 0) { throw 'keyman load failed' }
-          & $command inject smoke $project
+          & $command inject smoke:staging $project
           if ($LASTEXITCODE -ne 0) { throw 'keyman inject failed' }
-          if ((Get-Content -LiteralPath (Join-Path $project '.env') -Raw) -notmatch 'KEY="ok"') {
+          $env_text = Get-Content -LiteralPath (Join-Path $project '.env') -Raw
+          if ($env_text -notmatch 'KEY="ok"' -or $env_text -notmatch 'STAGE="s"') {
             throw 'The .env contents did not match'
           }
+      - uses: actions/upload-artifact@v6
+        with:
+          name: npm-package
+          path: dist/*.tgz
+          if-no-files-found: error
 
   github-release:
-    if: needs.plan.outputs.release == 'true'
-    needs: [plan, ci, package, windows-package-smoke]
+    # Runs when CI passed or was skipped (a merge to main), never after a failure.
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.release == 'true' }}
+    needs: [plan, ci, package]
     runs-on: ubuntu-24.04
     # Add required reviewers to the "release" environment (Settings › Environments)
     # to approve each release by hand before anything is tagged or published.
@@ -228,12 +219,8 @@ jobs:
           path: dist
       - uses: actions/download-artifact@v8
         with:
-          pattern: cli-*
-          path: dist/native
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: app-*
-          path: dist/assets
+          pattern: build-*
+          path: dist/built
           merge-multiple: true
       - name: Publish GitHub release
         shell: bash
@@ -250,8 +237,10 @@ jobs:
             found && /^## / { exit }
             found { print }
           ' CHANGELOG.md > notes.md
-          for binary_dir in dist/native/cli-*; do
-            target="${binary_dir#dist/native/cli-}"
+          mkdir -p dist/assets
+          cp dist/built/app/* dist/assets/
+          for binary_dir in dist/built/cli-*; do
+            target="${binary_dir#dist/built/cli-}"
             if test -f "$binary_dir/keyman.exe"; then
               cp "$binary_dir/keyman.exe" "dist/assets/keyman-$target.exe"
             else
@@ -269,7 +258,7 @@ jobs:
           fi
 
   npm-publish:
-    if: needs.plan.outputs.release == 'true'
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.release == 'true' }}
     needs: [plan, package, github-release]
     runs-on: ubuntu-24.04
     permissions:

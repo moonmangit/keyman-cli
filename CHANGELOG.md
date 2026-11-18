@@ -5,12 +5,12 @@
 ### New
 
 - **Updates in the desktop app.** Settings › About › Updates checks GitHub for a newer release and installs it with one click (**Update now**, then **Restart now**). Each download is checked against the release's `SHA256SUMS.txt`. The app also checks once a day at start; switch this off with **Check for updates automatically**.
-- Releases include the desktop app: `Keyman-windows-x64.zip`, `Keyman-macos-arm64.zip` and `Keyman-macos-x64.zip`.
+- Releases include the desktop app: `Keyman-windows-x64.zip`, and `Keyman-macos.zip` (one universal app for Apple silicon and Intel).
 
 ### Changed
 
 - Releases have Windows and macOS builds only. The Linux CLI binaries are not built for now; build them from source.
-- Faster releases: the builds run at the same time as CI, use a build cache, and run on Apple silicon runners for macOS. Pull requests no longer build the app bundles.
+- Faster releases: a merge to `main` does not run CI again (the pull request already passed it), the CLI and the app build in two jobs (Windows, and one macOS job), the builds use a build cache that each run on `main` saves, the macOS jobs use Intel runners (the arm64 runners had long queues), and the npm package is packed and tested in one Windows job. Pull requests no longer build the app bundles.
 
 ## 0.3.0
 
