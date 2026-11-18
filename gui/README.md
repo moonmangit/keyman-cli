@@ -40,7 +40,7 @@ If you close Keyman while a cloud action runs, the action stops. Run it again; K
 
 Use the CLI to create, invite, remove, list and delete groups (`keyman group ...`) and to get a cloud project with a different name (`keyman pull --as <name>`).
 
-**Languages**: the whole interface is in English and Thai (ไทย). It follows the system's preferred language, or pick one in Settings › Appearance › Language. Thai text uses the system's Thai font with Thai line breaking. Error details passed through from the master-file library stay in English.
+**Languages**: the whole interface is in English and Thai (ไทย). It follows the system's preferred language, or pick one in Settings › Appearance › Language. Thai text uses the bundled Noto Sans Thai (`assets/fonts`, alongside Inter, both under the SIL Open Font License) with Thai line breaking. Error details passed through from the master-file library stay in English.
 
 **Settings** (⌘, / Ctrl+,): window size presets, remembered folders, overwrite confirmation and Git warning (General); language, System/Light/Dark theme, accent colour and interface size (Appearance); clipboard clear time and re-hiding values (Privacy); version, paths and links (About). Settings and tied folders are saved between launches.
 
