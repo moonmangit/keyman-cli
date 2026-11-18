@@ -369,24 +369,26 @@ Every pull request runs [CI](.github/workflows/ci.yml):
 - the cloud end-to-end and database tests against a local Supabase stack
 - the desktop app's lint and tests on macOS and Windows
 
-Every merge to `main` runs the [build workflow](.github/workflows/release.yml). It builds the CLI and the desktop app for Windows x64 with the release profile, and packs and smoke tests the npm package. It does not run CI again, because the pull request already passed it. It does not publish anything.
+The [release workflow](.github/workflows/release.yml) builds Keyman for Windows x64 on GitHub: the CLI, the desktop app, its installer (Inno Setup, `installer/windows/keyman.iss`) and the npm package, which it smoke tests. A merge to `main` or a manual run only builds. A `vX.Y.Z` tag also publishes. macOS and Linux build from source for now.
 
-Releases are made on a Windows PC with [`scripts/release-windows.ps1`](scripts/release-windows.ps1). macOS and Linux are not built for now; build them from source.
+To release:
 
 1. Set the new version in `Cargo.toml`, `gui/Cargo.toml` and `npm/package.json`. All three must match.
 2. Add a `## X.Y.Z` section to `CHANGELOG.md`.
-3. Merge to `main`, then on the PC: `git switch main && git pull`.
-4. Check the build without publishing:
+3. Merge to `main`, then push the tag:
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -DryRun
+   ```bash
+   git switch main && git pull && git tag vX.Y.Z && git push origin vX.Y.Z
    ```
 
-5. Release:
+The workflow then creates the GitHub release with the notes from `CHANGELOG.md` and these files, and publishes the npm package through the npm trusted publisher:
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File scripts/release-windows.ps1
-   ```
+| File | For |
+|---|---|
+| `Keyman-setup-windows-x64.exe` | People: download it and double-click it to install the app |
+| `Keyman-windows-x64.zip` | The app's updater |
+| `keyman-x86_64-pc-windows-msvc.exe` | The CLI |
+| `keyman-cli-X.Y.Z.tgz` | npm |
+| `SHA256SUMS.txt` | The checksums; the updater checks each download against it |
 
-   It builds the CLI and the app, packs the npm package, writes `SHA256SUMS.txt`, and creates the GitHub release `vX.Y.Z` on the current commit of `main` with the notes from `CHANGELOG.md`. The files are `keyman-x86_64-pc-windows-msvc.exe`, `Keyman-windows-x64.zip` (the desktop app's updater reads it), `keyman-cli-X.Y.Z.tgz` and `SHA256SUMS.txt`.
-6. Publish npm with your login: `npm login`, then the `npm publish` command that the script shows.
+To approve each release before it is published, add required reviewers to the `release` environment in the repository settings.

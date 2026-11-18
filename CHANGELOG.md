@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.2
+
+### New
+
+- **Windows installer.** Download `Keyman-setup-windows-x64.exe` and double-click it. It installs the desktop app for your user only (no administrator permission), adds a Start menu entry, an optional desktop shortcut and an uninstaller, and the app can update itself in that folder.
+
+### Changed
+
+- Releases are built and published on GitHub again, like Sigit: push a `vX.Y.Z` tag. One Windows job builds the CLI, the app zip, the installer and the npm package. `scripts/release-windows.ps1` is removed.
+
 ## 0.3.1
 
 ### New
