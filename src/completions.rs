@@ -2,7 +2,7 @@
 //! match the commands and options. Project names come from `keyman list` at
 //! completion time, so they stay current as the master file changes.
 
-use crate::cli::{COMMANDS, PROJECT_COMMANDS, SHELLS};
+use crate::cli::{flag_name, COMMANDS, PROJECT_COMMANDS, SHELLS};
 use crate::ui::did_you_mean;
 
 /// Commands whose second argument is a directory.
@@ -14,7 +14,7 @@ fn flag_table() -> Vec<(&'static str, String)> {
         .iter()
         .filter(|spec| !spec.flags.is_empty())
         .map(|spec| {
-            let flags: Vec<&str> = spec.flags.iter().map(|(flag, _)| *flag).collect();
+            let flags: Vec<&str> = spec.flags.iter().map(|(flag, _)| flag_name(flag)).collect();
             (spec.name, flags.join(" "))
         })
         .collect()
@@ -31,6 +31,7 @@ pub fn script(shell: &str) -> Result<String, String> {
     let projects_bar = PROJECT_COMMANDS.join("|");
     let projects_space = PROJECT_COMMANDS.join(" ");
     let directories_bar = DIRECTORY_COMMANDS.join("|");
+    let directories_space = DIRECTORY_COMMANDS.join(" ");
     let flags = flag_table();
 
     let script = match shell {
@@ -55,16 +56,21 @@ _keyman() {{
   fi
   case $command in
     {projects_bar})
-      if (( COMP_CWORD == 2 )); then
-        COMPREPLY=($(compgen -W "$(keyman list 2>/dev/null)" -- "$cur"))
-      elif [[ $command == @({directories_bar}) ]] && (( COMP_CWORD == 3 )); then
-        COMPREPLY=($(compgen -d -- "$cur"))
+      # Bash splits words at ':', so read 'project:stage' from the line itself.
+      local line=${{COMP_LINE:0:COMP_POINT}} parts
+      read -ra parts <<< "$line"
+      [[ $line == *[[:space:]] ]] && parts+=("")
+      local word=${{parts[${{#parts[@]}}-1]}}
+      if (( ${{#parts[@]}} == 3 )); then
+        COMPREPLY=($(compgen -W "$(keyman list 2>/dev/null)" -- "$word"))
+        [[ $word == *:* ]] && COMPREPLY=("${{COMPREPLY[@]#"${{word%:*}}:"}}")
+      elif [[ " {directories_space} " == *" $command "* ]] && (( ${{#parts[@]}} == 4 )); then
+        COMPREPLY=($(compgen -d -- "$word"))
       fi ;;
     completions) COMPREPLY=($(compgen -W "{shells}" -- "$cur")) ;;
     help) COMPREPLY=($(compgen -W "{names}" -- "$cur")) ;;
   esac
 }}
-shopt -s extglob
 complete -o default -F _keyman keyman keyman-cli
 "#
             )
@@ -124,10 +130,12 @@ compdef _keyman keyman keyman-cli
                     clean(spec.summary)
                 ));
                 for (flag, description) in spec.flags {
+                    let name = flag_name(flag);
+                    let needs_value = if flag.len() > name.len() { " -r" } else { "" };
                     lines.push(format!(
-                        "complete -c keyman -n '__fish_seen_subcommand_from {}' -l {} -d '{}'",
+                        "complete -c keyman -n '__fish_seen_subcommand_from {}' -l {}{needs_value} -d '{}'",
                         spec.name,
-                        flag.trim_start_matches('-'),
+                        name.trim_start_matches('-'),
                         clean(description)
                     ));
                 }

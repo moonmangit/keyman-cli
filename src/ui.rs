@@ -240,6 +240,25 @@ fn strip_verbatim(text: &str) -> String {
     }
 }
 
+/// Control characters and Unicode format characters (category Cf), such as
+/// the bidirectional overrides and the zero width characters.
+pub fn is_hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(c as u32,
+            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x180E
+            | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+            | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// Text that another person or the server made (a project name, a variable
+/// name, a group name), safe to show in a terminal: hidden characters
+/// become '?'.
+pub fn safe_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if is_hidden(c) { '?' } else { c })
+        .collect()
+}
+
 pub fn plural(count: usize, word: &str) -> String {
     if count == 1 {
         format!("1 {word}")
@@ -317,6 +336,16 @@ mod tests {
         assert_eq!(strip_verbatim(r"\\?\C:\work\.env"), r"C:\work\.env");
         assert_eq!(strip_verbatim(r"\\?\UNC\server\share"), r"\\server\share");
         assert_eq!(strip_verbatim("/home/me/.env"), "/home/me/.env");
+    }
+
+    #[test]
+    fn hidden_characters_are_replaced_in_shown_text() {
+        assert_eq!(safe_text("a\u{1b}[31mb"), "a?[31mb");
+        assert_eq!(safe_text("a\u{202E}b\u{200B}c\u{2066}d"), "a?b?c?d");
+        assert_eq!(safe_text("line1\nline2"), "line1?line2");
+        assert_eq!(safe_text("แอป-app"), "แอป-app");
+        assert!(is_hidden('\u{FEFF}'));
+        assert!(!is_hidden('a'));
     }
 
     #[test]

@@ -4,3 +4,5 @@
 /npm/dist/
 *.tgz
 .npmrc
+/gui/target/
+.superpowers/

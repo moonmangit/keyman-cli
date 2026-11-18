@@ -1,0 +1,1847 @@
+//! Keyman Cloud screens: the Account page, the first-use card, the title-bar cloud icon, and
+//! the dialogs for the questions a cloud task asks (vault password, recovery code).
+
+use std::sync::atomic::Ordering;
+
+use keyman_cli::cloud::sync::LinkStatus;
+use rune::{Color, El, TextEdit, TextStyle, Tx, col, el, icon, row, text, text_input};
+use zeroize::Zeroizing;
+
+use crate::cloud::{self, Ask, Attention, Busy, CloudState, SyncSummary};
+use crate::i18n::{count, t};
+use crate::icons as ic;
+use crate::widgets::*;
+use crate::{App, Dialog, SettingsPage};
+
+/// The shortest vault password Keyman accepts, in characters.
+const MIN_PASSWORD: usize = 10;
+
+/// The recovery code, shown large.
+const CODE: TextStyle = TextStyle::new(19.0, 500.0).mono();
+
+/// Why the two new vault password entries cannot be used, or `None` when they can.
+pub fn new_password_error(a: &str, b: &str) -> Option<&'static str> {
+    if a.chars().count() < MIN_PASSWORD {
+        Some(t(
+            "The password must have 10 characters or more.",
+            "รหัสผ่านต้องมีอย่างน้อย 10 ตัวอักษร",
+        ))
+    } else if a != b {
+        Some(t(
+            "The two passwords are not the same.",
+            "รหัสผ่านทั้งสองช่องไม่ตรงกัน",
+        ))
+    } else {
+        None
+    }
+}
+
+/// The first-use card shows when a master file is loaded, nobody is signed in, the person
+/// did not skip it before, and no dialog is open.
+pub fn show_first_use(loaded: bool, cloud: &CloudState, done: bool, dialog_open: bool) -> bool {
+    loaded && *cloud == CloudState::SignedOut && !done && !dialog_open
+}
+
+/// Whether the dialog fields hold a complete answer to `ask`.
+pub fn can_answer(ask: &Ask, first: &str, second: &str) -> bool {
+    match ask {
+        Ask::NewPassword => new_password_error(first, second).is_none(),
+        Ask::ShowRecoveryCode(code) => !first.trim().is_empty() && same_code(first, code),
+        Ask::Password { .. } | Ask::RecoveryCode => !first.is_empty(),
+        // The cloud resolver answers these.
+        Ask::Resolve { .. } => false,
+    }
+}
+
+/// The new-password error to show now: nothing before the person types.
+fn shown_password_error(a: &str, b: &str) -> Option<&'static str> {
+    let error = new_password_error(a, b)?;
+    let short = a.chars().count() < MIN_PASSWORD;
+    ((short && !a.is_empty()) || (!short && !b.is_empty())).then_some(error)
+}
+
+/// A recovery code's characters as the library compares them (`normalize_recovery_code`:
+/// no spaces or dashes, upper case), without a copy: a dialog checks the code on each frame.
+fn code_chars(code: &str) -> impl Iterator<Item = char> + '_ {
+    code.chars()
+        .filter(|c| *c != ' ' && *c != '-')
+        .flat_map(char::to_uppercase)
+}
+
+fn same_code(typed: &str, code: &str) -> bool {
+    code_chars(typed).eq(code_chars(code))
+}
+
+/// The recovery code in two lines of four groups, wiped when dropped.
+fn code_lines(code: &str) -> Vec<Zeroizing<String>> {
+    let groups: Vec<&str> = code.split('-').collect();
+    groups
+        .chunks(4)
+        .map(|line| Zeroizing::new(line.join("-")))
+        .collect()
+}
+
+// ── Title bar ───────────────────────────────────────────────────────────────
+
+/// The title-bar cloud icon: signed out, signed in, or busy. A click opens Settings › Account.
+pub fn cloud_button(s: &App, p: Paint) -> El {
+    let (glyph, tint, tip) = match (&s.busy, &s.cloud) {
+        (Some(busy), _) => (
+            &ic::CLOUD_UP,
+            p.accent,
+            format!("Keyman Cloud · {}", busy.label),
+        ),
+        (None, CloudState::SignedIn { email }) => (
+            &ic::CLOUD_CHECK,
+            p.green,
+            tf!(
+                "Keyman Cloud · signed in as {}",
+                "Keyman Cloud · ลงชื่อเข้าใช้เป็น {}",
+                email
+            ),
+        ),
+        (None, CloudState::SignedOut) => (
+            &ic::CLOUD,
+            p.muted,
+            t(
+                "Keyman Cloud · not signed in",
+                "Keyman Cloud · ยังไม่ได้ลงชื่อเข้าใช้",
+            )
+            .to_owned(),
+        ),
+    };
+    el().key("tb-cloud")
+        .role("button")
+        .label(&tip)
+        .help(&tip)
+        .size(30.0, 30.0)
+        .center()
+        .radius(7.0)
+        .focusable(true)
+        .hover(p.hover)
+        .press(p.press)
+        .on_press(|s: &mut App| s.dialog = Some(Dialog::Settings(SettingsPage::Account)))
+        .child(icon(glyph, 17.0).color(tint).a11y_hidden())
+}
+
+// ── First-use card ──────────────────────────────────────────────────────────
+
+pub fn first_use_card(s: &App, p: Paint) -> El {
+    let idle = cloud::can_start(&s.busy);
+    // The Account page shows the sign-in while it runs: the browser link and Cancel.
+    let sign_in = |provider: &'static str| {
+        move |s: &mut App, _: &mut Tx| {
+            s.cloud_sign_in(provider);
+            s.dialog = Some(Dialog::Settings(SettingsPage::Account));
+        }
+    };
+    card(p, "cloud-first-use")
+        .padding(16.0)
+        .gap(14.0)
+        .child(
+            row()
+                .w_full()
+                .gap(14.0)
+                .center_y()
+                .child(icon_tile(&ic::CLOUD, 40.0, p.accent, p.dark))
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(3.0)
+                        .child(
+                            text(t(
+                                "Keep an encrypted copy in Keyman Cloud?",
+                                "เก็บสำเนาที่เข้ารหัสไว้ใน Keyman Cloud ไหม",
+                            ))
+                            .font(H2)
+                            .color(p.text)
+                            .wrap(),
+                        )
+                        .child(
+                            text(t(
+                                "Only you can read it. You can also sign in later in Settings › Account.",
+                                "มีเพียงคุณที่อ่านได้ และลงชื่อเข้าใช้ภายหลังได้ที่ การตั้งค่า › บัญชี",
+                            ))
+                            .font(SMALL)
+                            .color(p.muted)
+                            .wrap(),
+                        ),
+                ),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(button(
+                    p,
+                    "first-github",
+                    t("Sign in with GitHub", "ลงชื่อเข้าใช้ด้วย GitHub"),
+                    None,
+                    Kind::Primary,
+                    idle,
+                    sign_in("github"),
+                ))
+                .child(button(
+                    p,
+                    "first-google",
+                    t("Sign in with Google", "ลงชื่อเข้าใช้ด้วย Google"),
+                    None,
+                    Kind::Secondary,
+                    idle,
+                    sign_in("google"),
+                ))
+                .child(el().grow(1.0))
+                .child(button(
+                    p,
+                    "first-skip",
+                    t("Skip", "ข้าม"),
+                    None,
+                    Kind::Ghost,
+                    true,
+                    |s, _| s.skip_cloud_prompt(),
+                )),
+        )
+}
+
+// ── Settings › Account ──────────────────────────────────────────────────────
+
+/// A text button for a less common action.
+fn link_button(
+    p: Paint,
+    key: &str,
+    label: &str,
+    enabled: bool,
+    f: impl Fn(&mut App, &mut Tx) + 'static,
+) -> El {
+    let b = row()
+        .key(key)
+        .role("button")
+        .label(label)
+        .h(26.0)
+        .px(6.0)
+        .center_y()
+        .radius(6.0)
+        .disabled(!enabled)
+        .child(
+            text(label.to_owned())
+                .font(BODY_STRONG)
+                .color(p.accent)
+                .a11y_hidden(),
+        );
+    if enabled {
+        b.focusable(true)
+            .hover(p.hover)
+            .press(p.press)
+            .on_press_tx(f)
+    } else {
+        b.opacity(0.45)
+    }
+}
+
+/// The running task: its label, **Cancel**, and the sign-in link while the browser waits.
+fn busy_box(p: Paint, busy: &Busy) -> El {
+    let cancelling = busy.cancel.load(Ordering::SeqCst);
+    let mut b = col()
+        .key("cloud-busy")
+        .w_full()
+        .padding(16.0)
+        .gap(12.0)
+        .radius(10.0)
+        .fill(p.card)
+        .border(1.0, p.border)
+        .child(
+            row()
+                .w_full()
+                .gap(10.0)
+                .center_y()
+                .child(icon(&ic::CLOUD_UP, 18.0).color(p.accent).a11y_hidden())
+                .child(
+                    text(busy.label)
+                        .font(BODY_STRONG)
+                        .color(p.text)
+                        .role("status")
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(button(
+                    p,
+                    "cloud-cancel",
+                    t("Cancel", "ยกเลิก"),
+                    None,
+                    Kind::Secondary,
+                    !cancelling,
+                    |s, _| s.cloud_cancel(),
+                )),
+        );
+    if let Some(link) = &busy.link {
+        b = b.child(
+            col()
+                .key("cloud-link")
+                .w_full()
+                .gap(6.0)
+                .child(
+                    text(t(
+                        "If the browser does not open, open this link:",
+                        "ถ้าเบราว์เซอร์ไม่เปิดขึ้นมา ให้เปิดลิงก์นี้:",
+                    ))
+                    .font(SMALL)
+                    .color(p.muted)
+                    .wrap(),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .center_y()
+                        .child(
+                            row()
+                                .key("cloud-link-box")
+                                .h(30.0)
+                                .px(10.0)
+                                .center_y()
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .radius(7.0)
+                                .fill(field_fill(p))
+                                .border(1.0, p.border)
+                                .child(
+                                    text(link.clone())
+                                        .font(MONO_SMALL)
+                                        .color(p.text)
+                                        .truncate()
+                                        .selectable(true)
+                                        .grow(1.0)
+                                        .min_w(0.0),
+                                ),
+                        )
+                        .child(button(
+                            p,
+                            "cloud-copy-link",
+                            t("Copy", "คัดลอก"),
+                            Some(&ic::COPY),
+                            Kind::Secondary,
+                            true,
+                            |s, tx| {
+                                if let Some(link) = s.busy.as_ref().and_then(|b| b.link.clone()) {
+                                    tx.copy(link);
+                                    s.ok(t("Copied the link.", "คัดลอกลิงก์แล้ว"));
+                                }
+                            },
+                        )),
+                ),
+        );
+    }
+    b
+}
+
+/// Settings › Account: sign in, or the signed-in account, and the running task.
+pub fn account_page(s: &App, p: Paint) -> El {
+    let idle = cloud::can_start(&s.busy);
+    let mut page = col().w_full().gap(22.0).child(
+        row()
+            .key("cloud-head")
+            .w_full()
+            .gap(16.0)
+            .center_y()
+            .child(icon_tile(&ic::CLOUD, 48.0, p.accent, p.dark))
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(4.0)
+                    .child(text("Keyman Cloud").font(H1).color(p.text))
+                    .child(
+                        text(t(
+                            "Keep an encrypted copy of your projects. The server cannot read them.",
+                            "เก็บสำเนาที่เข้ารหัสของโปรเจกต์ไว้บนคลาวด์ เซิร์ฟเวอร์อ่านข้อมูลนี้ไม่ได้",
+                        ))
+                        .font(BODY)
+                        .color(p.muted)
+                        .wrap(),
+                    ),
+            ),
+    );
+    if let Some(busy) = &s.busy {
+        page = page.child(busy_box(p, busy));
+    }
+    page = page.child(match &s.cloud {
+        CloudState::SignedIn { email } => signed_in_group(p, email, idle),
+        CloudState::SignedOut if s.recover_pick => recover_group(p, idle),
+        CloudState::SignedOut => sign_in_group(p, idle),
+    });
+    if !s.cloud_store {
+        page = page.child(
+            row()
+                .key("cloud-no-store")
+                .w_full()
+                .gap(8.0)
+                .child(icon(&ic::INFO, 14.0).color(p.faint))
+                .child(
+                    text(t(
+                        "This computer has no credential store. Keyman asks for the vault password at each cloud action.",
+                        "เครื่องนี้ไม่มีที่เก็บรหัสผ่านของระบบ Keyman จึงถามรหัสผ่านตู้นิรภัยทุกครั้งที่ทำงานกับคลาวด์",
+                    ))
+                    .font(SMALL)
+                    .color(p.muted)
+                    .wrap()
+                    .grow(1.0)
+                    .min_w(0.0),
+                ),
+        );
+    }
+    page
+}
+
+/// The two provider buttons, each running `action` with "github" or "google".
+fn provider_buttons(p: Paint, key: &str, idle: bool, action: fn(&mut App, &'static str)) -> El {
+    row()
+        .key(key)
+        .gap(8.0)
+        .child(button(
+            p,
+            &format!("{key}-github"),
+            t("Sign in with GitHub", "ลงชื่อเข้าใช้ด้วย GitHub"),
+            None,
+            Kind::Primary,
+            idle,
+            move |s, _| action(s, "github"),
+        ))
+        .child(button(
+            p,
+            &format!("{key}-google"),
+            t("Sign in with Google", "ลงชื่อเข้าใช้ด้วย Google"),
+            None,
+            Kind::Secondary,
+            idle,
+            move |s, _| action(s, "google"),
+        ))
+}
+
+fn sign_in_group(p: Paint, idle: bool) -> El {
+    settings_group(
+        p,
+        "g-sign-in",
+        t("SIGN IN", "ลงชื่อเข้าใช้"),
+        vec![
+            col()
+                .key("sign-in-body")
+                .w_full()
+                .py(14.0)
+                .gap(12.0)
+                .child(
+                    text(t(
+                        "Use your GitHub or Google account. The first time, you make a vault password and get a recovery code.",
+                        "ใช้บัญชี GitHub หรือ Google ครั้งแรกคุณจะตั้งรหัสผ่านตู้นิรภัยและได้รับรหัสกู้คืน",
+                    ))
+                    .font(SMALL)
+                    .color(p.muted)
+                    .wrap(),
+                )
+                .child(provider_buttons(p, "sign-in", idle, App::cloud_sign_in)),
+            row()
+                .key("recover-row")
+                .w_full()
+                .py(10.0)
+                .gap(6.0)
+                .center_y()
+                .child(
+                    text(t(
+                        "Forgot the vault password?",
+                        "ลืมรหัสผ่านตู้นิรภัยใช่ไหม",
+                    ))
+                    .font(SMALL)
+                    .color(p.muted),
+                )
+                .child(link_button(
+                    p,
+                    "use-recovery",
+                    t("Use recovery code", "ใช้รหัสกู้คืน"),
+                    idle,
+                    |s, _| s.recover_pick = true,
+                )),
+        ],
+    )
+}
+
+/// **Use recovery code**: the provider to sign in with first.
+fn recover_group(p: Paint, idle: bool) -> El {
+    settings_group(
+        p,
+        "g-recover",
+        t("RECOVERY CODE", "รหัสกู้คืน"),
+        vec![
+            col()
+                .key("recover-body")
+                .w_full()
+                .py(14.0)
+                .gap(12.0)
+                .child(
+                    text(t(
+                        "Sign in, then type your recovery code and make a new vault password.",
+                        "ลงชื่อเข้าใช้ แล้วพิมพ์รหัสกู้คืนและตั้งรหัสผ่านตู้นิรภัยใหม่",
+                    ))
+                    .font(SMALL)
+                    .color(p.muted)
+                    .wrap(),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .child(provider_buttons(p, "recover", idle, App::cloud_recover))
+                        .child(el().grow(1.0))
+                        .child(button(
+                            p,
+                            "recover-back",
+                            t("Back", "ย้อนกลับ"),
+                            None,
+                            Kind::Ghost,
+                            true,
+                            |s, _| s.recover_pick = false,
+                        )),
+                ),
+        ],
+    )
+}
+
+fn signed_in_group(p: Paint, email: &str, idle: bool) -> El {
+    settings_group(
+        p,
+        "g-account",
+        t("ACCOUNT", "บัญชี"),
+        vec![
+            setting_row(
+                p,
+                "cloud-email",
+                &tf!("Signed in as {}", "ลงชื่อเข้าใช้เป็น {}", email),
+                t(
+                    "Keyman keeps an encrypted copy of the projects that you link.",
+                    "Keyman เก็บสำเนาที่เข้ารหัสของโปรเจกต์ที่คุณเชื่อมไว้",
+                ),
+                button(
+                    p,
+                    "cloud-sign-out",
+                    t("Sign out", "ออกจากระบบ"),
+                    None,
+                    Kind::Secondary,
+                    idle,
+                    |s, _| s.dialog = Some(Dialog::ConfirmSignOut),
+                ),
+            ),
+            setting_row(
+                p,
+                "cloud-recover",
+                t("Forgot the vault password?", "ลืมรหัสผ่านตู้นิรภัยใช่ไหม"),
+                t(
+                    "Type your recovery code and make a new vault password.",
+                    "พิมพ์รหัสกู้คืนแล้วตั้งรหัสผ่านตู้นิรภัยใหม่",
+                ),
+                button(
+                    p,
+                    "cloud-use-recovery",
+                    t("Use recovery code", "ใช้รหัสกู้คืน"),
+                    Some(&ic::KEY),
+                    Kind::Secondary,
+                    idle,
+                    |s, _| s.cloud_recover_signed_in(),
+                ),
+            ),
+            setting_row(
+                p,
+                "cloud-password",
+                t("Vault password", "รหัสผ่านตู้นิรภัย"),
+                t(
+                    "Keyman uses it to encrypt your secrets.",
+                    "Keyman ใช้รหัสผ่านนี้เข้ารหัสความลับของคุณ",
+                ),
+                button(
+                    p,
+                    "cloud-change-password",
+                    t("Change vault password", "เปลี่ยนรหัสผ่านตู้นิรภัย"),
+                    Some(&ic::LOCK),
+                    Kind::Secondary,
+                    idle,
+                    |s, _| s.cloud_change_password(),
+                ),
+            ),
+        ],
+    )
+}
+
+/// **Sign out** asks first.
+pub fn confirm_sign_out(p: Paint) -> El {
+    let back = |s: &mut App, _: &mut Tx| s.dialog = Some(Dialog::Settings(SettingsPage::Account));
+    col()
+        .key("confirm-sign-out")
+        .role("alertdialog")
+        .label(t("Sign out of Keyman Cloud?", "ออกจากระบบ Keyman Cloud ไหม"))
+        .w(440.0)
+        .padding(22.0)
+        .gap(14.0)
+        .radius(14.0)
+        .fill(p.bg)
+        .border(1.0, p.border)
+        .shadow(20.0, 60.0, Color::BLACK.alpha(0.4))
+        .child(icon_tile(&ic::CLOUD, 40.0, p.yellow, p.dark))
+        .child(
+            text(t("Sign out of Keyman Cloud?", "ออกจากระบบ Keyman Cloud ไหม"))
+                .font(H2)
+                .color(p.text),
+        )
+        .child(
+            text(t(
+                "Keyman removes the sign-in and the vault key from this computer. Your projects and their cloud links stay. To sign in again, you need the vault password.",
+                "Keyman จะลบการลงชื่อเข้าใช้และกุญแจตู้นิรภัยออกจากเครื่องนี้ โปรเจกต์และการเชื่อมกับคลาวด์ยังอยู่ หากต้องการลงชื่อเข้าใช้อีกครั้ง คุณต้องใช้รหัสผ่านตู้นิรภัย",
+            ))
+            .font(BODY)
+            .color(p.muted)
+            .wrap(),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .pt(6.0)
+                .child(el().grow(1.0))
+                .child(button(
+                    p,
+                    "sign-out-cancel",
+                    t("Cancel", "ยกเลิก"),
+                    None,
+                    Kind::Secondary,
+                    true,
+                    back,
+                ))
+                .child(button(
+                    p,
+                    "sign-out-confirm",
+                    t("Sign out", "ออกจากระบบ"),
+                    None,
+                    Kind::Danger,
+                    true,
+                    move |s, tx| {
+                        back(s, tx);
+                        s.cloud_sign_out();
+                    },
+                )),
+        )
+}
+
+// ── Project cloud state ─────────────────────────────────────────────────────
+
+/// The header status line for a project: `(English, Thai)`. `None` is a project that is not in
+/// the cloud. (`Missing` does not occur for a project that shows.)
+pub fn status_label(status: Option<&LinkStatus>) -> (&'static str, &'static str) {
+    match status {
+        Some(LinkStatus::Synced) => ("Synced", "ซิงก์แล้ว"),
+        Some(LinkStatus::LocalChanges) => ("Changes on this computer", "มีการเปลี่ยนแปลงในเครื่องนี้"),
+        // `Missing` is a linked name that is not in the master file: no page shows it.
+        Some(LinkStatus::Missing) | None => ("Not in the cloud", "ไม่ได้อยู่ในคลาวด์"),
+    }
+}
+
+/// Unlink is local, but it writes the same state file as a cloud task: not while one runs.
+pub fn can_unlink(busy: &Option<Busy>) -> bool {
+    cloud::can_start(busy)
+}
+
+/// The typed name must be the project name: spaces at the ends do not count, the case does.
+pub fn delete_confirmed(typed: &str, project: &str) -> bool {
+    !project.is_empty() && typed.trim() == project
+}
+
+/// The cloud mark after a linked project's name in the sidebar: a cloud with a check (synced) or
+/// a dot (changes on this computer). `None` for a project that is not linked.
+pub fn sidebar_mark(p: Paint, status: Option<&LinkStatus>) -> Option<El> {
+    let (glyph, tint) = match status? {
+        LinkStatus::Synced => (&ic::CLOUD_CHECK, p.green),
+        LinkStatus::LocalChanges => (&ic::CLOUD_DOT, p.yellow),
+        LinkStatus::Missing => return None,
+    };
+    Some(icon(glyph, 15.0).color(tint).a11y_hidden())
+}
+
+/// The cloud status line in the project header: an icon and the state in words.
+pub fn status_line(p: Paint, status: Option<&LinkStatus>) -> El {
+    let (glyph, tint) = match status {
+        Some(LinkStatus::Synced) => (&ic::CLOUD_CHECK, p.green),
+        Some(LinkStatus::LocalChanges) => (&ic::CLOUD_DOT, p.yellow),
+        Some(LinkStatus::Missing) | None => (&ic::CLOUD, p.muted),
+    };
+    let (en, th) = status_label(status);
+    row()
+        .key("cloud-status")
+        .gap(6.0)
+        .center_y()
+        .child(icon(glyph, 15.0).color(tint).a11y_hidden())
+        .child(
+            text(t(en, th).to_owned())
+                .font(SMALL)
+                .color(tint)
+                .role("status"),
+        )
+}
+
+/// A dialog card with its icon and title, like the sign-out confirm.
+fn sheet(p: Paint, key: &str, title: &str, glyph: &'static rune::Icon, tint: Color) -> El {
+    col()
+        .key(key)
+        .role("dialog")
+        .label(title)
+        .w(440.0)
+        .padding(22.0)
+        .gap(14.0)
+        .radius(14.0)
+        .fill(p.bg)
+        .border(1.0, p.border)
+        .shadow(20.0, 60.0, Color::BLACK.alpha(0.4))
+        .child(icon_tile(glyph, 40.0, tint, p.dark))
+        .child(text(title.to_owned()).font(H2).color(p.text).wrap())
+}
+
+/// One choice of the link picker: a radio row with the place's name.
+fn place(p: Paint, key: String, name: &str, hint: &str, chosen: bool, group: Option<String>) -> El {
+    row()
+        .key(key)
+        .role("radio")
+        .label(name)
+        .checked(chosen)
+        .focusable(true)
+        .w_full()
+        .h(44.0)
+        .px(12.0)
+        .gap(10.0)
+        .center_y()
+        .radius(8.0)
+        .fill(if chosen {
+            p.accent.alpha(if p.dark { 0.2 } else { 0.1 })
+        } else {
+            Color::TRANSPARENT
+        })
+        .border(1.0, if chosen { p.accent } else { p.border })
+        .hover(p.hover)
+        .press(p.press)
+        .on_press(move |s: &mut App| {
+            if let Some(picker) = &mut s.link_picker {
+                picker.choice = group.clone();
+            }
+        })
+        .child(
+            icon(
+                if chosen {
+                    &ic::CHECK_CIRCLE
+                } else {
+                    &ic::CLOUD
+                },
+                17.0,
+            )
+            .color(if chosen { p.accent } else { p.muted })
+            .a11y_hidden(),
+        )
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .child(
+                    text(name.to_owned())
+                        .font(BODY_STRONG)
+                        .color(p.text)
+                        .truncate()
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(hint.to_owned())
+                        .font(SMALL)
+                        .color(p.faint)
+                        .truncate()
+                        .a11y_hidden(),
+                ),
+        )
+}
+
+/// **Link to cloud**: where to keep the project. The groups load first (a cloud task).
+pub fn link_picker_dialog(s: &App, p: Paint) -> El {
+    let Some(picker) = &s.link_picker else {
+        return el();
+    };
+    let project = picker.project.clone();
+    let title = tf!(
+        "Where do you want to keep {}?",
+        "คุณต้องการเก็บ {} ไว้ที่ไหน",
+        project
+    );
+    let mut options = col().key("places").w_full().gap(8.0);
+    match &picker.groups {
+        None => {
+            options = options.child(
+                row().key("loading-groups").w_full().h(44.0).center().child(
+                    text(t("Loading groups…", "กำลังโหลดกลุ่ม…"))
+                        .font(BODY)
+                        .color(p.muted)
+                        .role("status"),
+                ),
+            );
+        }
+        Some(groups) => {
+            options = options.child(place(
+                p,
+                "place-personal".into(),
+                t("Personal", "ส่วนตัว"),
+                t("Only you can open it", "เฉพาะคุณที่เปิดได้"),
+                picker.choice.is_none(),
+                None,
+            ));
+            for (id, name) in groups {
+                options = options.child(place(
+                    p,
+                    format!("place-{id}"),
+                    name,
+                    t("Every member can open it", "สมาชิกทุกคนเปิดได้"),
+                    picker.choice.as_ref() == Some(name),
+                    Some(name.clone()),
+                ));
+            }
+        }
+    }
+    let ready = picker.groups.is_some();
+    let choice = picker.choice.clone();
+    sheet(p, "link-picker", &title, &ic::CLOUD_UP, p.accent)
+        .child(options)
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .pt(6.0)
+                .child(el().grow(1.0))
+                .child(button(
+                    p,
+                    "link-cancel",
+                    t("Cancel", "ยกเลิก"),
+                    None,
+                    Kind::Secondary,
+                    true,
+                    |s, _| s.close_dialog(),
+                ))
+                .child(button(
+                    p,
+                    "link-go",
+                    t("Link", "เชื่อม"),
+                    None,
+                    Kind::Primary,
+                    ready,
+                    move |s, _| s.cloud_link(&project, choice.clone()),
+                )),
+        )
+}
+
+/// **Delete from cloud**: the person types the project name first.
+pub fn delete_dialog(s: &App, p: Paint) -> El {
+    let Some(project) = s.delete_confirm.clone() else {
+        return el();
+    };
+    let ok = delete_confirmed(&s.delete_typed.text, &project) && cloud::can_start(&s.busy);
+    let title = tf!(
+        "Delete {} from the cloud for all members? Type the project name to confirm.",
+        "ลบ {} ออกจากคลาวด์สำหรับสมาชิกทั้งหมดไหม พิมพ์ชื่อโปรเจกต์เพื่อยืนยัน",
+        project
+    );
+    let enter_name = project.clone();
+    let input = text_input(&s.delete_typed, BODY)
+        .key("delete-name")
+        .label(t("Project name", "ชื่อโปรเจกต์"))
+        .single_line()
+        .placeholder(&project, p.faint)
+        .color(p.text)
+        .on_edit(|s: &mut App| &mut s.delete_typed)
+        // `cloud_delete` checks the typed name itself, so Return does nothing before a match.
+        .on_submit(move |s: &mut App, _| s.cloud_delete(&enter_name))
+        .grow(1.0)
+        .min_w(0.0);
+    sheet(p, "confirm-delete", &title, &ic::CLOSE, p.red)
+        .child(
+            text(t(
+                "Every member loses this project in the cloud. The copy on this computer stays, but it is no longer linked.",
+                "สมาชิกทุกคนจะไม่มีโปรเจกต์นี้ในคลาวด์ สำเนาในเครื่องนี้ยังอยู่ แต่จะไม่เชื่อมกับคลาวด์อีก",
+            ))
+            .font(BODY)
+            .color(p.muted)
+            .wrap(),
+        )
+        .child(
+            row()
+                .key("delete-name-box")
+                .w_full()
+                .h(34.0)
+                .px(10.0)
+                .center_y()
+                .radius(8.0)
+                .fill(field_fill(p))
+                .border(1.0, p.border)
+                .child(input),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .pt(6.0)
+                .child(el().grow(1.0))
+                .child(button(
+                    p,
+                    "delete-cancel",
+                    t("Cancel", "ยกเลิก"),
+                    None,
+                    Kind::Secondary,
+                    true,
+                    |s, _| s.close_dialog(),
+                ))
+                .child(button(
+                    p,
+                    "delete-go",
+                    t("Delete from cloud", "ลบออกจากคลาวด์"),
+                    None,
+                    Kind::Danger,
+                    ok,
+                    move |s, _| s.cloud_delete(&project),
+                )),
+        )
+}
+
+// ── Sync results ────────────────────────────────────────────────────────────
+
+/// One project in the **Sync results** dialog, with its reason in words.
+#[derive(Debug, PartialEq)]
+pub struct ResultRow {
+    pub project: String,
+    pub reason: String,
+    /// A same-name project: the row has **Merge**.
+    pub merge: bool,
+}
+
+/// The projects that need the person, in the order of the sync. A library reason is in the
+/// app's words (`cloud::app_wording`).
+/// `linked` says whether this computer's project with a name is linked: such a project cannot
+/// merge with another cloud project, so its row has no **Merge**.
+pub fn attention_rows(summary: &SyncSummary, linked: impl Fn(&str) -> bool) -> Vec<ResultRow> {
+    summary
+        .attention
+        .iter()
+        .map(|attention| {
+            let project = attention.project().to_owned();
+            let reason = match attention {
+                Attention::Skipped { reason, .. } => cloud::app_wording(reason),
+                Attention::Stopped { project, .. } => tf!(
+                    "You stopped the sync of {}. Keyman did not change it.",
+                    "คุณหยุดการซิงก์ {} แล้ว Keyman ไม่ได้เปลี่ยนโปรเจกต์นี้",
+                    project
+                ),
+                Attention::CloudIsNewer(project) => tf!(
+                    "The cloud has newer changes for {}. Click Sync again.",
+                    "คลาวด์มีการเปลี่ยนแปลงของ {} ที่ใหม่กว่า กดซิงก์อีกครั้ง",
+                    project
+                ),
+                Attention::CanMerge(project) if linked(project) => t(
+                    "A project with this name on this computer is linked to another cloud project. Use 'keyman pull --as <name>' in a terminal, or rename the local project.",
+                    "โปรเจกต์ชื่อนี้ในเครื่องนี้เชื่อมกับโปรเจกต์อื่นบนคลาวด์อยู่แล้ว ใช้ 'keyman pull --as <ชื่อ>' ในเทอร์มินัล หรือเปลี่ยนชื่อโปรเจกต์ในเครื่อง",
+                )
+                .to_owned(),
+                Attention::CanMerge(project) => tf!(
+                    "This computer has a different project with the name {}. Click Merge to join it with the cloud project.",
+                    "เครื่องนี้มีโปรเจกต์อื่นชื่อ {} อยู่แล้ว กดรวมเพื่อรวมกับโปรเจกต์บนคลาวด์",
+                    project
+                ),
+            };
+            let merge = matches!(attention, Attention::CanMerge(p) if !linked(p));
+            ResultRow {
+                project,
+                reason,
+                merge,
+            }
+        })
+        .collect()
+}
+
+/// The keys of result row `i` and of its **Merge** button. A project can have two rows (a pull
+/// and a push reason), so the index is in the key.
+fn row_keys(i: usize, project: &str) -> (String, String) {
+    (
+        format!("sync-row-{i}-{project}"),
+        format!("merge-{i}-{project}"),
+    )
+}
+
+/// The lines about the sync itself under the projects (now: that nothing was sent).
+fn result_lines(summary: &SyncSummary) -> Vec<String> {
+    summary
+        .not_sent
+        .then(|| cloud::not_sent_line().to_owned())
+        .into_iter()
+        .collect()
+}
+
+/// "Added to this computer: a, b".
+pub fn added_line(summary: &SyncSummary) -> String {
+    tf!(
+        "Added to this computer: {}",
+        "เพิ่มในเครื่องนี้แล้ว: {}",
+        summary.added.join(", ")
+    )
+}
+
+/// The first line of the **Sync results** dialog. The counts show only when something was
+/// done; "up to date" does not show above projects that need the person.
+pub fn results_intro(summary: &SyncSummary) -> String {
+    let counts = cloud::did_something(summary).then(|| cloud::counts_text(summary));
+    match (counts, summary.attention.is_empty()) {
+        (Some(counts), false) => format!(
+            "{counts} {}",
+            t("These projects need you:", "โปรเจกต์เหล่านี้ต้องให้คุณจัดการ:")
+        ),
+        (Some(counts), true) => counts,
+        (None, false) => t(
+            "Keyman synced your projects. These projects need you:",
+            "Keyman ซิงก์โปรเจกต์ของคุณแล้ว โปรเจกต์เหล่านี้ต้องให้คุณจัดการ:",
+        )
+        .to_owned(),
+        (None, true) => t("Read the messages below.", "อ่านข้อความด้านล่าง").to_owned(),
+    }
+}
+
+/// A line in the results: an icon and a text that wraps.
+fn result_line(
+    p: Paint,
+    key: String,
+    glyph: &'static rune::Icon,
+    tint: Color,
+    message: String,
+) -> El {
+    row()
+        .key(key)
+        .w_full()
+        .gap(8.0)
+        .child(icon(glyph, 14.0).color(tint).a11y_hidden())
+        .child(
+            text(message)
+                .font(SMALL)
+                .color(p.text)
+                .wrap()
+                .selectable(true)
+                .grow(1.0)
+                .min_w(0.0),
+        )
+}
+
+/// **Sync results**: the projects that need the person, with **Merge** for a same-name
+/// project, the added projects, and the invite lines.
+pub fn sync_results_dialog(s: &App, p: Paint) -> El {
+    let Some(summary) = &s.sync_results else {
+        return el();
+    };
+    let idle = cloud::can_start(&s.busy);
+    let mut list = col().key("sync-rows").w_full().gap(8.0);
+    let rows = attention_rows(summary, |name| s.link_of(name).is_some());
+    for (i, row_data) in rows.into_iter().enumerate() {
+        let ResultRow {
+            project,
+            reason,
+            merge,
+        } = row_data;
+        let (row_key, merge_key) = row_keys(i, &project);
+        let mut entry = row()
+            .key(row_key)
+            .w_full()
+            .padding(12.0)
+            .gap(12.0)
+            .center_y()
+            .radius(10.0)
+            .fill(p.card)
+            .border(1.0, p.border)
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(3.0)
+                    .child(
+                        text(project.clone())
+                            .font(BODY_STRONG)
+                            .color(p.text)
+                            .truncate(),
+                    )
+                    .child(
+                        text(reason)
+                            .font(SMALL)
+                            .color(p.muted)
+                            .wrap()
+                            .selectable(true),
+                    ),
+            );
+        if merge {
+            entry = entry.child(button(
+                p,
+                &merge_key,
+                t("Merge", "รวม"),
+                Some(&ic::MERGE),
+                Kind::Secondary,
+                idle,
+                move |s, _| s.cloud_merge(&project),
+            ));
+        }
+        list = list.child(entry);
+    }
+    if !summary.added.is_empty() {
+        list = list.child(result_line(
+            p,
+            "sync-added".into(),
+            &ic::PLUS,
+            p.green,
+            added_line(summary),
+        ));
+    }
+    for (i, (group, email)) in summary.given.iter().enumerate() {
+        list = list.child(result_line(
+            p,
+            format!("sync-given-{i}"),
+            &ic::CHECK_CIRCLE,
+            p.green,
+            cloud::given_line(group, email),
+        ));
+    }
+    for (i, line) in result_lines(summary).into_iter().enumerate() {
+        list = list.child(result_line(
+            p,
+            format!("sync-note-{i}"),
+            &ic::ALERT,
+            p.yellow,
+            line,
+        ));
+    }
+    for (i, warning) in summary.warnings.iter().enumerate() {
+        list = list.child(result_line(
+            p,
+            format!("sync-warning-{i}"),
+            &ic::ALERT,
+            p.yellow,
+            warning.clone(),
+        ));
+    }
+    let intro_text = results_intro(summary);
+    sheet(
+        p,
+        "sync-results",
+        t("Sync results", "ผลการซิงก์"),
+        &ic::CLOUD_UP,
+        p.accent,
+    )
+    .w(520.0)
+    .max_h(620.0)
+    .child(intro(p, &intro_text))
+    .child(
+        col()
+            .key("sync-scroll")
+            .w_full()
+            .child(list)
+            .scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            })
+            .shrink()
+            .min_h(0.0),
+    )
+    .child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .pt(6.0)
+            .child(el().grow(1.0))
+            .child(button(
+                p,
+                "sync-results-ok",
+                t("OK", "ตกลง"),
+                None,
+                Kind::Primary,
+                true,
+                |s, _| s.close_dialog(),
+            )),
+    )
+}
+
+/// The title-bar **Sync**, only when signed in. While a cloud task runs, it is disabled and
+/// its icon turns, in the busy colour of the cloud icon.
+pub fn sync_button(s: &App, p: Paint) -> Option<El> {
+    if !matches!(s.cloud, CloudState::SignedIn { .. }) {
+        return None;
+    }
+    let label = t("Sync", "ซิงก์");
+    let (tip, glyph) = match &s.busy {
+        Some(busy) => (
+            busy.label.to_owned(),
+            icon(&ic::SYNC, 15.0)
+                .color(p.accent)
+                .a11y_hidden()
+                .looping(rune::LoopSpec::rotation(0.9)),
+        ),
+        None => (
+            t(
+                "Get the cloud changes, then send yours",
+                "รับการเปลี่ยนแปลงจากคลาวด์ แล้วส่งของคุณ",
+            )
+            .to_owned(),
+            icon(&ic::SYNC, 15.0).color(p.muted).a11y_hidden(),
+        ),
+    };
+    let busy = s.busy.is_some();
+    let b = row()
+        .key("tb-sync")
+        .role("button")
+        .label(label)
+        .help(&tip)
+        .h(30.0)
+        .px(10.0)
+        .gap(6.0)
+        .center()
+        .radius(7.0)
+        .disabled(busy)
+        .child(glyph)
+        .child(
+            text(label)
+                .font(BODY_STRONG)
+                .color(if busy { p.muted } else { p.text })
+                .a11y_hidden(),
+        );
+    Some(if busy {
+        b
+    } else {
+        b.focusable(true)
+            .hover(p.hover)
+            .press(p.press)
+            .on_press(|s: &mut App| s.cloud_sync())
+    })
+}
+
+// ── Question dialogs ────────────────────────────────────────────────────────
+
+fn field_fill(p: Paint) -> Color {
+    if p.dark {
+        Color::BLACK.alpha(0.2)
+    } else {
+        Color::WHITE
+    }
+}
+
+/// A labelled secure field. `shown` draws the characters (a code to compare), but keeps the
+/// other secure protections: no copy, no undo, no accessibility text, wiped buffers.
+fn field(
+    p: Paint,
+    key: &str,
+    label: &str,
+    edit: &TextEdit,
+    shown: bool,
+    access: impl for<'a> Fn(&'a mut App) -> &'a mut TextEdit + 'static,
+) -> El {
+    let input = text_input(edit, if shown { MONO } else { BODY })
+        .key(key)
+        .label(label)
+        .single_line()
+        .color(p.text)
+        .on_edit(access)
+        .on_submit(|s: &mut App, _| s.cloud_answer())
+        .secure()
+        .revealed(shown)
+        .grow(1.0)
+        .min_w(0.0);
+    col()
+        .w_full()
+        .gap(6.0)
+        .child(text(label.to_owned()).font(SMALL).color(p.muted))
+        .child(
+            row()
+                .key(format!("{key}-box"))
+                .w_full()
+                .h(34.0)
+                .px(10.0)
+                .center_y()
+                .radius(8.0)
+                .fill(field_fill(p))
+                .border(1.0, p.border)
+                .child(input),
+        )
+}
+
+/// A short line under the fields: an error or a warning.
+fn note(key: &str, glyph: &'static rune::Icon, tint: Color, message: String) -> El {
+    row()
+        .key(key)
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(icon(glyph, 14.0).color(tint).a11y_hidden())
+        .child(
+            text(message)
+                .font(SMALL)
+                .color(tint)
+                .role("status")
+                .wrap()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+}
+
+fn intro(p: Paint, message: &str) -> El {
+    text(message.to_owned()).font(BODY).color(p.muted).wrap()
+}
+
+/// Puts the recovery code on the clipboard like **Copy export**: kept out of clipboard
+/// history, and cleared after the clipboard time.
+fn copy_code(s: &mut App, tx: &mut Tx) {
+    let copied = match s.question.as_ref().map(|q| &q.ask) {
+        Some(Ask::ShowRecoveryCode(code)) => {
+            let _ = tx.copy_secret(code.as_str(), s.clipboard_time());
+            true
+        }
+        _ => false,
+    };
+    if copied {
+        let secs = s.settings.clipboard_secs;
+        s.ok(tf!(
+            "Copied. The clipboard clears in {} seconds.",
+            "คัดลอกแล้ว คลิปบอร์ดจะถูกล้างใน {} วินาที",
+            secs
+        ));
+    }
+}
+
+/// The dialog for the open cloud question, if there is one this task shows.
+pub fn question_dialog(s: &App, p: Paint) -> Option<El> {
+    let ask = &s.question.as_ref()?.ask;
+    let f = &s.cloud_fields;
+    let (a, b) = (f.first.text.as_str(), f.second.text.as_str());
+    let ready = can_answer(ask, a, b);
+    let (key, glyph, title, body, ok) = match ask {
+        Ask::NewPassword => {
+            let body = col()
+                .w_full()
+                .gap(12.0)
+                .child(intro(
+                    p,
+                    t(
+                        "Make a vault password. Keyman uses it to encrypt your secrets.",
+                        "ตั้งรหัสผ่านตู้นิรภัย Keyman ใช้รหัสผ่านนี้เข้ารหัสความลับของคุณ",
+                    ),
+                ))
+                .child(note(
+                    "no-reset",
+                    &ic::ALERT,
+                    p.yellow,
+                    t(
+                        "Keyman cannot reset this password.",
+                        "Keyman รีเซ็ตรหัสผ่านนี้ให้ไม่ได้",
+                    )
+                    .to_owned(),
+                ))
+                .child(field(
+                    p,
+                    "new-password",
+                    t("Vault password", "รหัสผ่านตู้นิรภัย"),
+                    &f.first,
+                    false,
+                    |s: &mut App| &mut s.cloud_fields.first,
+                ))
+                .child(field(
+                    p,
+                    "new-password-again",
+                    t("Type the password again", "พิมพ์รหัสผ่านอีกครั้ง"),
+                    &f.second,
+                    false,
+                    |s: &mut App| &mut s.cloud_fields.second,
+                ))
+                .children(
+                    shown_password_error(a, b)
+                        .map(|error| note("password-error", &ic::ALERT, p.red, error.into())),
+                );
+            (
+                "new-password-dialog",
+                &ic::LOCK,
+                t("New vault password", "รหัสผ่านตู้นิรภัยใหม่"),
+                body,
+                t("OK", "ตกลง"),
+            )
+        }
+        Ask::ShowRecoveryCode(code) => {
+            let mut lines = col().key("recovery-code").gap(4.0).center();
+            for (i, line) in code_lines(code).iter().enumerate() {
+                lines = lines.child(
+                    text(line.as_str())
+                        .key(format!("code-{i}"))
+                        .font(CODE)
+                        .color(p.text),
+                );
+            }
+            let wrong = !ready && code_chars(a).count() >= code_chars(code).count();
+            let body = col()
+                .w_full()
+                .gap(12.0)
+                .child(intro(
+                    p,
+                    t(
+                        "Write down this code and keep it in a safe place. If you lose the password and this code, nobody can get your cloud data back.",
+                        "จดรหัสนี้ไว้และเก็บในที่ปลอดภัย หากคุณลืมรหัสผ่านและทำรหัสนี้หาย จะไม่มีใครกู้ข้อมูลบนคลาวด์ของคุณคืนได้",
+                    ),
+                ))
+                .child(
+                    row()
+                        .key("code-box")
+                        .w_full()
+                        .padding(14.0)
+                        .gap(12.0)
+                        .center_y()
+                        .radius(10.0)
+                        .fill(p.card)
+                        .border(1.0, p.border)
+                        .child(el().grow(1.0))
+                        .child(lines)
+                        .child(el().grow(1.0))
+                        .child(button(
+                            p,
+                            "copy-code",
+                            t("Copy", "คัดลอก"),
+                            Some(&ic::COPY),
+                            Kind::Secondary,
+                            true,
+                            copy_code,
+                        )),
+                )
+                .child(field(
+                    p,
+                    "code-again",
+                    t("Type the code again", "พิมพ์รหัสอีกครั้ง"),
+                    &f.first,
+                    true,
+                    |s: &mut App| &mut s.cloud_fields.first,
+                ))
+                .children(wrong.then(|| {
+                    note(
+                        "code-error",
+                        &ic::ALERT,
+                        p.red,
+                        t("The code is not the same.", "รหัสไม่ตรงกัน").into(),
+                    )
+                }));
+            (
+                "recovery-code-dialog",
+                &ic::KEY,
+                t("Recovery code", "รหัสกู้คืน"),
+                body,
+                t("Continue", "ต่อไป"),
+            )
+        }
+        Ask::Password { tries_left } => {
+            let body = col()
+                .w_full()
+                .gap(12.0)
+                .child(intro(
+                    p,
+                    t(
+                        "Type the vault password to open your cloud data.",
+                        "พิมพ์รหัสผ่านตู้นิรภัยเพื่อเปิดข้อมูลบนคลาวด์",
+                    ),
+                ))
+                .child(field(
+                    p,
+                    "password",
+                    t("Vault password", "รหัสผ่านตู้นิรภัย"),
+                    &f.first,
+                    false,
+                    |s: &mut App| &mut s.cloud_fields.first,
+                ))
+                // The bridge counts down after each wrong try.
+                .children((*tries_left < cloud::PASSWORD_TRIES).then(|| {
+                    note(
+                        "tries-left",
+                        &ic::ALERT,
+                        p.red,
+                        tf!(
+                            "{} left",
+                            "เหลืออีก {}",
+                            count(usize::from(*tries_left), "try", "tries", "ครั้ง")
+                        ),
+                    )
+                }));
+            (
+                "password-dialog",
+                &ic::LOCK,
+                t("Vault password", "รหัสผ่านตู้นิรภัย"),
+                body,
+                t("OK", "ตกลง"),
+            )
+        }
+        Ask::RecoveryCode => {
+            let body = col()
+                .w_full()
+                .gap(12.0)
+                .child(intro(
+                    p,
+                    t(
+                        "Type the recovery code that you wrote down when you made the vault password.",
+                        "พิมพ์รหัสกู้คืนที่คุณจดไว้ตอนตั้งรหัสผ่านตู้นิรภัย",
+                    ),
+                ))
+                .child(field(
+                    p,
+                    "recovery",
+                    t("Recovery code", "รหัสกู้คืน"),
+                    &f.first,
+                    true,
+                    |s: &mut App| &mut s.cloud_fields.first,
+                ));
+            (
+                "recovery-dialog",
+                &ic::KEY,
+                t("Recovery code", "รหัสกู้คืน"),
+                body,
+                t("Continue", "ต่อไป"),
+            )
+        }
+        Ask::Resolve { .. } => return None,
+    };
+    Some(
+        col()
+            .key(key)
+            .role("dialog")
+            .label(title)
+            .w(460.0)
+            .padding(22.0)
+            .gap(14.0)
+            .radius(14.0)
+            .fill(p.bg)
+            .border(1.0, p.border)
+            .shadow(20.0, 60.0, Color::BLACK.alpha(0.4))
+            .child(icon_tile(glyph, 40.0, p.accent, p.dark))
+            .child(text(title.to_owned()).font(H2).color(p.text))
+            .child(body)
+            .child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .pt(6.0)
+                    .child(el().grow(1.0))
+                    // The only way out besides an answer: it stops the task.
+                    .child(button(
+                        p,
+                        "question-cancel",
+                        t("Cancel", "ยกเลิก"),
+                        None,
+                        Kind::Secondary,
+                        true,
+                        |s, _| s.cloud_cancel(),
+                    ))
+                    .child(button(
+                        p,
+                        "question-ok",
+                        ok,
+                        None,
+                        Kind::Primary,
+                        ready,
+                        |s, _| s.cloud_answer(),
+                    )),
+            ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_label_for_each_state() {
+        assert_eq!(status_label(None), ("Not in the cloud", "ไม่ได้อยู่ในคลาวด์"));
+        assert_eq!(
+            status_label(Some(&LinkStatus::Synced)),
+            ("Synced", "ซิงก์แล้ว")
+        );
+        assert_eq!(
+            status_label(Some(&LinkStatus::LocalChanges)),
+            ("Changes on this computer", "มีการเปลี่ยนแปลงในเครื่องนี้")
+        );
+    }
+
+    #[test]
+    fn sync_results_list_needs_attention() {
+        let library = "The master file changed while Keyman worked. Keyman did not write anything. Run 'keyman pull' again.";
+        let summary = SyncSummary {
+            updated: 0,
+            added: vec!["new-app".into()],
+            sent: 0,
+            attention: vec![
+                Attention::Skipped {
+                    project: "e".into(),
+                    reason: library.into(),
+                },
+                Attention::Stopped {
+                    project: "d".into(),
+                    conflicts: 2,
+                },
+                Attention::CloudIsNewer("g".into()),
+                Attention::CanMerge("f".into()),
+            ],
+            given: Vec::new(),
+            warnings: Vec::new(),
+            not_sent: false,
+        };
+        let rows = attention_rows(&summary, |_| false);
+        // A library reason is in the app's words: no CLI command.
+        assert_eq!(
+            rows[0],
+            ResultRow {
+                project: "e".into(),
+                reason: cloud::app_wording(library),
+                merge: false
+            }
+        );
+        assert!(
+            !rows[0].reason.contains("keyman pull"),
+            "{}",
+            rows[0].reason
+        );
+        // Either language: another test may switch it meanwhile.
+        assert!(
+            [
+                "You stopped the sync of d. Keyman did not change it.",
+                "คุณหยุดการซิงก์ d แล้ว Keyman ไม่ได้เปลี่ยนโปรเจกต์นี้",
+            ]
+            .contains(&rows[1].reason.as_str()),
+            "{}",
+            rows[1].reason
+        );
+        assert!(
+            [
+                "The cloud has newer changes for g. Click Sync again.",
+                "คลาวด์มีการเปลี่ยนแปลงของ g ที่ใหม่กว่า กดซิงก์อีกครั้ง",
+            ]
+            .contains(&rows[2].reason.as_str()),
+            "{}",
+            rows[2].reason
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.merge).collect::<Vec<_>>(),
+            [false, false, false, true]
+        );
+        assert_eq!(rows[3].project, "f");
+
+        // A local project with that name that is linked already cannot merge.
+        let rows = attention_rows(&summary, |name| name == "f");
+        assert!(!rows[3].merge);
+        assert!(
+            rows[3].reason.contains("keyman pull --as <name>")
+                || rows[3].reason.contains("keyman pull --as <ชื่อ>"),
+            "{}",
+            rows[3].reason
+        );
+    }
+
+    #[test]
+    fn the_results_intro_does_not_say_up_to_date_above_problems() {
+        let mut summary = SyncSummary {
+            updated: 0,
+            added: Vec::new(),
+            sent: 0,
+            attention: vec![Attention::CloudIsNewer("g".into())],
+            given: Vec::new(),
+            warnings: Vec::new(),
+            not_sent: false,
+        };
+        let intro = results_intro(&summary);
+        assert!(
+            [
+                "Keyman synced your projects. These projects need you:",
+                "Keyman ซิงก์โปรเจกต์ของคุณแล้ว โปรเจกต์เหล่านี้ต้องให้คุณจัดการ:",
+            ]
+            .contains(&intro.as_str()),
+            "{intro}"
+        );
+        // Only a warning (a push that stopped): no "up to date" either.
+        summary.attention.clear();
+        summary
+            .warnings
+            .push("Keyman did not send your changes.".into());
+        let intro = results_intro(&summary);
+        assert!(
+            !intro.contains("up to date") && !intro.contains("ปัจจุบัน"),
+            "{intro}"
+        );
+        // Counts show when something was done.
+        summary.updated = 2;
+        let intro = results_intro(&summary);
+        assert!(intro.contains('2'), "{intro}");
+    }
+
+    #[test]
+    fn two_rows_of_one_project_have_their_own_keys() {
+        let rows = [
+            Attention::Skipped {
+                project: "e".into(),
+                reason: "pull why".into(),
+            },
+            Attention::Skipped {
+                project: "e".into(),
+                reason: "The project e is not in the cloud now. Run 'keyman unlink e'.".into(),
+            },
+        ];
+        let summary = SyncSummary {
+            updated: 0,
+            added: Vec::new(),
+            sent: 0,
+            attention: rows.to_vec(),
+            given: Vec::new(),
+            warnings: Vec::new(),
+            not_sent: false,
+        };
+        let shown = attention_rows(&summary, |_| false);
+        assert!(!shown[1].reason.contains("keyman"), "{}", shown[1].reason);
+        assert_ne!(row_keys(0, "e"), row_keys(1, "e"));
+        let (row, merge) = row_keys(1, "e");
+        assert_ne!(row, merge);
+    }
+
+    #[test]
+    fn a_stopped_push_is_a_line_in_the_results() {
+        let mut summary = SyncSummary {
+            updated: 1,
+            added: Vec::new(),
+            sent: 0,
+            attention: vec![Attention::CloudIsNewer("g".into())],
+            given: Vec::new(),
+            warnings: Vec::new(),
+            not_sent: false,
+        };
+        assert!(result_lines(&summary).is_empty());
+        summary.not_sent = true;
+        assert_eq!(
+            result_lines(&summary),
+            vec![cloud::not_sent_line().to_owned()]
+        );
+    }
+
+    #[test]
+    fn unlink_is_blocked_while_busy() {
+        assert!(can_unlink(&None));
+        assert!(!can_unlink(&Some(Busy::new("Linking…"))));
+    }
+
+    #[test]
+    fn delete_needs_the_exact_name() {
+        assert!(delete_confirmed("my-app", "my-app"));
+        assert!(delete_confirmed("  my-app ", "my-app"));
+        assert!(!delete_confirmed("My-App", "my-app"));
+        assert!(!delete_confirmed("my-ap", "my-app"));
+        assert!(!delete_confirmed("my app", "my-app"));
+        assert!(!delete_confirmed("", ""));
+    }
+
+    #[test]
+    fn new_password_rules() {
+        let short = new_password_error("short", "short").unwrap();
+        assert!(
+            [
+                "The password must have 10 characters or more.",
+                "รหัสผ่านต้องมีอย่างน้อย 10 ตัวอักษร"
+            ]
+            .contains(&short)
+        );
+        let differ = new_password_error("abcdefghij", "abcdefghik").unwrap();
+        assert!(
+            [
+                "The two passwords are not the same.",
+                "รหัสผ่านทั้งสองช่องไม่ตรงกัน"
+            ]
+            .contains(&differ)
+        );
+        assert_eq!(new_password_error("abcdefghij", "abcdefghij"), None);
+        // Characters, not bytes: ten Thai letters are enough.
+        let thai = "กขคงจฉชซฌญ";
+        assert_eq!(new_password_error(thai, thai), None);
+        assert!(new_password_error("กขคงจ", "กขคงจ").is_some());
+    }
+
+    #[test]
+    fn first_use_card_rules() {
+        let out = CloudState::SignedOut;
+        let signed_in = CloudState::SignedIn {
+            email: "a@b.c".into(),
+        };
+        for loaded in [false, true] {
+            for cloud in [&out, &signed_in] {
+                for done in [false, true] {
+                    for dialog in [false, true] {
+                        let want = loaded && *cloud == out && !done && !dialog;
+                        assert_eq!(
+                            show_first_use(loaded, cloud, done, dialog),
+                            want,
+                            "{loaded} {cloud:?} {done} {dialog}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn answers_are_complete_before_ok() {
+        assert!(!can_answer(&Ask::NewPassword, "abcdefghij", "abcdefghik"));
+        assert!(can_answer(&Ask::NewPassword, "abcdefghij", "abcdefghij"));
+        assert!(!can_answer(&Ask::Password { tries_left: 3 }, "", ""));
+        assert!(can_answer(&Ask::Password { tries_left: 1 }, "x", ""));
+        assert!(!can_answer(&Ask::RecoveryCode, "", ""));
+        let code = Ask::ShowRecoveryCode("ABCD-EFGH".to_owned().into());
+        assert!(!can_answer(&code, "", ""));
+        assert!(!can_answer(&code, "ABCD-EFGX", ""));
+        assert!(can_answer(&code, " abcd efgh ", ""));
+        assert!(!can_answer(
+            &Ask::Resolve {
+                project: "app".into(),
+                conflicts: Vec::new()
+            },
+            "x",
+            "x"
+        ));
+    }
+
+    #[test]
+    fn password_errors_wait_for_typing() {
+        assert_eq!(shown_password_error("", ""), None);
+        assert!(shown_password_error("short", "").is_some());
+        assert_eq!(shown_password_error("abcdefghij", ""), None);
+        assert!(shown_password_error("abcdefghij", "abc").is_some());
+        assert_eq!(shown_password_error("abcdefghij", "abcdefghij"), None);
+    }
+
+    #[test]
+    fn the_code_shows_in_two_lines() {
+        let lines = code_lines("AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH");
+        let lines: Vec<&str> = lines.iter().map(|line| line.as_str()).collect();
+        assert_eq!(lines, ["AAAA-BBBB-CCCC-DDDD", "EEEE-FFFF-GGGG-HHHH"]);
+    }
+
+    #[test]
+    fn the_code_check_matches_the_library() {
+        use keyman_cli::cloud::crypto::normalize_recovery_code as library;
+        let code = "7K2M-QD9T-4XWB-HN3R";
+        for typed in [
+            "7k2m qd9t 4xwb hn3r",
+            "7K2M-QD9T-4XWB-HN3",
+            "7K2MQD9T4XWBHN3R",
+            "ß-ab",
+            "",
+        ] {
+            assert_eq!(
+                same_code(typed, code),
+                library(typed) == library(code),
+                "{typed}"
+            );
+            assert_eq!(
+                code_chars(typed).collect::<String>(),
+                library(typed),
+                "{typed}"
+            );
+        }
+    }
+}
