@@ -1,16 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 ### New
 
 - **Updates in the desktop app.** Settings › About › Updates checks GitHub for a newer release and installs it with one click (**Update now**, then **Restart now**). Each download is checked against the release's `SHA256SUMS.txt`. The app also checks once a day at start; switch this off with **Check for updates automatically**.
-- Releases include the desktop app: `Keyman-windows-x64.zip`, and `Keyman-macos.zip` (one universal app for Apple silicon and Intel).
+- Releases include the desktop app for Windows: `Keyman-windows-x64.zip`.
 
 ### Changed
 
-- Releases have Windows and macOS builds only. The Linux CLI binaries are not built for now; build them from source.
-- Faster releases: a merge to `main` does not run CI again (the pull request already passed it), the CLI and the app build in two jobs (Windows, and one macOS job), the builds use a build cache that each run on `main` saves, the macOS jobs use Intel runners (the arm64 runners had long queues), and the npm package is packed and tested in one Windows job. Pull requests no longer build the app bundles.
+- Releases have Windows x64 builds only, for the CLI, the npm package and the app. macOS and Linux are not built for now (macOS runners wait in a long queue); build them from source.
+- Releases are made on a Windows PC with `scripts/release-windows.ps1`. The GitHub workflow on `main` only checks the Windows release build and the npm package, and publishes nothing. It does not run CI again after a merge (the pull request already passed it).
+- Faster builds: release builds no longer use cross-crate LTO (the binaries are a little larger), the build cache has a fixed key, and pull requests no longer build the app bundles.
 
 ## 0.3.0
 

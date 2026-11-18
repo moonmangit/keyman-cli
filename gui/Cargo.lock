@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "keyman-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.22.1",
  "keyman-cli",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "keyman-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",

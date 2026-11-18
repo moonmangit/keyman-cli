@@ -1,6 +1,6 @@
 [package]
 name = "keyman-cli"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Load project environment variables from a master YAML file"
 license = "MIT"
@@ -26,7 +26,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "async-
 rpassword = "7"
 
 # Smaller, faster release binaries.
+# Fast release builds: no cross-crate LTO and the default codegen units (they build
+# in parallel). The binaries are a little larger, and strip keeps them small.
 [profile.release]
-lto = "thin"
-codegen-units = 1
 strip = true

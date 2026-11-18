@@ -75,10 +75,8 @@ pub fn parse(v: &str) -> Option<(u64, u64, u64)> {
 pub fn asset() -> Option<&'static str> {
     if cfg!(all(windows, target_arch = "x86_64")) {
         Some("Keyman-windows-x64.zip")
-    } else if cfg!(target_os = "macos") {
-        // One universal app for Apple silicon and Intel.
-        Some("Keyman-macos.zip")
     } else {
+        // Releases have a Windows build only for now.
         None
     }
 }

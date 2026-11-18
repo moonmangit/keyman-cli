@@ -15,7 +15,7 @@ No more copying `.env` files between machines, digging through chat history for 
 npm install -g keyman-cli
 ```
 
-Works on Windows x64 and macOS (Intel and Apple Silicon). Rust is not needed. For Linux, build it from source: `cargo install --git https://github.com/moonmangit/keyman-cli`. The command is `keyman` (or `keyman-cli`).
+Prebuilt for Windows x64. Rust is not needed. For macOS and Linux, build it from source: `cargo install --git https://github.com/moonmangit/keyman-cli`. The command is `keyman` (or `keyman-cli`).
 
 ## Quick start
 
@@ -369,12 +369,24 @@ Every pull request runs [CI](.github/workflows/ci.yml):
 - the cloud end-to-end and database tests against a local Supabase stack
 - the desktop app's lint and tests on macOS and Windows
 
-Every merge to `main` runs the [release workflow](.github/workflows/release.yml). It builds the CLI and the desktop app in two jobs: Windows x64, and macOS (Apple silicon and Intel, with one universal app). Then it smoke tests the npm package on Windows. A merge does not run CI again, because the pull request already passed it; a tag push or a manual run does. When the version in `Cargo.toml` has no `vX.Y.Z` tag yet, the same run releases it after the builds pass: it tags the merged commit, creates the GitHub release with the notes from `CHANGELOG.md`, the CLI binaries, the app zips (`Keyman-windows-x64.zip`, `Keyman-macos.zip`) and `SHA256SUMS.txt`, and publishes the npm package through the configured npm trusted publisher. The desktop app's updater reads these zips and checks them against `SHA256SUMS.txt`.
+Every merge to `main` runs the [build workflow](.github/workflows/release.yml). It builds the CLI and the desktop app for Windows x64 with the release profile, and packs and smoke tests the npm package. It does not run CI again, because the pull request already passed it. It does not publish anything.
 
-To release:
+Releases are made on a Windows PC with [`scripts/release-windows.ps1`](scripts/release-windows.ps1). macOS and Linux are not built for now; build them from source.
 
 1. Set the new version in `Cargo.toml`, `gui/Cargo.toml` and `npm/package.json`. All three must match.
 2. Add a `## X.Y.Z` section to `CHANGELOG.md`.
-3. Merge to `main`.
+3. Merge to `main`, then on the PC: `git switch main && git pull`.
+4. Check the build without publishing:
 
-A merge that keeps the version only tests and packages. Pushing a `vX.Y.Z` tag by hand also releases. To approve each release before it is published, add required reviewers to the `release` environment in the repository settings.
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -DryRun
+   ```
+
+5. Release:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts/release-windows.ps1
+   ```
+
+   It builds the CLI and the app, packs the npm package, writes `SHA256SUMS.txt`, and creates the GitHub release `vX.Y.Z` on the current commit of `main` with the notes from `CHANGELOG.md`. The files are `keyman-x86_64-pc-windows-msvc.exe`, `Keyman-windows-x64.zip` (the desktop app's updater reads it), `keyman-cli-X.Y.Z.tgz` and `SHA256SUMS.txt`.
+6. Publish npm with your login: `npm login`, then the `npm publish` command that the script shows.
