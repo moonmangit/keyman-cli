@@ -1,6 +1,6 @@
 name: Build and release
 
-# Every merge to main builds the CLI and the desktop app for Windows x64 and macOS Apple silicon. (It
+# Every merge to main builds the CLI and the desktop app for Windows x64. (It
 # does not run CI again: the pull request already passed it. A tag push or a manual
 # run does run CI.) When the version in Cargo.toml has no tag yet, the same run
 # releases, but only after every build (and CI, when it runs) passes: it tags the merged
@@ -78,36 +78,25 @@ jobs:
     if: github.ref != 'refs/heads/main'
     uses: ./.github/workflows/ci.yml
 
-  # Two build jobs only, one of them on macOS: GitHub has few macOS runners, and each
-  # more macOS job can wait in its queue.
+  # Windows only for now: macOS runners wait in a long queue (a release job waited
+  # 15 minutes and never started). macOS builds from source.
   build:
-    name: Build · ${{ matrix.name }}
+    name: Build · Windows x64
     needs: plan
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows x64
-            os: windows-2022
-          - name: macOS Apple silicon
-            # Apple silicon: about 4 times faster than the Intel runners, which also
-            # wait in a queue. One macOS job only, because macOS runners are few.
-            os: macos-15
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
       - run: rustup update stable
-      # The same key on every run of a job, so each run starts from the cache that the
-      # last run on main saved. Only main and tags save it.
+      # The same key on every run, so each run starts from the cache that the last
+      # run on main saved. Only main and tags save it.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ runner.os }}
+          shared-key: release-Windows
           save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
           workspaces: |
             . -> target
             gui -> target
-      - name: CLI and app (Windows)
-        if: runner.os == 'Windows'
+      - name: CLI and app
         shell: pwsh
         run: |
           cargo build --locked --release --target x86_64-pc-windows-msvc
@@ -121,19 +110,9 @@ jobs:
           Copy-Item gui/target/x86_64-pc-windows-msvc/release/keyman-app.exe dist/app/Keyman.exe
           Compress-Archive -Path dist/app/Keyman.exe -DestinationPath dist/app/Keyman-windows-x64.zip
           Remove-Item dist/app/Keyman.exe
-      - name: CLI and app (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          # Apple silicon only: Intel Macs are not built for now.
-          cargo build --locked --release --target aarch64-apple-darwin
-          mkdir -p dist/cli-aarch64-apple-darwin
-          cp target/aarch64-apple-darwin/release/keyman dist/cli-aarch64-apple-darwin/
-          (cd gui && scripts/bundle-macos.sh --target aarch64-apple-darwin)
-          mkdir -p dist/app
-          ditto -c -k --keepParent gui/target/release/bundle/Keyman.app dist/app/Keyman-macos-arm64.zip
       - uses: actions/upload-artifact@v6
         with:
-          name: build-${{ runner.os }}
+          name: build-Windows
           path: dist/
           if-no-files-found: error
 
@@ -162,9 +141,7 @@ jobs:
             cp "$dir"/* "npm/bin/native/$target/"
           done
           test -f npm/bin/native/x86_64-pc-windows-msvc/keyman.exe
-          test -f npm/bin/native/aarch64-apple-darwin/keyman
           test -f built/app/Keyman-windows-x64.zip
-          test -f built/app/Keyman-macos-arm64.zip
           mkdir -p dist
           npm pack ./npm --pack-destination dist
       - name: Install and run the npm command
