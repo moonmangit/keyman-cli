@@ -1586,6 +1586,7 @@ mod tests {
             given: Vec::new(),
             warnings: Vec::new(),
             not_sent: false,
+            nothing_linked: false,
         };
         let rows = attention_rows(&summary, |_| false);
         // A library reason is in the app's words: no CLI command.
@@ -1648,6 +1649,7 @@ mod tests {
             given: Vec::new(),
             warnings: Vec::new(),
             not_sent: false,
+            nothing_linked: false,
         };
         let intro = results_intro(&summary);
         assert!(
@@ -1694,6 +1696,7 @@ mod tests {
             given: Vec::new(),
             warnings: Vec::new(),
             not_sent: false,
+            nothing_linked: false,
         };
         let shown = attention_rows(&summary, |_| false);
         assert!(!shown[1].reason.contains("keyman"), "{}", shown[1].reason);
@@ -1712,6 +1715,7 @@ mod tests {
             given: Vec::new(),
             warnings: Vec::new(),
             not_sent: false,
+            nothing_linked: false,
         };
         assert!(result_lines(&summary).is_empty());
         summary.not_sent = true;

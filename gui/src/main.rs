@@ -1258,6 +1258,7 @@ fn sync_results(s: &mut App) {
         given: vec![("Backend team".into(), "sam@example.com".into())],
         warnings: vec!["Keyman cannot give lee@example.com access to Design now.".into()],
         not_sent: false,
+        nothing_linked: false,
     });
     s.dialog = Some(Dialog::SyncResults);
 }
