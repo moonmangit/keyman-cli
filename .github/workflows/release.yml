@@ -1,19 +1,13 @@
-name: Build and release
+name: Build
 
-# Every merge to main builds the CLI and the desktop app for Windows x64. (It
-# does not run CI again: the pull request already passed it. A tag push or a manual
-# run does run CI.) When the version in Cargo.toml has no tag yet, the same run
-# releases, but only after every build (and CI, when it runs) passes: it tags the merged
-# commit, creates the GitHub release from CHANGELOG.md (with the app zips and
-# SHA256SUMS.txt, which the app's updater reads), and publishes to npm. So releasing
-# is: bump the version (Cargo.toml, gui/Cargo.toml, npm/package.json), add its
-# changelog section, merge. Pushing a vX.Y.Z tag by hand still works too.
-#
-# The npm trusted publisher is tied to this file's name: keep it release.yml.
+# Releases are made on a Windows PC with scripts/release-windows.ps1, not here.
+# Every merge to main checks the release build: it builds the CLI and the desktop
+# app for Windows x64 with the release profile, and packs and smoke tests the npm
+# package. It does not run CI again (the pull request already passed it); a manual
+# run does. Nothing is tagged or published.
 on:
   push:
     branches: [main]
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -25,17 +19,13 @@ concurrency:
 
 jobs:
   plan:
-    name: Plan the release
+    name: Check versions
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.plan.outputs.version }}
-      release: ${{ steps.plan.outputs.release }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - id: plan
-        name: Check versions and decide whether to release
         shell: bash
         run: |
           set -euo pipefail
@@ -46,32 +36,10 @@ jobs:
             echo "::error::Cargo.toml has $version, gui/Cargo.toml has $app_version and npm/package.json has $npm_version. Set all three to the same version."
             exit 1
           fi
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
-              echo "::error::Tag $GITHUB_REF_NAME does not match version $version"
-              exit 1
-            fi
-            release=true
-          elif [[ "$GITHUB_REF" == refs/heads/main ]] && ! git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-            release=true
-          else
-            release=false
-          fi
-          if [[ "$release" == true ]] && ! grep -qx "## $version" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no '## $version' section. Add the release notes before releasing."
-            exit 1
-          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "release=$release" >> "$GITHUB_OUTPUT"
-          if [[ "$release" == true ]]; then
-            echo "### Releasing v$version" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### v$version is already released: testing and packaging only" >> "$GITHUB_STEP_SUMMARY"
-          fi
 
-  # A merge to main skips CI: the pull request already passed the same CI. (Set
-  # "Require status checks to pass" on main, so that no merge skips it.) A tag push
-  # or a manual run still runs CI first.
+  # A merge to main skips CI: the pull request already passed the same CI. A manual
+  # run still runs it.
   ci:
     name: CI
     needs: plan
@@ -171,87 +139,3 @@ jobs:
           name: npm-package
           path: dist/*.tgz
           if-no-files-found: error
-
-  github-release:
-    # Runs when CI passed or was skipped (a merge to main), never after a failure.
-    if: ${{ !cancelled() && !failure() && needs.plan.outputs.release == 'true' }}
-    needs: [plan, ci, package]
-    runs-on: ubuntu-24.04
-    # Add required reviewers to the "release" environment (Settings › Environments)
-    # to approve each release by hand before anything is tagged or published.
-    environment: release
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: npm-package
-          path: dist
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: build-*
-          path: dist/built
-          merge-multiple: true
-      - name: Publish GitHub release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -euo pipefail
-          tag="v$VERSION"
-          # The changelog section for this version, without its heading.
-          awk -v heading="## $VERSION" '
-            $0 == heading { found = 1; next }
-            found && /^## / { exit }
-            found { print }
-          ' CHANGELOG.md > notes.md
-          mkdir -p dist/assets
-          cp dist/built/app/* dist/assets/
-          for binary_dir in dist/built/cli-*; do
-            target="${binary_dir#dist/built/cli-}"
-            if test -f "$binary_dir/keyman.exe"; then
-              cp "$binary_dir/keyman.exe" "dist/assets/keyman-$target.exe"
-            else
-              cp "$binary_dir/keyman" "dist/assets/keyman-$target"
-            fi
-          done
-          # The app's updater checks each download against this file.
-          (cd dist/assets && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/*.tgz dist/assets/* --clobber
-          else
-            # Tags the merged commit when the tag does not exist yet.
-            gh release create "$tag" dist/*.tgz dist/assets/* \
-              --target "$GITHUB_SHA" --title "Keyman $VERSION" --notes-file notes.md
-          fi
-
-  npm-publish:
-    if: ${{ !cancelled() && !failure() && needs.plan.outputs.release == 'true' }}
-    needs: [plan, package, github-release]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: npm-package
-          path: dist
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-          registry-url: https://registry.npmjs.org
-      - name: Publish with npm trusted publishing
-        shell: bash
-        env:
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -euo pipefail
-          if npm view "keyman-cli@$VERSION" version >/dev/null 2>&1; then
-            echo "keyman-cli@$VERSION is already published"
-          else
-            npm publish ./dist/*.tgz --access public
-          fi

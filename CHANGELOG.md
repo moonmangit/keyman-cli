@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 ### New
 
@@ -10,7 +10,8 @@
 ### Changed
 
 - Releases have Windows x64 builds only, for the CLI, the npm package and the app. macOS and Linux are not built for now (macOS runners wait in a long queue); build them from source.
-- Faster releases: a merge to `main` does not run CI again (the pull request already passed it), the CLI and the app build in one Windows job, the builds use a build cache that each run on `main` saves, and the npm package is packed and tested in one Windows job. Pull requests no longer build the app bundles. Release builds no longer use cross-crate LTO, so they compile much faster; the binaries are a little larger.
+- Releases are made on a Windows PC with `scripts/release-windows.ps1`. The GitHub workflow on `main` only checks the Windows release build and the npm package, and publishes nothing. It does not run CI again after a merge (the pull request already passed it).
+- Faster builds: release builds no longer use cross-crate LTO (the binaries are a little larger), the build cache has a fixed key, and pull requests no longer build the app bundles.
 
 ## 0.3.0
 

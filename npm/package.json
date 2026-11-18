@@ -1,6 +1,6 @@
 {
   "name": "keyman-cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Manage project .env files from one private YAML file",
   "license": "MIT",
   "repository": {
