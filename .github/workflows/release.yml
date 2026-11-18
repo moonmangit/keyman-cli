@@ -90,10 +90,9 @@ jobs:
           - name: Windows x64
             os: windows-2022
           - name: macOS universal
-            # Intel runners: GitHub's macOS arm64 runners have capacity limits, and a
-            # release job waited 15 minutes for one and never started. The Intel
-            # runner builds the Apple silicon part too.
-            os: macos-15-intel
+            # Apple silicon: about 4 times faster than the Intel runners, which also
+            # wait in a queue. One macOS job only, because macOS runners are few.
+            os: macos-15
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
