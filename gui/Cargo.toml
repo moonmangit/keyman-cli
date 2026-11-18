@@ -37,6 +37,7 @@ parley_engine = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459
 accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a" }
 accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "3d037b49e459cd45d9438a46d50be3b20d53542a" }
 
+# Fast release builds: no cross-crate LTO (it was most of the macOS build time, which
+# builds the app twice for the universal app). strip keeps the binary small.
 [profile.release]
-lto = "thin"
 strip = true
