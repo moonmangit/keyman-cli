@@ -68,7 +68,7 @@ It builds the CLI and the app, makes a demo master file with a staged project an
 
 ## Updates
 
-**Settings › About › Updates** asks GitHub for the newest release. When it is newer, **Update now** downloads the zip for this system (`Keyman-windows-x64.zip`, or the universal `Keyman-macos.zip`), checks it against the release's `SHA256SUMS.txt`, and puts it in place of the running copy. Then **Restart now** opens the new version. Your settings stay. If Keyman is installed for all users, Windows asks for administrator permission and macOS asks for your password. A build that runs from `target/` does not replace itself.
+**Settings › About › Updates** asks GitHub for the newest release. When it is newer, **Update now** downloads the zip for this system (`Keyman-windows-x64.zip` or `Keyman-macos-arm64.zip`; Intel Macs are not built for now), checks it against the release's `SHA256SUMS.txt`, and puts it in place of the running copy. Then **Restart now** opens the new version. Your settings stay. If Keyman is installed for all users, Windows asks for administrator permission and macOS asks for your password. A build that runs from `target/` does not replace itself.
 
 **Check for updates automatically** (on by default) checks once a day when Keyman starts and shows a message when a newer version is available. Keyman installs an update only when you click **Update now**. The code is in `src/update.rs`.
 
@@ -90,7 +90,7 @@ cd gui && scripts/bundle-macos.sh
 cd gui && scripts/bundle-macos.sh --universal
 ```
 
-The app lands in `target/release/bundle/Keyman.app`; `--universal` builds one app for Apple silicon and Intel, and `--target <triple>` builds one target. The release builds the universal app.
+The app lands in `target/release/bundle/Keyman.app`; `--universal` builds one app for Apple silicon and Intel, and `--target <triple>` builds one target. The release builds `--target aarch64-apple-darwin`.
 
 **Windows**: build with the MSVC toolchain. The executable carries its icon and version details, and release builds open no console window.
 

@@ -15,7 +15,7 @@ No more copying `.env` files between machines, digging through chat history for 
 npm install -g keyman-cli
 ```
 
-Works on Windows x64 and macOS (Intel and Apple Silicon). Rust is not needed. For Linux, build it from source: `cargo install --git https://github.com/moonmangit/keyman-cli`. The command is `keyman` (or `keyman-cli`).
+Works on Windows x64 and macOS on Apple silicon. Rust is not needed. For Linux and Intel Macs, build it from source: `cargo install --git https://github.com/moonmangit/keyman-cli`. The command is `keyman` (or `keyman-cli`).
 
 ## Quick start
 
@@ -369,7 +369,7 @@ Every pull request runs [CI](.github/workflows/ci.yml):
 - the cloud end-to-end and database tests against a local Supabase stack
 - the desktop app's lint and tests on macOS and Windows
 
-Every merge to `main` runs the [release workflow](.github/workflows/release.yml). It builds the CLI and the desktop app in two jobs: Windows x64, and macOS (Apple silicon and Intel, with one universal app). Then it smoke tests the npm package on Windows. A merge does not run CI again, because the pull request already passed it; a tag push or a manual run does. When the version in `Cargo.toml` has no `vX.Y.Z` tag yet, the same run releases it after the builds pass: it tags the merged commit, creates the GitHub release with the notes from `CHANGELOG.md`, the CLI binaries, the app zips (`Keyman-windows-x64.zip`, `Keyman-macos.zip`) and `SHA256SUMS.txt`, and publishes the npm package through the configured npm trusted publisher. The desktop app's updater reads these zips and checks them against `SHA256SUMS.txt`.
+Every merge to `main` runs the [release workflow](.github/workflows/release.yml). It builds the CLI and the desktop app in two jobs: Windows x64, and macOS Apple silicon. Then it smoke tests the npm package on Windows. A merge does not run CI again, because the pull request already passed it; a tag push or a manual run does. When the version in `Cargo.toml` has no `vX.Y.Z` tag yet, the same run releases it after the builds pass: it tags the merged commit, creates the GitHub release with the notes from `CHANGELOG.md`, the CLI binaries, the app zips (`Keyman-windows-x64.zip`, `Keyman-macos-arm64.zip`) and `SHA256SUMS.txt`, and publishes the npm package through the configured npm trusted publisher. The desktop app's updater reads these zips and checks them against `SHA256SUMS.txt`.
 
 To release:
 
