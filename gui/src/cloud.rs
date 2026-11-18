@@ -408,6 +408,8 @@ pub struct SyncSummary {
     pub warnings: Vec<String>,
     /// The sync stopped after the pull: Keyman did not send this computer's changes.
     pub not_sent: bool,
+    /// The sync found no project: none is linked here and the cloud has none.
+    pub nothing_linked: bool,
 }
 
 /// A project that needs the person after a sync.
@@ -439,6 +441,7 @@ pub fn summarize(report: &PullReport, pushed: &[PushResult]) -> SyncSummary {
         given: report.given.clone(),
         warnings: report.warnings.clone(),
         not_sent: false,
+        nothing_linked: false,
     };
     for result in &report.results {
         match result {
@@ -503,7 +506,12 @@ pub enum PushOutcome {
 /// results without an error. A cancel with nothing to report ends as a plain cancel.
 pub fn sync_outcome(report: &PullReport, push: PushOutcome) -> Result<Done, String> {
     match push {
-        PushOutcome::Sent(pushed) => Ok(Done::SyncFinished(summarize(report, &pushed))),
+        PushOutcome::Sent(pushed) => {
+            let mut summary = summarize(report, &pushed);
+            // Each linked project gives a push result, and each cloud project a pull result.
+            summary.nothing_linked = report.results.is_empty() && pushed.is_empty();
+            Ok(Done::SyncFinished(summary))
+        }
         PushOutcome::Cancelled => {
             let mut summary = summarize(report, &[]);
             let nothing = summary.updated == 0
@@ -599,7 +607,11 @@ fn toast_words(summary: &SyncSummary, thai: bool) -> Option<String> {
     if needs_person(summary) {
         return None;
     }
-    let mut text = counts_words(summary, thai);
+    let mut text = if summary.nothing_linked {
+        nothing_linked_words(thai).to_owned()
+    } else {
+        counts_words(summary, thai)
+    };
     if summary.not_sent {
         text.push('\n');
         text.push_str(not_sent_words(thai));
@@ -1074,6 +1086,14 @@ fn merged(s: &mut App, project: &str, mut summary: SyncSummary) {
             text.push_str(&given_line(group, email));
         }
         s.ok(text);
+    }
+}
+
+fn nothing_linked_words(thai: bool) -> &'static str {
+    if thai {
+        "ยังไม่มีโปรเจกต์ที่เชื่อมกับคลาวด์ เลือกโปรเจกต์แล้วคลิก เชื่อมกับคลาวด์"
+    } else {
+        "No project is linked to the cloud. Select a project and click Link to cloud."
     }
 }
 
@@ -1860,6 +1880,7 @@ mod tests {
             given: Vec::new(),
             warnings: Vec::new(),
             not_sent: false,
+            nothing_linked: false,
         }
     }
 
@@ -1928,6 +1949,38 @@ mod tests {
         };
         let again = summarize(&stopped, &[PushResult::CloudIsNewer("d".into())]);
         assert_eq!(again.attention.len(), 1);
+    }
+
+    #[test]
+    fn sync_with_nothing_linked_says_so() {
+        let empty = PullReport {
+            results: Vec::new(),
+            given: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let Ok(Done::SyncFinished(got)) = sync_outcome(&empty, PushOutcome::Sent(Vec::new()))
+        else {
+            panic!("a sync with nothing linked must finish");
+        };
+        assert!(got.nothing_linked);
+        assert_eq!(
+            toast_words(&got, false).as_deref(),
+            Some("No project is linked to the cloud. Select a project and click Link to cloud.")
+        );
+        assert_eq!(
+            toast_words(&got, true).as_deref(),
+            Some("ยังไม่มีโปรเจกต์ที่เชื่อมกับคลาวด์ เลือกโปรเจกต์แล้วคลิก เชื่อมกับคลาวด์")
+        );
+        // A linked project that has no changes is up to date, not "nothing linked".
+        let linked = PushOutcome::Sent(vec![PushResult::UpToDate("a".into())]);
+        let Ok(Done::SyncFinished(got)) = sync_outcome(&empty, linked) else {
+            panic!("a sync of an up-to-date project must finish");
+        };
+        assert!(!got.nothing_linked);
+        assert_eq!(
+            toast_words(&got, false).as_deref(),
+            Some("All projects are up to date.")
+        );
     }
 
     #[test]
