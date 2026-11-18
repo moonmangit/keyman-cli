@@ -2033,6 +2033,7 @@ fn settings_dialog(s: &App, p: Paint, page: SettingsPage) -> El {
                         info("about-ui", t("Built with", "สร้างด้วย"), "Rust · Rune".into()),
                     ],
                 ))
+                .child(updates_group(p, s))
                 .child(
                     row()
                         .gap(8.0)
@@ -2343,4 +2344,161 @@ fn confirm_all_dialog(s: &App, p: Paint) -> El {
                 .child(button(p, "confirm-all-cancel", t("Cancel", "ยกเลิก"), None, Kind::Secondary, true, |s, _| s.dialog = None))
                 .child(button(p, "confirm-all-write", t("Write to all", "เขียนทั้งหมด"), Some(&ic::DOWNLOAD), Kind::Danger, true, |s, _| s.write_all_now())),
         )
+}
+
+/// Settings › About › Updates: the state of the update, its button, and the automatic check.
+fn updates_group(p: Paint, s: &App) -> El {
+    use crate::update::{self, Update};
+    let current = update::current();
+    let (status, mut buttons): (String, Vec<El>) = match &s.update {
+        Update::NotChecked => (
+            tf!("Version {}", "เวอร์ชัน {}", current),
+            vec![check_button(p, t("Check for updates", "ตรวจหาอัปเดต"), true)],
+        ),
+        Update::Checking => (
+            t("Checking for updates…", "กำลังตรวจหาอัปเดต…").into(),
+            vec![check_button(
+                p,
+                t("Check for updates", "ตรวจหาอัปเดต"),
+                false,
+            )],
+        ),
+        Update::UpToDate => (
+            tf!(
+                "Keyman {} is the newest version.",
+                "Keyman {} เป็นเวอร์ชันล่าสุดแล้ว",
+                current
+            ),
+            vec![check_button(p, t("Check again", "ตรวจอีกครั้ง"), true)],
+        ),
+        Update::Available(release) => {
+            let page = release.page.clone();
+            let notes = button(
+                p,
+                "update-page",
+                t("Release page", "หน้ารุ่น"),
+                Some(&ic::EXTERNAL),
+                Kind::Secondary,
+                true,
+                move |s, tx| crate::open_link(s, tx, &page),
+            );
+            match update::cannot_install(release) {
+                Some(why) => (
+                    tf!(
+                        "Keyman {} is available. {}",
+                        "Keyman {} พร้อมให้อัปเดตแล้ว {}",
+                        release.version,
+                        why
+                    ),
+                    vec![notes],
+                ),
+                None => (
+                    tf!(
+                        "Keyman {} is available. You have {}.",
+                        "Keyman {} พร้อมให้อัปเดตแล้ว เวอร์ชันของคุณคือ {}",
+                        release.version,
+                        current
+                    ),
+                    vec![
+                        button(
+                            p,
+                            "update-install",
+                            t("Update now", "อัปเดตเลย"),
+                            Some(&ic::DOWNLOAD),
+                            Kind::Primary,
+                            true,
+                            |s, _| s.install_update(),
+                        ),
+                        notes,
+                    ],
+                ),
+            }
+        }
+        Update::Installing { version } => (
+            tf!("Installing Keyman {}…", "กำลังติดตั้ง Keyman {}…", version),
+            vec![button(
+                p,
+                "update-install",
+                t("Update now", "อัปเดตเลย"),
+                Some(&ic::DOWNLOAD),
+                Kind::Primary,
+                false,
+                |_, _| {},
+            )],
+        ),
+        Update::Installed { version } => (
+            tf!(
+                "Keyman {} is installed. Restart Keyman to use it.",
+                "ติดตั้ง Keyman {} แล้ว เปิด Keyman ใหม่เพื่อใช้งาน",
+                version
+            ),
+            vec![button(
+                p,
+                "update-restart",
+                t("Restart now", "เปิดใหม่ตอนนี้"),
+                Some(&ic::REFRESH),
+                Kind::Primary,
+                true,
+                |s, _| s.restart_after_update(),
+            )],
+        ),
+        Update::Failed(error) => (
+            error.clone(),
+            vec![check_button(p, t("Try again", "ลองอีกครั้ง"), true)],
+        ),
+    };
+    let failed = matches!(s.update, Update::Failed(_));
+    let mut actions = row().gap(8.0);
+    for b in buttons.drain(..) {
+        actions = actions.child(b);
+    }
+    let state = col()
+        .key("update-state")
+        .w_full()
+        .py(10.0)
+        .gap(10.0)
+        .child(
+            text(status)
+                .font(BODY)
+                .color(if failed { p.red } else { p.text })
+                .wrap()
+                .selectable(true),
+        )
+        .child(actions);
+    settings_group(
+        p,
+        "g-updates",
+        t("UPDATES", "อัปเดต"),
+        vec![
+            state,
+            setting_row(
+                p,
+                "update-auto",
+                t("Check for updates automatically", "ตรวจหาอัปเดตอัตโนมัติ"),
+                t(
+                    "Check once a day when Keyman starts. Keyman installs only when you click Update now.",
+                    "ตรวจวันละครั้งเมื่อเปิด Keyman และจะติดตั้งเมื่อคุณคลิก อัปเดตเลย เท่านั้น",
+                ),
+                switch(
+                    p,
+                    "update-auto-switch",
+                    t("Check for updates automatically", "ตรวจหาอัปเดตอัตโนมัติ"),
+                    s.settings.update_check,
+                    |s| s.update_settings(|st| st.update_check = !st.update_check),
+                ),
+            ),
+        ],
+    )
+}
+
+fn check_button(p: Paint, label: &str, enabled: bool) -> El {
+    button(
+        p,
+        "update-check",
+        label,
+        Some(&ic::REFRESH),
+        Kind::Secondary,
+        enabled,
+        |s, _| s.check_for_updates(),
+    )
 }

@@ -115,6 +115,10 @@ pub struct Settings {
     pub stages_w: f32,
     /// The Variables column's share of the page (Folders gets the rest).
     pub split: f32,
+    /// Check for a newer release at start, at most once a day.
+    pub update_check: bool,
+    /// When the last check for updates worked, in seconds since 1970.
+    pub last_update_check: u64,
 }
 
 impl Default for Settings {
@@ -133,6 +137,8 @@ impl Default for Settings {
             sidebar_w: SIDEBAR_W.0,
             stages_w: STAGES_W.0,
             split: SPLIT.0,
+            update_check: true,
+            last_update_check: 0,
         }
     }
 }
@@ -177,6 +183,10 @@ impl Settings {
                 .get::<f32>("split")
                 .filter(|&f| in_range(f, SPLIT))
                 .unwrap_or(d.split),
+            update_check: prefs.get("update_check").unwrap_or(d.update_check),
+            last_update_check: prefs
+                .get("last_update_check")
+                .unwrap_or(d.last_update_check),
         }
     }
 
@@ -194,7 +204,9 @@ impl Settings {
             prefs.set("cloud_prompt_done", &self.cloud_prompt_done)?;
             prefs.set("sidebar_w", &self.sidebar_w)?;
             prefs.set("stages_w", &self.stages_w)?;
-            prefs.set("split", &self.split)
+            prefs.set("split", &self.split)?;
+            prefs.set("update_check", &self.update_check)?;
+            prefs.set("last_update_check", &self.last_update_check)
         })();
         result.map_err(|error| format!("cannot save settings: {error:?}"))
     }
@@ -222,6 +234,8 @@ mod tests {
             sidebar_w: 300.0,
             stages_w: 180.0,
             split: 0.6,
+            update_check: false,
+            last_update_check: 1_700_000_000,
         };
         changed.save(&mut prefs).unwrap();
         assert_eq!(Settings::load(&prefs), changed);

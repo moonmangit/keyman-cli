@@ -15,6 +15,7 @@ mod menu;
 mod resolve;
 mod settings;
 mod ties;
+mod update;
 mod views;
 mod widgets;
 
@@ -181,6 +182,8 @@ pub struct App {
     pub sync_results: Option<cloud::SyncSummary>,
     /// The choices of the open cloud conflict question; wiped after the answer.
     pub cloud_picks: Option<cloud::CloudPicks>,
+    /// Settings › About › Updates.
+    pub update: update::Update,
 }
 
 impl App {
@@ -246,6 +249,7 @@ impl App {
             project_menu: None,
             sync_results: None,
             cloud_picks: None,
+            update: update::Update::NotChecked,
         }
     }
 
@@ -637,7 +641,7 @@ impl App {
         self.show_toast(false, text.into());
     }
 
-    fn show_toast(&mut self, ok: bool, text: String) -> u64 {
+    pub(crate) fn show_toast(&mut self, ok: bool, text: String) -> u64 {
         let id = self.toast.as_ref().map_or(1, |toast| toast.id + 1);
         self.toast = Some(Toast { id, ok, text });
         id
@@ -1178,6 +1182,16 @@ fn set_icon() {
     }
 }
 
+/// Settings › About with a newer release that can install.
+fn about_update(s: &mut App) {
+    s.dialog = Some(Dialog::Settings(SettingsPage::About));
+    s.update = update::Update::Available(update::Release {
+        version: "0.4.0".into(),
+        page: format!("{REPO_URL}/releases/tag/v0.4.0"),
+        files: Some((String::new(), String::new())),
+    });
+}
+
 fn thai(s: &mut App) {
     s.settings.language = i18n::Language::Thai;
     i18n::set(i18n::Language::Thai);
@@ -1344,6 +1358,11 @@ fn main() {
             }),
             ("about", |s| {
                 s.dialog = Some(Dialog::Settings(SettingsPage::About))
+            }),
+            ("about-update", about_update),
+            ("th-about-update", |s| {
+                thai(s);
+                about_update(s);
             }),
             ("help", |s| s.dialog = Some(Dialog::Help(HelpPage::Start))),
             ("shortcuts", |s| {
@@ -1526,6 +1545,9 @@ fn main() {
             let mut app = App::new(Some(handle), Prefs::open(APP_ID));
             if scene {
                 app.settings.cloud_prompt_done = true;
+            } else {
+                update::clean_up_previous();
+                app.check_for_updates_at_start();
             }
             app
         })

@@ -1,10 +1,12 @@
 name: Build and release
 
-# Every merge to main runs the full CI, then builds and smoke tests the npm package.
-# When the version in Cargo.toml has no tag yet, the same run starts the release:
-# it tags the merged commit, creates the GitHub release from CHANGELOG.md, and
-# publishes to npm. So releasing is: bump the version, add its changelog section,
-# merge. Pushing a vX.Y.Z tag by hand still works too.
+# Every merge to main runs the full CI and, at the same time, builds the CLI and the
+# desktop app for Windows and macOS. When the version in Cargo.toml has no tag yet,
+# the same run releases, but only after CI and every build pass: it tags the merged
+# commit, creates the GitHub release from CHANGELOG.md (with the app zips and
+# SHA256SUMS.txt, which the app's updater reads), and publishes to npm. So releasing
+# is: bump the version (Cargo.toml, gui/Cargo.toml, npm/package.json), add its
+# changelog section, merge. Pushing a vX.Y.Z tag by hand still works too.
 #
 # The npm trusted publisher is tied to this file's name: keep it release.yml.
 on:
@@ -37,9 +39,10 @@ jobs:
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          app_version=$(sed -n 's/^version = "\(.*\)"/\1/p' gui/Cargo.toml | head -1)
           npm_version=$(node -p "require('./npm/package.json').version")
-          if [[ "$version" != "$npm_version" ]]; then
-            echo "::error::Cargo.toml has $version but npm/package.json has $npm_version. Set both to the same version."
+          if [[ "$version" != "$npm_version" || "$version" != "$app_version" ]]; then
+            echo "::error::Cargo.toml has $version, gui/Cargo.toml has $app_version and npm/package.json has $npm_version. Set all three to the same version."
             exit 1
           fi
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
@@ -70,47 +73,79 @@ jobs:
     needs: plan
     uses: ./.github/workflows/ci.yml
 
+  # Starts with CI, not after it. The release jobs below wait for both.
   build:
-    needs: ci
+    name: Build · ${{ matrix.name }}
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            extension: ''
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            extension: ''
-          - os: windows-2022
+          - name: Windows x64
+            os: windows-2022
             target: x86_64-pc-windows-msvc
-            extension: '.exe'
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            extension: ''
-          - os: macos-15-intel
+            app: Keyman-windows-x64.zip
+          - name: macOS Apple silicon
+            os: macos-15
             target: aarch64-apple-darwin
-            extension: ''
+            app: Keyman-macos-arm64.zip
+          - name: macOS Intel
+            # Built on the faster Apple silicon runners, for the Intel target.
+            os: macos-15
+            target: x86_64-apple-darwin
+            app: Keyman-macos-x64.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - run: rustup update stable
-      - run: rustup target add ${{ matrix.target }}
-      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - run: rustup update stable && rustup target add ${{ matrix.target }}
+      - name: App toolchain target
+        working-directory: gui
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: |
+            . -> target
+            gui -> target
+      - name: CLI
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: App (Windows)
+        if: runner.os == 'Windows'
+        working-directory: gui
+        shell: pwsh
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/keyman-app.exe dist/Keyman.exe
+          Compress-Archive -Path dist/Keyman.exe -DestinationPath ${{ matrix.app }}
+      - name: App (macOS)
+        if: runner.os == 'macOS'
+        working-directory: gui
+        run: |
+          scripts/bundle-macos.sh --target ${{ matrix.target }}
+          ditto -c -k --keepParent target/release/bundle/Keyman.app ${{ matrix.app }}
       - uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/keyman${{ matrix.extension }}
+          name: cli-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/keyman${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v6
+        with:
+          name: app-${{ matrix.target }}
+          path: gui/${{ matrix.app }}
           if-no-files-found: error
 
   package:
     needs: [plan, build]
-    runs-on: ubuntu-24.04
+    # Apple silicon: the smoke test runs the macOS arm64 binary.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          path: npm/bin/native
+          pattern: cli-*
+          path: native
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -119,8 +154,11 @@ jobs:
         run: |
           set -euo pipefail
           test "$(node -p "require('./npm/package.json').version")" = "${{ needs.plan.outputs.version }}"
-          test -f npm/bin/native/x86_64-unknown-linux-gnu/keyman
-          test -f npm/bin/native/aarch64-unknown-linux-gnu/keyman
+          for dir in native/cli-*; do
+            target="${dir#native/cli-}"
+            mkdir -p "npm/bin/native/$target"
+            cp "$dir"/* "npm/bin/native/$target/"
+          done
           test -f npm/bin/native/x86_64-pc-windows-msvc/keyman.exe
           test -f npm/bin/native/x86_64-apple-darwin/keyman
           test -f npm/bin/native/aarch64-apple-darwin/keyman
@@ -175,7 +213,7 @@ jobs:
 
   github-release:
     if: needs.plan.outputs.release == 'true'
-    needs: [plan, package, windows-package-smoke]
+    needs: [plan, ci, package, windows-package-smoke]
     runs-on: ubuntu-24.04
     # Add required reviewers to the "release" environment (Settings › Environments)
     # to approve each release by hand before anything is tagged or published.
@@ -190,8 +228,13 @@ jobs:
           path: dist
       - uses: actions/download-artifact@v8
         with:
-          pattern: '*-*-*'
+          pattern: cli-*
           path: dist/native
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: app-*
+          path: dist/assets
+          merge-multiple: true
       - name: Publish GitHub release
         shell: bash
         env:
@@ -207,17 +250,16 @@ jobs:
             found && /^## / { exit }
             found { print }
           ' CHANGELOG.md > notes.md
-          mkdir -p dist/assets
-          for binary_dir in dist/native/*; do
-            target="${binary_dir##*/}"
-            # The pattern also matches the app artifacts CI uploads; only the CLI is released.
-            [[ "$target" == keyman-app-* ]] && continue
+          for binary_dir in dist/native/cli-*; do
+            target="${binary_dir#dist/native/cli-}"
             if test -f "$binary_dir/keyman.exe"; then
               cp "$binary_dir/keyman.exe" "dist/assets/keyman-$target.exe"
             else
               cp "$binary_dir/keyman" "dist/assets/keyman-$target"
             fi
           done
+          # The app's updater checks each download against this file.
+          (cd dist/assets && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/*.tgz dist/assets/* --clobber
           else
