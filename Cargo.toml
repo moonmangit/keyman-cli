@@ -1,6 +1,6 @@
 [package]
 name = "keyman-cli"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Load project environment variables from a master YAML file"
 license = "MIT"
@@ -24,3 +24,9 @@ sha2 = "0.10"
 webbrowser = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 rpassword = "7"
+
+# Smaller, faster release binaries.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

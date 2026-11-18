@@ -9,8 +9,24 @@ use keyman_cli::save::{self, Edit, Plan};
 
 pub struct Project {
     pub name: String,
-    /// The project's variables, or the rule it breaks.
-    pub variables: Result<Variables, String>,
+    /// The project with its stages, or the rule it breaks.
+    pub data: Result<master::Project, String>,
+}
+
+impl Project {
+    /// Its stage names; empty for a project without stages.
+    pub fn stages(&self) -> Vec<String> {
+        self.data
+            .as_ref()
+            .map(master::Project::stage_names)
+            .unwrap_or_default()
+    }
+
+    /// The variables `stage` writes (a project with stages needs one).
+    pub fn variables(&self, stage: Option<&str>) -> Result<Variables, String> {
+        let data = self.data.as_ref().map_err(Clone::clone)?;
+        master::stage_variables(data, &self.name, stage)
+    }
 }
 
 pub struct Master {
@@ -26,7 +42,7 @@ impl Master {
     pub fn problems(&self) -> usize {
         self.projects
             .iter()
-            .filter(|project| project.variables.is_err())
+            .filter(|project| project.data.is_err())
             .count()
     }
 }
@@ -37,8 +53,8 @@ pub fn read(home: &Path) -> Result<Master, String> {
     let projects = master::project_names(&yaml)?
         .into_iter()
         .map(|name| {
-            let variables = master::project_variables(&yaml, &name);
-            Project { name, variables }
+            let data = master::read_project(&yaml, &name);
+            Project { name, data }
         })
         .collect();
     Ok(Master { path, projects })
@@ -106,6 +122,8 @@ pub struct SavePreview {
     pub plan: Plan,
     /// False when saving creates a new project.
     pub exists: bool,
+    /// The whole project after saving, stages included.
+    pub desired: master::Project,
 }
 
 /// `keyman save --dry-run <project> <folder>`. Reads the master file fresh so
@@ -113,6 +131,7 @@ pub struct SavePreview {
 pub fn save_preview(
     home: &Path,
     project: &str,
+    stage: Option<&str>,
     folder: &Path,
     replace: bool,
 ) -> Result<SavePreview, String> {
@@ -127,14 +146,25 @@ pub fn save_preview(
     let exists = master::project_names(&yaml)?
         .iter()
         .any(|name| name == project);
-    let existing = if exists {
-        master::project_variables(&yaml, project)?
+    let current = if exists {
+        master::read_project(&yaml, project)?
     } else {
-        Vec::new()
+        master::Project::default()
+    };
+    let (plan, desired) = match stage {
+        Some(stage) => save::plan_stage(&current, stage, &incoming, replace),
+        None => {
+            master::stage_variables(&current, project, None)?;
+            let plan = save::plan(&current.shared, &incoming, replace);
+            let mut desired = current.clone();
+            desired.shared = plan.result.clone();
+            (plan, desired)
+        }
     };
     Ok(SavePreview {
-        plan: save::plan(&existing, &incoming, replace),
+        plan,
         exists,
+        desired,
     })
 }
 
@@ -142,15 +172,16 @@ pub fn save_preview(
 pub fn save_apply(
     home: &Path,
     project: &str,
+    stage: Option<&str>,
     folder: &Path,
     replace: bool,
 ) -> Result<usize, String> {
-    let preview = save_preview(home, project, folder, replace)?;
+    let preview = save_preview(home, project, stage, folder, replace)?;
     if preview.exists && preview.plan.changes() == 0 {
         return Ok(0);
     }
     let (path, yaml) = master::read_master(home)?;
-    let updated = save::update_project(&yaml, project, &preview.plan, preview.exists)?;
+    let updated = save::write_project(&yaml, project, &preview.desired, preview.exists)?;
     master::atomic_write(&path, updated.as_bytes())?;
     Ok(preview.plan.changes())
 }
@@ -198,6 +229,7 @@ pub fn conflicts(master_vars: &[(String, String)], folder: &Path) -> Result<Vec<
 pub fn resolve(
     home: &Path,
     project: &str,
+    stage: Option<&str>,
     folder: &Path,
     resolved: &[(String, Option<String>)],
 ) -> Result<Variables, String> {
@@ -215,7 +247,8 @@ pub fn resolve(
         }
     }
     let (path, yaml) = master::read_master(home)?;
-    let existing = master::project_variables(&yaml, project)?;
+    let current = master::read_project(&yaml, project)?;
+    let existing = master::stage_variables(&current, project, stage)?;
     let choice = |name: &str| {
         resolved
             .iter()
@@ -237,13 +270,23 @@ pub fn resolve(
             result.push((name.clone(), value.clone()));
         }
     }
-    let plan = save::plan(&existing, &result, true);
+    // A stage keeps what differs from the shared values as its own; a shared
+    // variable stays (it cannot leave one stage only), and .env gets it too.
+    let (plan, desired) = match stage {
+        Some(stage) => save::plan_stage(&current, stage, &result, true),
+        None => {
+            let plan = save::plan(&existing, &result, true);
+            let mut desired = current.clone();
+            desired.shared = plan.result.clone();
+            (plan, desired)
+        }
+    };
     if plan.changes() > 0 {
-        let updated = save::update_project(&yaml, project, &plan, true)?;
+        let updated = save::write_project(&yaml, project, &desired, true)?;
         master::atomic_write(&path, updated.as_bytes())?;
     }
-    envfile::write(&result, folder)?;
-    Ok(result)
+    envfile::write(&plan.result, folder)?;
+    Ok(plan.result)
 }
 
 /// How a tied folder's .env stands against the master file.
@@ -258,6 +301,8 @@ pub enum FolderStatus {
     Differs(usize),
     /// .env exists but cannot be read as variables.
     Unreadable,
+    /// The project has stages and this folder has none picked, so nothing is written to it.
+    NoStage,
 }
 
 pub fn folder_status(master_vars: &[(String, String)], folder: &Path) -> FolderStatus {
@@ -356,7 +401,7 @@ mod tests {
 
         init(home).unwrap();
         let loaded = read(home).unwrap();
-        let vars = loaded.project("my-app").unwrap().variables.clone().unwrap();
+        let vars = loaded.project("my-app").unwrap().variables(None).unwrap();
         assert_eq!(vars.len(), 3);
 
         let injected = inject(&vars, &folder).unwrap();
@@ -376,22 +421,21 @@ mod tests {
         assert_eq!(edit_of("NEW_FLAG"), Edit::Added);
         assert_eq!(edit_of("DEBUG"), Edit::Removed);
 
-        let preview = save_preview(home, "my-app", &folder, false).unwrap();
+        let preview = save_preview(home, "my-app", None, &folder, false).unwrap();
         assert!(preview.exists);
         assert_eq!(preview.plan.count(Edit::Kept), 2);
-        assert_eq!(save_apply(home, "my-app", &folder, false).unwrap(), 2);
+        assert_eq!(save_apply(home, "my-app", None, &folder, false).unwrap(), 2);
 
         let saved = read(home)
             .unwrap()
             .project("my-app")
             .unwrap()
-            .variables
-            .clone()
+            .variables(None)
             .unwrap();
         assert!(saved.contains(&("API_KEY".into(), "rotated".into())));
         assert!(saved.contains(&("NEW_FLAG".into(), "1".into())));
         assert!(saved.contains(&("DEBUG".into(), "true".into())));
-        assert_eq!(save_apply(home, "my-app", &folder, false).unwrap(), 0);
+        assert_eq!(save_apply(home, "my-app", None, &folder, false).unwrap(), 0);
     }
 
     #[test]
@@ -410,8 +454,7 @@ mod tests {
             .unwrap()
             .project("my-app")
             .unwrap()
-            .variables
-            .clone()
+            .variables(None)
             .unwrap();
         let found = conflicts(&vars, &folder).unwrap();
         let names: Vec<&str> = found.iter().map(|c| c.name.as_str()).collect();
@@ -427,13 +470,12 @@ mod tests {
             ("NEW_FLAG".to_owned(), Some("edited".to_owned())),
             ("OTHER".to_owned(), None),
         ];
-        let result = resolve(home, "my-app", &folder, &resolved).unwrap();
+        let result = resolve(home, "my-app", None, &folder, &resolved).unwrap();
         let saved = read(home)
             .unwrap()
             .project("my-app")
             .unwrap()
-            .variables
-            .clone()
+            .variables(None)
             .unwrap();
         assert_eq!(saved, result);
         assert!(saved.contains(&("API_KEY".into(), "from-env".into())));
@@ -442,7 +484,60 @@ mod tests {
         assert_eq!(folder_status(&saved, &folder), FolderStatus::InSync);
 
         let bad = vec![("NEW_FLAG".to_owned(), Some("two\nlines".to_owned()))];
-        assert!(resolve(home, "my-app", &folder, &bad).is_err());
+        assert!(resolve(home, "my-app", None, &folder, &bad).is_err());
+    }
+
+    #[test]
+    fn saving_and_resolving_a_stage_keep_shared_values() {
+        let scratch = Scratch::new("stages");
+        let home = &scratch.0;
+        let folder = home.join("code");
+        fs::create_dir_all(&folder).unwrap();
+        let file = home.join("keyman.yml");
+        fs::write(
+            &file,
+            "app:\n  DEBUG: \"false\"\n  LOG: \"info\"\n  prod:\n    DB: \"p\"\n  dev:\n    DB: \"d\"\n",
+        )
+        .unwrap();
+        load(&file, home).unwrap();
+        let project = |stage| read(home).unwrap().project("app").unwrap().variables(stage);
+        assert!(project(None).unwrap_err().contains("has stages"));
+        assert_eq!(
+            read(home).unwrap().project("app").unwrap().stages(),
+            ["prod", "dev"]
+        );
+
+        // Save dev's .env: DEBUG differs from shared, so it becomes dev's own.
+        fs::write(
+            folder.join(".env"),
+            "DEBUG=\"true\"\nLOG=\"info\"\nDB=\"d2\"\n",
+        )
+        .unwrap();
+        assert!(save_preview(home, "app", None, &folder, false).is_err());
+        assert_eq!(
+            save_apply(home, "app", Some("dev"), &folder, false).unwrap(),
+            2
+        );
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("  dev:\n    DB: \"d2\"\n    DEBUG: \"true\"\n"),
+            "{text}"
+        );
+        assert_eq!(
+            project(Some("prod")).unwrap()[0],
+            ("DEBUG".into(), "false".into())
+        );
+
+        // Resolving prod: LOG removed from .env stays shared, and .env gets it back.
+        fs::write(folder.join(".env"), "DEBUG=\"false\"\nDB=\"p2\"\n").unwrap();
+        let resolved = vec![
+            ("DB".to_owned(), Some("p2".to_owned())),
+            ("LOG".to_owned(), None),
+        ];
+        let result = resolve(home, "app", Some("prod"), &folder, &resolved).unwrap();
+        assert!(result.contains(&("LOG".into(), "info".into())));
+        assert_eq!(result, project(Some("prod")).unwrap());
+        assert_eq!(folder_status(&result, &folder), FolderStatus::InSync);
     }
 
     #[test]
@@ -475,11 +570,15 @@ mod tests {
         fs::write(folder.join(".env"), "TOKEN=\"abc\"\n").unwrap();
         init(home).unwrap();
 
-        assert!(!save_preview(home, "other", &folder, false).unwrap().exists);
-        save_apply(home, "other", &folder, false).unwrap();
+        assert!(
+            !save_preview(home, "other", None, &folder, false)
+                .unwrap()
+                .exists
+        );
+        save_apply(home, "other", None, &folder, false).unwrap();
         let master = read(home).unwrap();
         assert_eq!(
-            master.project("other").unwrap().variables.clone().unwrap(),
+            master.project("other").unwrap().variables(None).unwrap(),
             vec![("TOKEN".into(), "abc".into())]
         );
         assert!(master.project("my-app").is_some());

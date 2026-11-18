@@ -11,6 +11,13 @@ pub struct Ties {
     folders: BTreeMap<String, Vec<String>>,
     /// Project name to the folder actions use.
     active: BTreeMap<String, String>,
+    /// The stage each folder's .env is written from, keyed by `stage_key`.
+    stages: BTreeMap<String, String>,
+}
+
+/// One key per project and folder: a folder can be tied to two projects.
+fn stage_key(project: &str, folder: &str) -> String {
+    format!("{project}\n{folder}")
 }
 
 impl Ties {
@@ -27,19 +34,25 @@ impl Ties {
                     .collect()
             });
         let active = prefs.get("active").unwrap_or_default();
-        Ties { folders, active }
+        let stages = prefs.get("tie_stages").unwrap_or_default();
+        Ties {
+            folders,
+            active,
+            stages,
+        }
     }
 
     pub fn save(&self, prefs: &mut Prefs) -> Result<(), String> {
         prefs
             .set("ties", &self.folders)
             .and_then(|()| prefs.set("active", &self.active))
+            .and_then(|()| prefs.set("tie_stages", &self.stages))
             .and_then(|()| prefs.remove("folders"))
             .map_err(|error| format!("cannot remember tied folders: {error:?}"))
     }
 
     pub fn forget(prefs: &mut Prefs) -> Result<(), String> {
-        ["ties", "active", "folders"]
+        ["ties", "active", "folders", "tie_stages"]
             .iter()
             .try_for_each(|key| prefs.remove(key))
             .map_err(|error| format!("cannot forget tied folders: {error:?}"))
@@ -78,6 +91,21 @@ impl Ties {
         if self.active.get(project).is_some_and(|f| f == folder) {
             self.active.remove(project);
         }
+        self.stages.remove(&stage_key(project, folder));
+    }
+
+    /// The stage a tied folder uses, as chosen (it may no longer exist).
+    pub fn stage(&self, project: &str, folder: &str) -> Option<&str> {
+        self.stages
+            .get(&stage_key(project, folder))
+            .map(String::as_str)
+    }
+
+    pub fn set_stage(&mut self, project: &str, folder: &str, stage: &str) {
+        if self.folders(project).iter().any(|f| f == folder) {
+            self.stages
+                .insert(stage_key(project, folder), stage.to_owned());
+        }
     }
 
     pub fn set_active(&mut self, project: &str, folder: &str) {
@@ -108,6 +136,25 @@ mod tests {
         assert_eq!(ties.active("app"), Some("/a"));
         ties.untie("app", "/a");
         assert!(ties.folders("app").is_empty());
+    }
+
+    #[test]
+    fn each_folder_keeps_its_stage() {
+        let mut prefs = Prefs::memory();
+        let mut ties = Ties::default();
+        ties.tie("app", "/a");
+        ties.tie("app", "/b");
+        ties.set_stage("app", "/a", "production");
+        ties.set_stage("app", "/b", "staging");
+        ties.set_stage("app", "/not-tied", "x");
+        ties.save(&mut prefs).unwrap();
+        let mut loaded = Ties::load(&prefs);
+        assert_eq!(loaded, ties);
+        assert_eq!(loaded.stage("app", "/a"), Some("production"));
+        assert_eq!(loaded.stage("app", "/not-tied"), None);
+        loaded.untie("app", "/a");
+        assert_eq!(loaded.stage("app", "/a"), None);
+        assert_eq!(loaded.stage("app", "/b"), Some("staging"));
     }
 
     #[test]

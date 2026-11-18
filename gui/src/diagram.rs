@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use keyman_cli::ui::display_path;
 use rune::{Color, El, LineCap, Path as Curve, Shape, canvas, col, row, text};
 
-use crate::core::{self, FolderStatus};
+use crate::core::FolderStatus;
 use crate::i18n::{count, t};
 use crate::icons as ic;
 use crate::widgets::*;
@@ -32,6 +32,7 @@ pub fn status_look(p: Paint, status: FolderStatus) -> (Color, String) {
         FolderStatus::NoEnv => (p.accent, t("No .env yet", "ยังไม่มี .env").into()),
         FolderStatus::Missing => (p.red, t("Missing", "หาไม่พบ").into()),
         FolderStatus::Unreadable => (p.red, t("Unreadable", "อ่านไม่ได้").into()),
+        FolderStatus::NoStage => (p.muted, t("Pick a stage", "เลือกสเตจ").into()),
     }
 }
 
@@ -83,13 +84,10 @@ fn elbow(y: f32) -> Curve {
         .line_to([FAN_W - 4.0, y])
 }
 
-pub fn tie_diagram(s: &App, p: Paint, project: &str, vars: &[(String, String)]) -> El {
+pub fn tie_diagram(s: &App, p: Paint, project: &str) -> El {
     let folders = s.tied();
     let active = s.folder();
-    let statuses: Vec<FolderStatus> = folders
-        .iter()
-        .map(|f| core::folder_status(vars, f))
-        .collect();
+    let statuses: Vec<FolderStatus> = folders.iter().map(|f| s.folder_status(f)).collect();
     let n = folders.len().max(1);
     let fan_h = DROP + n as f32 * NODE_H + (n - 1) as f32 * GAP;
     let row_y = |i: usize| DROP + i as f32 * (NODE_H + GAP) + NODE_H / 2.0;
@@ -168,7 +166,15 @@ pub fn tie_diagram(s: &App, p: Paint, project: &str, vars: &[(String, String)]) 
         &ic::KEY,
         p.accent,
         project.to_owned(),
-        count(vars.len(), "variable", "variables", "ตัวแปร"),
+        match s.stages().len() {
+            0 => count(
+                s.variables().and_then(Result::ok).map_or(0, |v| v.len()),
+                "variable",
+                "variables",
+                "ตัวแปร",
+            ),
+            n => count(n, "stage", "stages", "สเตจ"),
+        },
     )
     .border(1.5, p.accent.alpha(0.6));
 
@@ -235,7 +241,11 @@ pub fn tie_diagram(s: &App, p: Paint, project: &str, vars: &[(String, String)]) 
             &ic::FOLDER,
             color,
             name,
-            display_path(folder),
+            // The stage this folder's .env is written from, before its path.
+            match s.folder_stage(folder) {
+                Some(stage) => format!("{stage} · {}", display_path(folder)),
+                None => display_path(folder),
+            },
         )
         .role("button")
         .label(tf!("Folder {}", "โฟลเดอร์ {}", display_path(folder)))

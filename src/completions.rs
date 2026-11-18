@@ -31,6 +31,7 @@ pub fn script(shell: &str) -> Result<String, String> {
     let projects_bar = PROJECT_COMMANDS.join("|");
     let projects_space = PROJECT_COMMANDS.join(" ");
     let directories_bar = DIRECTORY_COMMANDS.join("|");
+    let directories_space = DIRECTORY_COMMANDS.join(" ");
     let flags = flag_table();
 
     let script = match shell {
@@ -55,16 +56,21 @@ _keyman() {{
   fi
   case $command in
     {projects_bar})
-      if (( COMP_CWORD == 2 )); then
-        COMPREPLY=($(compgen -W "$(keyman list 2>/dev/null)" -- "$cur"))
-      elif [[ $command == @({directories_bar}) ]] && (( COMP_CWORD == 3 )); then
-        COMPREPLY=($(compgen -d -- "$cur"))
+      # Bash splits words at ':', so read 'project:stage' from the line itself.
+      local line=${{COMP_LINE:0:COMP_POINT}} parts
+      read -ra parts <<< "$line"
+      [[ $line == *[[:space:]] ]] && parts+=("")
+      local word=${{parts[${{#parts[@]}}-1]}}
+      if (( ${{#parts[@]}} == 3 )); then
+        COMPREPLY=($(compgen -W "$(keyman list 2>/dev/null)" -- "$word"))
+        [[ $word == *:* ]] && COMPREPLY=("${{COMPREPLY[@]#"${{word%:*}}:"}}")
+      elif [[ " {directories_space} " == *" $command "* ]] && (( ${{#parts[@]}} == 4 )); then
+        COMPREPLY=($(compgen -d -- "$word"))
       fi ;;
     completions) COMPREPLY=($(compgen -W "{shells}" -- "$cur")) ;;
     help) COMPREPLY=($(compgen -W "{names}" -- "$cur")) ;;
   esac
 }}
-shopt -s extglob
 complete -o default -F _keyman keyman keyman-cli
 "#
             )

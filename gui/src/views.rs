@@ -1,5 +1,7 @@
 //! Every screen of the app, from the custom title bar down.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 use keyman_cli::save::Edit;
 use keyman_cli::ui::display_path;
 use rune::{Color, Cx, El, ScrollSpec, col, el, icon, row, text, text_input};
@@ -27,6 +29,22 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     cx.foreground(p.text);
     cx.focus_ring(2.0, 2.0, p.accent.alpha(0.6));
 
+    // The page's width last frame, after the project list and the stage column.
+    let asides = s.settings.sidebar_w
+        + RESIZER_W
+        + if s.stages().is_empty() {
+            0.0
+        } else {
+            s.settings.stages_w + RESIZER_W
+        };
+    let narrow = cx
+        .layout_with("root", move |r| r[2] - asides - 64.0 < 860.0)
+        .unwrap_or(false);
+    // The width Variables and Folders share, for their divider.
+    let columns_w = cx.layout("columns").map_or(0.0, |r| r[2]);
+    COLUMNS_W.store(columns_w.to_bits(), Ordering::Relaxed);
+    NARROW.store(narrow, Ordering::Relaxed);
+
     let body = match &s.master {
         Ok(master) => {
             let mut page = match &s.selected {
@@ -53,6 +71,22 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
                 .grow(1.0)
                 .min_h(0.0)
                 .child(sidebar(s, p))
+                .child(resizer(
+                    p,
+                    "resize-sidebar",
+                    Pane::Sidebar,
+                    t("Resize the project list", "ปรับขนาดรายการโปรเจกต์"),
+                    true,
+                ))
+                .children(stage_aside(s, p).map(|aside| {
+                    row().h_full().child(aside).child(resizer(
+                        p,
+                        "resize-stages",
+                        Pane::Stages,
+                        t("Resize the stage column", "ปรับขนาดคอลัมน์สเตจ"),
+                        true,
+                    ))
+                }))
                 .child(content(p, page))
         }
         Err(error) => row()
@@ -111,6 +145,142 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
         root = root.child(crate::menu::project_menu(s, p, name, at, window));
     }
     root
+}
+
+/// The second column: the selected project's stages, when it has them. Each row
+/// shows how many values the stage sets itself and how many folders write from it.
+fn stage_aside(s: &App, p: Paint) -> Option<El> {
+    let stages = s.stages();
+    if stages.is_empty() {
+        return None;
+    }
+    let current = s.stage();
+    let folders = s.tied();
+    let own_count = |stage: &str| {
+        s.master
+            .as_ref()
+            .ok()
+            .and_then(|m| m.project(s.selected.as_deref()?))
+            .and_then(|project| project.data.as_ref().ok()?.stage(stage).map(Vec::len))
+            .unwrap_or(0)
+    };
+    let mut list = col()
+        .key("stage-list")
+        .role("radiogroup")
+        .label(t("Stages", "สเตจ"))
+        .w_full()
+        .gap(2.0);
+    for stage in &stages {
+        let selected = current.as_deref() == Some(stage.as_str());
+        let using = folders
+            .iter()
+            .filter(|f| s.folder_stage(f).as_deref() == Some(stage.as_str()))
+            .count();
+        let own = own_count(stage);
+        let pick = stage.clone();
+        let mut r = row()
+            .key(format!("stage-{stage}"))
+            .role("radio")
+            .label(stage)
+            .checked(selected)
+            .focusable(true)
+            .w_full()
+            .h(46.0)
+            .px(10.0)
+            .gap(10.0)
+            .center_y()
+            .radius(7.0)
+            .on_press(move |s: &mut App| s.show_stage(&pick))
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(1.0)
+                    .child(
+                        text(stage.clone())
+                            .font(if selected { BODY_STRONG } else { BODY })
+                            .color(p.text)
+                            .truncate(),
+                    )
+                    .child(
+                        text(if own == 0 {
+                            t("Shared values only", "ใช้ค่าร่วมอย่างเดียว").to_owned()
+                        } else {
+                            tf!(
+                                "{} set here",
+                                "กำหนดที่นี่ {}",
+                                count(own, "value", "values", "ค่า")
+                            )
+                        })
+                        .font(SMALL)
+                        .color(if selected { p.accent } else { p.faint })
+                        .truncate(),
+                    ),
+            );
+        if using > 0 {
+            r = r.child(
+                row()
+                    .gap(4.0)
+                    .center_y()
+                    .help(tf!(
+                        "{} write from this stage",
+                        "{} เขียนจากสเตจนี้",
+                        count(using, "folder", "folders", "โฟลเดอร์")
+                    ))
+                    .child(icon(&ic::FOLDER, 13.0).color(p.faint))
+                    .child(text(using.to_string()).font(MONO_SMALL).color(p.faint)),
+            );
+        }
+        r = if selected {
+            r.fill(p.accent.alpha(if p.dark { 0.2 } else { 0.12 }))
+        } else {
+            r.hover(p.hover).press(p.press)
+        };
+        list = list.child(r);
+    }
+    Some(
+        col()
+            .key("stage-aside")
+            .w(s.settings.stages_w)
+            .h_full()
+            .px(10.0)
+            .pt(14.0)
+            .pb(12.0)
+            .gap(10.0)
+            .fill(p.panel)
+            .child(
+                row()
+                    .key("stages-head")
+                    .w_full()
+                    .pl(10.0)
+                    .h(32.0)
+                    .center_y()
+                    .child(text(t("STAGES", "สเตจ")).font(CAPS).color(p.faint))
+                    .child(
+                        text(format!("  {}", stages.len()))
+                            .font(CAPS)
+                            .color(p.faint),
+                    ),
+            )
+            .child(
+                list.scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .shrink()
+                .min_h(0.0),
+            )
+            .child(el().grow(1.0))
+            .child(
+                text(t(
+                    "A stage's values replace the shared ones. Add stages in the master file.",
+                    "ค่าของสเตจจะแทนค่าร่วม เพิ่มสเตจได้ในไฟล์หลัก",
+                ))
+                .font(SMALL)
+                .color(p.faint)
+                .wrap()
+                .px(10.0),
+            ),
+    )
 }
 
 /// The scrolling main area.
@@ -274,8 +444,10 @@ fn sidebar(s: &App, p: Paint) -> El {
         shown += 1;
         let name = project.name.clone();
         let selected = s.selected.as_ref() == Some(&name);
-        let (status, detail) = match &project.variables {
-            Ok(vars) => (p.green, vars.len().to_string()),
+        // A project with stages shows its stage count, the others their variables.
+        let (status, detail) = match &project.data {
+            Ok(data) if data.has_stages() => (p.green, format!("{}▾", data.stages.len())),
+            Ok(data) => (p.green, data.shared.len().to_string()),
             Err(_) => (p.red, "!".to_owned()),
         };
         list = list.child(
@@ -379,14 +551,13 @@ fn sidebar(s: &App, p: Paint) -> El {
 
     col()
         .key("sidebar")
-        .w(264.0)
+        .w(s.settings.sidebar_w)
         .h_full()
         .px(12.0)
         .pt(14.0)
         .pb(12.0)
         .gap(10.0)
         .fill(p.panel)
-        .border_sides([0.0, 1.0, 0.0, 0.0], p.border)
         .child(search)
         .child(
             row()
@@ -540,12 +711,28 @@ fn empty_page(p: Paint) -> El {
         )
 }
 
+/// Set each frame: the width of the Variables and Folders row, as f32 bits.
+static COLUMNS_W: AtomicU32 = AtomicU32::new(0);
+/// The gap between the Variables and Folders cards, which holds their divider.
+const COLUMN_GAP: f32 = 20.0;
+
+/// Set each frame: the page is too narrow for two columns side by side.
+static NARROW: AtomicBool = AtomicBool::new(false);
+
+pub fn narrow() -> bool {
+    NARROW.load(Ordering::Relaxed)
+}
+
 fn page_header(p: Paint, name: &str, status: El, subtitle: String, actions: El) -> El {
-    row()
+    // When narrow, the buttons go under the title.
+    let header = if narrow() {
+        col().gap(14.0)
+    } else {
+        row().gap(16.0).center_y()
+    };
+    header
         .key("page-header")
         .w_full()
-        .gap(16.0)
-        .center_y()
         .child(
             col()
                 .grow(1.0)
@@ -570,7 +757,7 @@ fn page_header(p: Paint, name: &str, status: El, subtitle: String, actions: El) 
 }
 
 fn project_page(s: &App, p: Paint, name: &str) -> El {
-    let variables = s.variables().cloned().unwrap_or_else(|| Ok(Vec::new()));
+    let variables = s.variables().unwrap_or_else(|| Ok(Vec::new()));
     let folder_note = s
         .folder()
         .map(|f| format!(" · {}", display_path(&f)))
@@ -646,12 +833,11 @@ fn project_page(s: &App, p: Paint, name: &str) -> El {
     let link_name = name.to_owned();
     let mut actions = row().gap(8.0);
     if linked.is_none() {
-        actions = actions.child(button(
+        actions = actions.child(action_button(
             p,
             "link-cloud",
             t("Link to cloud", "เชื่อมกับคลาวด์"),
-            Some(&ic::CLOUD_UP),
-            Kind::Secondary,
+            &ic::CLOUD_UP,
             idle,
             move |s, _| {
                 if signed_in {
@@ -664,7 +850,7 @@ fn project_page(s: &App, p: Paint, name: &str) -> El {
         ));
     }
     let actions = actions
-        .child(button(
+        .child(action_button(
             p,
             "reveal-all",
             if s.reveal_all {
@@ -672,20 +858,18 @@ fn project_page(s: &App, p: Paint, name: &str) -> El {
             } else {
                 t("Reveal values", "แสดงค่า")
             },
-            Some(if s.reveal_all { &ic::EYE_OFF } else { &ic::EYE }),
-            Kind::Secondary,
+            if s.reveal_all { &ic::EYE_OFF } else { &ic::EYE },
             !vars.is_empty(),
             |s, _| {
                 s.reveal_all = !s.reveal_all;
                 s.revealed.clear();
             },
         ))
-        .child(button(
+        .child(action_button(
             p,
             "copy-export",
             t("Copy export", "คัดลอก export"),
-            Some(&ic::COPY),
-            Kind::Secondary,
+            &ic::COPY,
             !vars.is_empty(),
             move |s, tx| {
                 let secs = s.settings.clipboard_secs;
@@ -708,24 +892,44 @@ fn project_page(s: &App, p: Paint, name: &str) -> El {
         ));
 
     // Variables and folders side by side; both columns grow with the window.
-    let columns = row()
-        .key("columns")
-        .w_full()
-        .gap(20.0)
-        .child(
-            col()
-                .key("col-vars")
-                .grow(1.0)
-                .min_w(0.0)
-                .child(variables_tab(s, p, &vars)),
-        )
-        .child(
-            col()
-                .key("col-folders")
-                .grow(1.0)
-                .min_w(0.0)
-                .child(folder_tab(s, p, true)),
-        );
+    // A narrow window stacks them.
+    let vars_col = col().key("col-vars").child(variables_tab(s, p, &vars));
+    let folders_col = col().key("col-folders").child(folder_tab(s, p, true));
+    let columns = if narrow() {
+        col()
+            .key("columns")
+            .w_full()
+            .gap(20.0)
+            .child(vars_col.w_full())
+            .child(folders_col.w_full())
+    } else {
+        // Variables takes its saved share; the divider sits in the gap between the cards.
+        let shared = (f32::from_bits(COLUMNS_W.load(Ordering::Relaxed)) - COLUMN_GAP).max(0.0);
+        let vars_col = if shared > 0.0 {
+            vars_col.w(crate::settings::split_width(s.settings.split, shared))
+        } else {
+            vars_col.grow(1.0)
+        };
+        row()
+            .key("columns")
+            .w_full()
+            .child(vars_col.min_w(0.0))
+            .child(
+                row()
+                    .key("columns-gap")
+                    .w(COLUMN_GAP)
+                    .h_full()
+                    .center()
+                    .child(resizer(
+                        p,
+                        "resize-columns",
+                        Pane::Split(shared),
+                        t("Resize Variables and Folders", "ปรับขนาดตัวแปรและโฟลเดอร์"),
+                        false,
+                    )),
+            )
+            .child(folders_col.grow(1.0).min_w(0.0))
+    };
     page.child(page_header(
         p,
         name,
@@ -734,10 +938,19 @@ fn project_page(s: &App, p: Paint, name: &str) -> El {
             .center_y()
             .child(badge(p, t("Valid", "ถูกต้อง"), p.green))
             .child(cloud_views::status_line(p, linked)),
-        format!(
-            "{}{folder_note}",
-            count(vars.len(), "variable", "variables", "ตัวแปร")
-        ),
+        match s.stage() {
+            Some(stage) => tf!(
+                "{} · stage {}{}",
+                "{} · สเตจ {}{}",
+                count(vars.len(), "variable", "variables", "ตัวแปร"),
+                stage,
+                folder_note
+            ),
+            None => format!(
+                "{}{folder_note}",
+                count(vars.len(), "variable", "variables", "ตัวแปร")
+            ),
+        },
         actions,
     ))
     .child(columns)
@@ -767,6 +980,8 @@ fn new_project_page(s: &App, p: Paint, name: &str) -> El {
 const NAME_W: f32 = 140.0;
 
 fn variables_tab(s: &App, p: Paint, vars: &[(String, String)]) -> El {
+    let own = s.stage_own();
+    let stage = s.stage();
     let hidden = if s.reveal_all {
         t("values shown", "แสดงค่าอยู่")
     } else {
@@ -788,15 +1003,25 @@ fn variables_tab(s: &App, p: Paint, vars: &[(String, String)]) -> El {
                     .gap(2.0)
                     .child(text(t("Variables", "ตัวแปร")).font(H2).color(p.text))
                     .child(
-                        text(format!(
-                            "{} · {hidden}",
-                            count(vars.len(), "variable", "variables", "ตัวแปร")
-                        ))
+                        text(match &stage {
+                            Some(_) => tf!(
+                                "{} · {} set by this stage · {}",
+                                "{} · สเตจนี้กำหนด {} · {}",
+                                count(vars.len(), "variable", "variables", "ตัวแปร"),
+                                own.len(),
+                                hidden
+                            ),
+                            None => format!(
+                                "{} · {hidden}",
+                                count(vars.len(), "variable", "variables", "ตัวแปร")
+                            ),
+                        })
                         .font(SMALL)
                         .color(p.muted),
                     ),
             ),
     );
+
     if vars.is_empty() {
         return table.child(
             col()
@@ -859,6 +1084,13 @@ fn variables_tab(s: &App, p: Paint, vars: &[(String, String)]) -> El {
                 .grow(1.0)
                 .min_w(0.0),
             );
+        // Values the stage sets itself; the rest are shared by every stage.
+        if let (Some(stage), true) = (&stage, own.contains(name)) {
+            r = r.child(badge(p, stage, p.accent).help(t(
+                "Set by this stage. Other values are shared by every stage.",
+                "สเตจนี้กำหนดเอง ค่าอื่นใช้ร่วมกันทุกสเตจ",
+            )));
+        }
         if !s.reveal_all {
             r = r.child(icon_button(
                 p,
@@ -907,8 +1139,8 @@ fn variables_tab(s: &App, p: Paint, vars: &[(String, String)]) -> El {
 // ── Folders ───────────────────────────────────────────────────────────
 
 fn folder_tab(s: &App, p: Paint, exists: bool) -> El {
-    if let (true, Some(name), Some(Ok(vars))) = (exists, &s.selected, s.variables()) {
-        return crate::diagram::tie_diagram(s, p, name, vars);
+    if let (true, Some(name), Some(Ok(_))) = (exists, &s.selected, s.variables()) {
+        return crate::diagram::tie_diagram(s, p, name);
     }
     // A new project: its one folder, and the step that saves its .env as the project.
     let folder = s.folder();
@@ -2051,15 +2283,14 @@ fn confirm_dialog(s: &App, p: Paint) -> El {
 }
 
 fn confirm_all_dialog(s: &App, p: Paint) -> El {
-    let changing: Vec<String> = match s.variables() {
-        Some(Ok(vars)) => s
-            .tied()
-            .iter()
-            .filter(|f| core::env_would_change(vars, f))
-            .map(|f| display_path(f))
-            .collect(),
-        _ => Vec::new(),
-    };
+    let changing: Vec<String> = s
+        .tied()
+        .iter()
+        .filter(
+            |f| matches!(s.folder_variables(f), Some(Ok(vars)) if core::env_would_change(&vars, f)),
+        )
+        .map(|f| display_path(f))
+        .collect();
     let mut list = col().key("confirm-all-list").w_full().gap(4.0);
     for path in &changing {
         list = list.child(

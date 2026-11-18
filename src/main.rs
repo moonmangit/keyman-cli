@@ -88,8 +88,17 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
         "status" => status(&home_dir()?)?,
         "list" => list(&home_dir()?)?,
         "show" => {
-            let (project, variables) = project_for(arg(0))?;
-            show(&project, &variables, cli::has(&flags, "--reveal"))
+            let (_, yaml) = read_master(&home_dir()?)?;
+            let target = resolve_target(arg(0), &yaml)?;
+            let project = master::read_project(&yaml, &target.project)?;
+            let reveal = cli::has(&flags, "--reveal");
+            if target.stage.is_none() && project.has_stages() {
+                show_stages(&target.project, &project, reveal)
+            } else {
+                let variables =
+                    master::stage_variables(&project, &target.project, target.stage.as_deref())?;
+                show(&target.label(), &variables, reveal)
+            }
         }
         "inject" => {
             let (project, variables) = project_for(arg(0))?;
@@ -140,6 +149,7 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
         "link" => {
             let home = home_dir()?;
             let (_, yaml) = read_master(&home)?;
+            whole_project(arg(0), &yaml)?;
             let project = resolve_project(arg(0), &yaml)?;
             let group = cli::value(&flags, "--group").map(|name| name.to_string_lossy());
             sync::ensure_unlinked(&home, &project)?;
@@ -148,6 +158,9 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
             ui::success(&format!("Linked {project} to Keyman Cloud."))
         }
         "unlink" => {
+            if let Ok((_, yaml)) = read_master(&home_dir()?) {
+                whole_project(arg(0), &yaml)?;
+            }
             let project = match arg(0) {
                 Some(name) => name.to_string_lossy().into_owned(),
                 None => current_folder_name()?,
@@ -155,8 +168,16 @@ fn execute(args: &[OsString]) -> Result<Outcome, String> {
             sync::unlink(&home_dir()?, &project)?;
             ui::success(&format!("Removed the link for {project}."))
         }
-        "push" => return push_command(arg(0)),
-        "pull" => return pull_command(arg(0), &flags),
+        "push" | "pull" => {
+            if let Ok((_, yaml)) = read_master(&home_dir()?) {
+                whole_project(arg(0), &yaml)?;
+            }
+            return if spec.name == "push" {
+                push_command(arg(0))
+            } else {
+                pull_command(arg(0), &flags)
+            };
+        }
         "cloud" => return cloud_command(&positional[0].to_string_lossy(), arg(1)),
         "group" => return group_command(&positional),
         other => return Err(format!("command '{other}' is not implemented")),
@@ -773,11 +794,75 @@ fn loaded_message(loaded: &master::Loaded, created: bool) -> String {
 
 /// Reads the master file and returns the variables of the named project, or
 /// of the project named after the current folder when no name is given.
+/// A project, or one of its stages, as named on the command line.
+#[derive(Debug)]
+struct Target {
+    project: String,
+    stage: Option<String>,
+}
+
+impl Target {
+    /// `my-app` or `my-app:staging`.
+    fn label(&self) -> String {
+        match &self.stage {
+            Some(stage) => format!("{}{}{stage}", self.project, master::STAGE_SEPARATOR),
+            None => self.project.clone(),
+        }
+    }
+}
+
+/// Resolves `project` or `project:stage`, defaulting to the current folder name.
+fn resolve_target(given: Option<&OsString>, yaml: &str) -> Result<Target, String> {
+    if let Some(name) = given {
+        let names = master::project_names(yaml)?;
+        let name = name.to_string_lossy();
+        // ':staging' names a stage of the project named after the current folder.
+        if let Some(stage) = folder_stage(&name, &names) {
+            return Ok(Target {
+                project: resolve_project(None, yaml)?,
+                stage: Some(stage.to_owned()),
+            });
+        }
+        if let (project, Some(stage)) = master::split_target(&name, &names) {
+            let project = resolve_project(Some(&OsString::from(project)), yaml)?;
+            return Ok(Target {
+                project,
+                stage: Some(stage.to_owned()),
+            });
+        }
+    }
+    Ok(Target {
+        project: resolve_project(given, yaml)?,
+        stage: None,
+    })
+}
+
+/// The stage in ':staging', a short form for a stage of the project named after
+/// the current folder. A project whose own name starts with ':' wins.
+fn folder_stage<'a>(target: &'a str, names: &[String]) -> Option<&'a str> {
+    target
+        .strip_prefix(master::STAGE_SEPARATOR)
+        .filter(|stage| !stage.is_empty() && !names.iter().any(|name| name == target))
+}
+
+/// Cloud commands link a whole project, stages included.
+fn whole_project(given: Option<&OsString>, yaml: &str) -> Result<(), String> {
+    let Some(name) = given else { return Ok(()) };
+    let names = master::project_names(yaml).unwrap_or_default();
+    match master::split_target(&name.to_string_lossy(), &names) {
+        (project, Some(_)) if names.iter().any(|n| n == project) => Err(format!(
+            "Keyman Cloud syncs a whole project with all its stages\n\nUse the project name only, for example '{project}'."
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn project_for(given: Option<&OsString>) -> Result<(String, Variables), String> {
     let (_, yaml) = read_master(&home_dir()?)?;
-    let project = resolve_project(given, &yaml)?;
-    let variables = master::project_variables(&yaml, &project)?;
-    Ok((project, variables))
+    let target = resolve_target(given, &yaml)?;
+    let project = master::read_project(&yaml, &target.project)?;
+    let variables = master::stage_variables(&project, &target.project, target.stage.as_deref())?;
+    Ok((target.label(), variables))
 }
 
 fn resolve_project(given: Option<&OsString>, yaml: &str) -> Result<String, String> {
@@ -834,8 +919,21 @@ fn status(home: &Path) -> Result<String, String> {
     let width = names.iter().map(String::len).max().unwrap_or(0);
     let mut problems = 0;
     for name in &names {
-        let (mark, detail) = match master::project_variables(&yaml, name) {
-            Ok(variables) => (green("✓"), dim(&plural(variables.len(), "variable"))),
+        let (mark, detail) = match master::read_project(&yaml, name) {
+            Ok(project) if project.has_stages() => (
+                green("✓"),
+                dim(&format!(
+                    "{} · {}: {}",
+                    plural(project.shared.len(), "shared variable"),
+                    if project.stages.len() == 1 {
+                        "stage"
+                    } else {
+                        "stages"
+                    },
+                    project.stage_names().join(", ")
+                )),
+            ),
+            Ok(project) => (green("✓"), dim(&plural(project.shared.len(), "variable"))),
             Err(problem) => {
                 problems += 1;
                 (red("✗"), red(&problem))
@@ -868,7 +966,17 @@ fn list(home: &Path) -> Result<String, String> {
     if names.is_empty() {
         ui::note("the master file has no projects yet. Run 'keyman edit' to add one.");
     }
-    Ok(names.join("\n"))
+    let mut lines = Vec::new();
+    for name in names {
+        let stages = master::read_project(&yaml, &name)
+            .map(|project| project.stage_names())
+            .unwrap_or_default();
+        lines.push(name.clone());
+        for stage in stages {
+            lines.push(format!("{name}{}{stage}", master::STAGE_SEPARATOR));
+        }
+    }
+    Ok(lines.join("\n"))
 }
 
 fn show(project: &str, variables: &[(String, String)], reveal: bool) -> String {
@@ -884,6 +992,20 @@ fn show(project: &str, variables: &[(String, String)], reveal: bool) -> String {
         lines.push(dim("  No variables yet."));
         return lines.join("\n");
     }
+    variable_lines(&mut lines, variables, reveal, "  ");
+    if !reveal {
+        lines.push(String::new());
+        lines.push(dim("Values are hidden. Add --reveal to show them."));
+    }
+    lines.join("\n")
+}
+
+fn variable_lines(
+    lines: &mut Vec<String>,
+    variables: &[(String, String)],
+    reveal: bool,
+    indent: &str,
+) {
     let width = variables
         .iter()
         .map(|(name, _)| name.len())
@@ -895,10 +1017,44 @@ fn show(project: &str, variables: &[(String, String)], reveal: bool) -> String {
         } else {
             dim("••••••••")
         };
-        lines.push(format!("  {}  {value}", bold(&ui::pad(name, width))));
+        lines.push(format!("{indent}{}  {value}", bold(&ui::pad(name, width))));
     }
-    if !reveal {
+}
+
+/// `keyman show` for a project with stages: the shared variables, then each
+/// stage's own variables.
+fn show_stages(name: &str, project: &master::Project, reveal: bool) -> String {
+    let mut lines = vec![
+        format!(
+            "{}{}",
+            accent(&bold(name)),
+            dim(&format!(
+                " · {} · {}",
+                plural(project.shared.len(), "shared variable"),
+                plural(project.stages.len(), "stage")
+            ))
+        ),
+        String::new(),
+        bold("  Shared"),
+    ];
+    if project.shared.is_empty() {
+        lines.push(dim("    No shared variables."));
+    }
+    variable_lines(&mut lines, &project.shared, reveal, "    ");
+    for (stage, variables) in &project.stages {
         lines.push(String::new());
+        lines.push(format!("  {}", accent(&bold(stage))));
+        if variables.is_empty() {
+            lines.push(dim("    Only the shared variables."));
+        }
+        variable_lines(&mut lines, variables, reveal, "    ");
+    }
+    lines.push(String::new());
+    lines.push(dim(&format!(
+        "A stage's values replace the shared ones. Run 'keyman show {name}{}<stage>' to see\nwhat one stage writes.",
+        master::STAGE_SEPARATOR
+    )));
+    if !reveal {
         lines.push(dim("Values are hidden. Add --reveal to show them."));
     }
     lines.join("\n")
@@ -912,10 +1068,25 @@ fn save_command(
 ) -> Result<String, String> {
     let (master_path, yaml) = read_master(&home_dir()?)?;
     let names = master::project_names(&yaml)?;
-    let (project, from_folder) = match given {
-        Some(name) => (name.to_string_lossy().into_owned(), false),
+    let (full, from_folder) = match given {
+        Some(name) => {
+            let name = name.to_string_lossy().into_owned();
+            match folder_stage(&name, &names) {
+                Some(stage) => (
+                    format!(
+                        "{}{}{stage}",
+                        current_folder_name()?,
+                        master::STAGE_SEPARATOR
+                    ),
+                    true,
+                ),
+                None => (name, false),
+            }
+        }
         None => (current_folder_name()?, true),
     };
+    let (project, stage) = master::split_target(&full, &names);
+    let (project, stage) = (project.to_owned(), stage.map(str::to_owned));
     let exists = names.contains(&project);
     if !exists && !cli::has(flags, "--new") {
         if let Some(close) = ui::suggest(&project, names.iter().map(String::as_str)) {
@@ -937,21 +1108,64 @@ fn save_command(
             display_path(&env_path)
         ));
     }
-    let existing = if exists {
-        master::project_variables(&yaml, &project).map_err(|error| {
+    let current = if exists {
+        master::read_project(&yaml, &project).map_err(|error| {
             format!("{error}\n\nFix the project with 'keyman edit' before saving into it.")
         })?
     } else {
-        Vec::new()
+        master::Project::default()
     };
-    let plan = save::plan(&existing, &incoming, cli::has(flags, "--replace"));
+    let replace = cli::has(flags, "--replace");
+    let new_stage = stage
+        .as_deref()
+        .is_some_and(|stage| current.stage(stage).is_none());
+    if let Some(stage) = &stage {
+        if !master::valid_stage_name(stage) {
+            return Err(format!(
+                "'{stage}' is not a valid stage name (use letters, digits, '-', '_' and '.')"
+            ));
+        }
+        if exists && new_stage && !cli::has(flags, "--new") {
+            let stages = current.stage_names();
+            let hint = ui::did_you_mean(stage, stages.iter().map(String::as_str));
+            // Keep the folder the person named, quoted when it has spaces.
+            let folder = directory.map_or(String::new(), |d| {
+                let d = d.to_string_lossy();
+                if d.contains(char::is_whitespace) {
+                    format!(" '{d}'")
+                } else {
+                    format!(" {d}")
+                }
+            });
+            return Err(format!(
+                "project '{project}' has no stage '{stage}'{hint}\n\nTo create it, run 'keyman save {full}{folder} --new'."
+            ));
+        }
+    } else if current.has_stages() {
+        master::stage_variables(&current, &project, None)?;
+    }
+    let (plan, desired) = match &stage {
+        Some(stage) => save::plan_stage(&current, stage, &incoming, replace),
+        None => {
+            let plan = save::plan(&current.shared, &incoming, replace);
+            let mut desired = current.clone();
+            desired.shared = plan.result.clone();
+            (plan, desired)
+        }
+    };
+    let label = Target {
+        project: project.clone(),
+        stage: stage.clone(),
+    }
+    .label();
+    let is_shared = |name: &str| stage.is_some() && current.shared.iter().any(|(n, _)| n == name);
     let env_shown = display_path(&fs::canonicalize(&env_path).unwrap_or(env_path));
     let master_shown = display_path(&master_path);
 
-    if exists && plan.changes() == 0 {
+    if exists && !new_stage && plan.changes() == 0 {
         return Ok(ui::success(&format!(
             "{} is already up to date with {env_shown}",
-            accent(&project)
+            accent(&label)
         )));
     }
 
@@ -961,8 +1175,14 @@ fn save_command(
             bold("Saving"),
             env_shown,
             dim("→"),
-            accent(&bold(&project)),
-            dim(if exists { "" } else { " (new project)" })
+            accent(&bold(&label)),
+            dim(if !exists {
+                " (new project)"
+            } else if new_stage {
+                " (new stage)"
+            } else {
+                ""
+            })
         ),
         String::new(),
     ];
@@ -978,6 +1198,9 @@ fn save_command(
             Edit::Added => format!("{} {name}  {}", green("+"), dim("added")),
             Edit::Changed => format!("{} {name}  {}", yellow("~"), dim("changed")),
             Edit::Removed => format!("{} {name}  {}", red("-"), dim("removed")),
+            Edit::Kept if is_shared(name.trim_end()) => dim(&format!(
+                "= {name}  shared by every stage, kept (change it with 'keyman edit')"
+            )),
             Edit::Kept => dim(&format!(
                 "= {name}  only in the master file, kept (--replace removes it)"
             )),
@@ -1000,7 +1223,7 @@ fn save_command(
         ));
         return Ok(lines.join("\n"));
     }
-    let updated = save::update_project(&yaml, &project, &plan, exists)?;
+    let updated = save::write_project(&yaml, &project, &desired, exists)?;
     master::atomic_write(&master_path, updated.as_bytes())?;
     lines.push(ui::success(&format!(
         "Saved {} to {}",
@@ -1352,6 +1575,40 @@ mod tests {
             render_project("p:\n  KEY: 'a\"b\\c$d`e'\n", "p").unwrap(),
             "KEY=\"a\\\"b\\\\c\\$d\\`e\"\n"
         );
+    }
+
+    #[test]
+    fn stages_in_list_status_show_and_targets() {
+        let fixture = Fixture::new(
+            "api:\n  DEBUG: \"0\"\n  prod:\n    DB: \"p\"\n  dev:\n    DEBUG: \"1\"\nweb: {}\n",
+        );
+        fixture.load();
+        let (_, yaml) = read_master(&fixture.home).unwrap();
+        assert_eq!(list(&fixture.home).unwrap(), "api\napi:prod\napi:dev\nweb");
+        assert!(status(&fixture.home)
+            .unwrap()
+            .contains("✓ api  1 shared variable · stages: prod, dev"));
+        let target = resolve_target(Some(&OsString::from("api:dev")), &yaml).unwrap();
+        assert_eq!(
+            (target.project.as_str(), target.label()),
+            ("api", "api:dev".to_owned())
+        );
+        assert!(resolve_target(Some(&OsString::from("nope:dev")), &yaml)
+            .unwrap_err()
+            .contains("project 'nope' was not found"));
+        let project = master::read_project(&yaml, "api").unwrap();
+        assert_eq!(
+            show_stages("api", &project, true),
+            "api · 1 shared variable · 2 stages\n\n  Shared\n    DEBUG  0\n\n  prod\n    DB  p\n\n  dev\n    DEBUG  1\n\nA stage's values replace the shared ones. Run 'keyman show api:<stage>' to see\nwhat one stage writes."
+        );
+        assert!(whole_project(Some(&OsString::from("api:dev")), &yaml).is_err());
+        assert!(whole_project(Some(&OsString::from("api")), &yaml).is_ok());
+        // ':dev' is a stage of the project named after the current folder.
+        let names = master::project_names(&yaml).unwrap();
+        assert_eq!(folder_stage(":dev", &names), Some("dev"));
+        assert_eq!(folder_stage(":", &names), None);
+        assert_eq!(folder_stage("api:dev", &names), None);
+        assert_eq!(folder_stage(":odd", &[":odd".to_owned()]), None);
     }
 
     #[test]

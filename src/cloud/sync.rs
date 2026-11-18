@@ -235,7 +235,7 @@ fn cloud_name_is_free(cloud_names: &[String], project: &str) -> Result<(), Strin
 
 pub fn link(home: &Path, u: &Unlocked, project: &str, group: Option<&str>) -> Result<Link, String> {
     let (_, yaml) = master::read_master(home)?;
-    let variables = master::project_variables(&yaml, project)?;
+    let variables = master::project_flat(&yaml, project)?;
     ensure_unlinked(home, project)?;
     let memberships = u.api.my_memberships()?;
     let vaults = Vaults::from_memberships(u, &memberships);
@@ -369,7 +369,7 @@ pub fn push(home: &Path, u: &Unlocked, project: Option<&str>) -> Result<Vec<Push
             });
             continue;
         }
-        let local = match master::project_variables(&yaml, &name) {
+        let local = match master::project_flat(&yaml, &name) {
             Ok(local) => local,
             Err(reason) => {
                 results.push(PushResult::Skipped {
@@ -760,20 +760,16 @@ pub fn pull_merge(
     Ok(Some(merge::resolve(merged, &choices)))
 }
 
-/// The master file text with `project` set to exactly `variables`.
+/// The master file text with `project` set to exactly `variables`, in the flat
+/// form that carries stages (`master::Project::flat`).
 pub fn write_project(
     yaml: &str,
     project: &str,
     exists: bool,
     variables: &[(String, String)],
 ) -> Result<String, String> {
-    let existing = if exists {
-        master::project_variables(yaml, project)?
-    } else {
-        Vec::new()
-    };
-    let plan = save::plan(&existing, variables, true);
-    save::update_project(yaml, project, &plan, exists)
+    let desired = master::Project::from_flat(variables)?;
+    save::write_project(yaml, project, &desired, exists)
 }
 
 #[derive(Debug, PartialEq)]
@@ -798,7 +794,7 @@ pub fn local_status(home: &Path) -> Result<Vec<(String, LinkStatus)>, String> {
             let status = if !names.contains(&link.project) {
                 LinkStatus::Missing
             } else {
-                match master::project_variables(&yaml, &link.project) {
+                match master::project_flat(&yaml, &link.project) {
                     Ok(local) if same_vars(&local, &link.base) => LinkStatus::Synced,
                     _ => LinkStatus::LocalChanges,
                 }
@@ -893,7 +889,7 @@ fn linked_step(
     if !names.contains(&link.project) {
         return Ok(Step::Skipped(skip_reason_missing(&link.project)));
     }
-    let local = match master::project_variables(yaml, &link.project) {
+    let local = match master::project_flat(yaml, &link.project) {
         Ok(local) => local,
         Err(reason) => return Ok(Step::Skipped(reason)),
     };
@@ -915,7 +911,7 @@ fn adopt_step(
     cloud: &[(String, String)],
     resolver: &mut dyn Resolver,
 ) -> Result<Step, String> {
-    let local = match master::project_variables(yaml, name) {
+    let local = match master::project_flat(yaml, name) {
         Ok(local) => local,
         Err(reason) => return Ok(Step::Skipped(reason)),
     };
@@ -1350,6 +1346,58 @@ mod tests {
                 yaml: None,
                 changes: 0
             }
+        );
+    }
+
+    #[test]
+    fn stages_sync_as_part_of_the_project() {
+        let yaml = "# top\napp:\n  A: \"1\"  # shared\n  prod:\n    DB: \"p\"\n  dev:\n";
+        let base = master::project_flat(yaml, "app").unwrap();
+        let link = link_of("app", base.clone());
+        // The cloud changed prod, removed dev and added qa.
+        let cloud = v(&[
+            ("A", "1"),
+            ("prod:", ""),
+            ("prod:DB", "p2"),
+            ("qa:", ""),
+            ("qa:DB", "q"),
+        ]);
+        let mut r = Fixed(None, 0);
+        let Step::Done {
+            yaml: Some(out), ..
+        } = linked_step(yaml, &link, 2, &cloud, &mut r).unwrap()
+        else {
+            panic!("expected a write");
+        };
+        assert_eq!(
+            out,
+            "# top\napp:\n  A: \"1\"  # shared\n  prod:\n    DB: \"p2\"\n  qa:\n    DB: \"q\"\n"
+        );
+        assert_eq!(r.1, 0);
+
+        // Both sides changed the same stage value: one conflict, named stage:NAME.
+        let local = "app:\n  A: \"1\"\n  prod:\n    DB: \"mine\"\n  dev:\n";
+        let mut r = Fixed(Some(vec![Some("theirs".into())]), 0);
+        let cloud = v(&[
+            ("A", "1"),
+            ("prod:", ""),
+            ("prod:DB", "theirs"),
+            ("dev:", ""),
+        ]);
+        let merged = pull_merge(
+            "app",
+            &base,
+            &master::project_flat(local, "app").unwrap(),
+            &cloud,
+            &mut r,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(merged.contains(&("prod:DB".to_owned(), "theirs".to_owned())));
+        let out = write_project(local, "app", true, &merged).unwrap();
+        assert_eq!(
+            master::project_variables(&out, "app:prod").unwrap(),
+            v(&[("A", "1"), ("DB", "theirs")])
         );
     }
 

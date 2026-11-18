@@ -18,7 +18,9 @@ mod ties;
 mod views;
 mod widgets;
 
-use std::collections::BTreeSet;
+use widgets::Pane;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -142,6 +144,8 @@ pub struct App {
     pub selected: Option<String>,
     /// Each project's tied folders and which one is active.
     pub ties: Ties,
+    /// The stage shown for each project with stages (this session only).
+    pub view_stage: BTreeMap<String, String>,
     pub revealed: BTreeSet<String>,
     pub reveal_all: bool,
     pub panel: Panel,
@@ -218,6 +222,7 @@ impl App {
             master: Err(String::new()),
             selected: None,
             ties,
+            view_stage: BTreeMap::new(),
             revealed: BTreeSet::new(),
             reveal_all: false,
             panel: Panel::None,
@@ -329,13 +334,138 @@ impl App {
         }
     }
 
-    pub fn variables(&self) -> Option<&Result<Vec<(String, String)>, String>> {
+    fn project(&self) -> Option<&core::Project> {
         let name = self.selected.as_ref()?;
-        self.master
+        self.master.as_ref().ok()?.project(name)
+    }
+
+    /// The selected project's stages; empty when it has none.
+    pub fn stages(&self) -> Vec<String> {
+        self.project()
+            .map(core::Project::stages)
+            .unwrap_or_default()
+    }
+
+    /// The stage on show: the one picked, else the active folder's, else the first.
+    /// `None` for a project without stages.
+    pub fn stage(&self) -> Option<String> {
+        let stages = self.stages();
+        let name = self.selected.as_ref()?;
+        let valid = |stage: &&str| stages.iter().any(|s| s == stage);
+        self.view_stage
+            .get(name)
+            .map(String::as_str)
+            .filter(valid)
+            .or_else(|| {
+                let folder = self.ties.active(name)?;
+                self.ties.stage(name, folder).filter(valid)
+            })
+            .or(stages.first().map(String::as_str))
+            .map(str::to_owned)
+    }
+
+    /// The stage a tied folder writes from. `None` for a project without stages, and
+    /// for a folder whose stage was never picked or no longer exists: such a folder is
+    /// not written until a stage is picked for it, as the CLI asks for one too.
+    pub fn folder_stage(&self, folder: &Path) -> Option<String> {
+        let stages = self.stages();
+        let name = self.selected.as_ref()?;
+        self.ties
+            .stage(name, &folder.to_string_lossy())
+            .filter(|stage| stages.iter().any(|s| s == stage))
+            .map(str::to_owned)
+    }
+
+    /// True when the project has stages but `folder` has none picked.
+    pub fn needs_stage(&self, folder: &Path) -> bool {
+        !self.stages().is_empty() && self.folder_stage(folder).is_none()
+    }
+
+    /// How a tied folder's .env stands against what it is written from.
+    pub fn folder_status(&self, folder: &Path) -> FolderStatus {
+        if !folder.is_dir() {
+            return FolderStatus::Missing;
+        }
+        if self.needs_stage(folder) {
+            return FolderStatus::NoStage;
+        }
+        match self.folder_variables(folder) {
+            Some(Ok(vars)) => core::folder_status(&vars, folder),
+            _ => FolderStatus::Unreadable,
+        }
+    }
+
+    /// Says how to pick a stage for `folder`.
+    fn fail_no_stage(&mut self, folder: &Path) {
+        self.fail(tf!(
+            "Pick a stage for {} first: right-click it › Write from stage",
+            "เลือกสเตจให้ {} ก่อน: คลิกขวา › เขียนจากสเตจ",
+            display_path(folder)
+        ));
+    }
+
+    /// `my-app` or `my-app:staging`, for messages.
+    pub fn target_label(&self, stage: Option<&str>) -> String {
+        let name = self.selected.clone().unwrap_or_default();
+        match stage {
+            Some(stage) => format!("{name}{}{stage}", keyman_cli::master::STAGE_SEPARATOR),
+            None => name,
+        }
+    }
+
+    /// The variables of the stage on show (all of them for a project without stages).
+    pub fn variables(&self) -> Option<Result<Vec<(String, String)>, String>> {
+        Some(self.project()?.variables(self.stage().as_deref()))
+    }
+
+    /// The variables a tied folder's .env is written from; `None` when there is no
+    /// project, or the folder needs a stage first.
+    pub fn folder_variables(&self, folder: &Path) -> Option<Result<Vec<(String, String)>, String>> {
+        if self.needs_stage(folder) {
+            return None;
+        }
+        Some(
+            self.project()?
+                .variables(self.folder_stage(folder).as_deref()),
+        )
+    }
+
+    /// The names the stage on show sets itself (its own or overridden values).
+    pub fn stage_own(&self) -> Vec<String> {
+        let (Some(project), Some(stage)) = (self.project(), self.stage()) else {
+            return Vec::new();
+        };
+        project
+            .data
             .as_ref()
-            .ok()?
-            .project(name)
-            .map(|project| &project.variables)
+            .ok()
+            .and_then(|data| data.stage(&stage))
+            .map(|vars| vars.iter().map(|(name, _)| name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn show_stage(&mut self, stage: &str) {
+        if let Some(name) = self.selected.clone() {
+            self.view_stage.insert(name, stage.to_owned());
+        }
+    }
+
+    /// Writes `folder`'s .env from `stage` from now on.
+    pub fn set_folder_stage(&mut self, folder: &Path, stage: &str) {
+        let Some(project) = self.selected.clone() else {
+            return;
+        };
+        self.menu = None;
+        self.ties
+            .set_stage(&project, &folder.to_string_lossy(), stage);
+        self.view_stage.insert(project.clone(), stage.to_owned());
+        self.store_ties();
+        self.ok(tf!(
+            "{} now uses {} · Write .env to apply it",
+            "{} ใช้ {} แล้ว · กด เขียน .env เพื่อใช้ค่าใหม่",
+            display_path(folder),
+            self.target_label(Some(stage))
+        ));
     }
 
     /// The selected project's active folder.
@@ -353,7 +483,14 @@ impl App {
 
     /// Ties a folder to a project and makes it the active one.
     pub fn tie(&mut self, project: &str, folder: &Path) {
+        let stage = (self.selected.as_deref() == Some(project))
+            .then(|| self.stage())
+            .flatten();
         self.ties.tie(project, &folder.to_string_lossy());
+        if let Some(stage) = stage {
+            self.ties
+                .set_stage(project, &folder.to_string_lossy(), &stage);
+        }
         self.panel = Panel::None;
         self.store_ties();
     }
@@ -378,6 +515,10 @@ impl App {
             return;
         };
         self.ties.set_active(&project, &folder.to_string_lossy());
+        // The page follows the folder's stage.
+        if let Some(stage) = self.folder_stage(folder) {
+            self.view_stage.insert(project.clone(), stage);
+        }
         self.panel = Panel::None;
         self.store_ties();
     }
@@ -389,6 +530,44 @@ impl App {
             Ties::forget(&mut self.prefs)
         };
         if let Err(error) = result {
+            self.fail(error);
+        }
+    }
+
+    /// A resizable section's width in points (the split as the Variables column's width).
+    pub fn pane_width(&self, pane: Pane) -> f32 {
+        match pane {
+            Pane::Sidebar => self.settings.sidebar_w,
+            Pane::Stages => self.settings.stages_w,
+            Pane::Split(total) => settings::split_width(self.settings.split, total),
+        }
+    }
+
+    /// Sets a section's width, kept within its limits. Saved by `store_settings`.
+    pub fn set_pane_width(&mut self, pane: Pane, width: f32) {
+        let clamp = |value: f32, (_, min, max): (f32, f32, f32)| value.clamp(min, max);
+        match pane {
+            Pane::Sidebar => self.settings.sidebar_w = clamp(width, settings::SIDEBAR_W),
+            Pane::Stages => self.settings.stages_w = clamp(width, settings::STAGES_W),
+            Pane::Split(total) if total > 0.0 => {
+                let width = settings::split_width(width / total, total);
+                self.settings.split = clamp(width / total, settings::SPLIT);
+            }
+            Pane::Split(_) => {}
+        }
+    }
+
+    pub fn reset_pane_width(&mut self, pane: Pane) {
+        match pane {
+            Pane::Sidebar => self.settings.sidebar_w = settings::SIDEBAR_W.0,
+            Pane::Stages => self.settings.stages_w = settings::STAGES_W.0,
+            Pane::Split(_) => self.settings.split = settings::SPLIT.0,
+        }
+    }
+
+    /// Saves the settings as they are (after a resize).
+    pub fn store_settings(&mut self) {
+        if let Err(error) = self.settings.save(&mut self.prefs) {
             self.fail(error);
         }
     }
@@ -475,10 +654,14 @@ impl App {
 
     /// `keyman inject`, asking first when it would overwrite a different .env.
     pub fn inject(&mut self) {
-        let (Some(folder), Some(Ok(variables))) = (self.folder(), self.variables()) else {
+        let Some(folder) = self.folder() else { return };
+        if self.needs_stage(&folder) {
+            return self.fail_no_stage(&folder);
+        }
+        let Some(Ok(variables)) = self.folder_variables(&folder) else {
             return;
         };
-        if self.settings.confirm_overwrite && core::env_would_change(variables, &folder) {
+        if self.settings.confirm_overwrite && core::env_would_change(&variables, &folder) {
             self.dialog = Some(Dialog::ConfirmOverwrite);
         } else {
             self.inject_now();
@@ -487,13 +670,11 @@ impl App {
 
     pub fn inject_now(&mut self) {
         self.dialog = None;
-        let (Some(project), Some(folder), Some(Ok(variables))) = (
-            self.selected.clone(),
-            self.folder(),
-            self.variables().cloned(),
-        ) else {
+        let Some(folder) = self.folder() else { return };
+        let Some(Ok(variables)) = self.folder_variables(&folder) else {
             return;
         };
+        let project = self.target_label(self.folder_stage(&folder).as_deref());
         let warn = self.settings.git_warning;
         let result = core::inject(&variables, &folder).map(|injected| {
             let path = display_path(&injected.path);
@@ -534,13 +715,9 @@ impl App {
 
     /// `keyman inject` into every tied folder that exists.
     pub fn write_all(&mut self) {
-        let Some(Ok(variables)) = self.variables() else {
-            return;
-        };
-        let would_change = self
-            .tied()
-            .iter()
-            .any(|folder| core::env_would_change(variables, folder));
+        let would_change = self.tied().iter().any(|folder| {
+            matches!(self.folder_variables(folder), Some(Ok(variables)) if core::env_would_change(&variables, folder))
+        });
         if self.settings.confirm_overwrite && would_change {
             self.dialog = Some(Dialog::ConfirmWriteAll);
         } else {
@@ -550,16 +727,25 @@ impl App {
 
     pub fn write_all_now(&mut self) {
         self.dialog = None;
-        let Some(Ok(variables)) = self.variables().cloned() else {
-            return;
-        };
         let (mut written, mut current, mut skipped, mut unignored) = (0, 0, 0, Vec::new());
-        let mut errors = Vec::new();
+        let (mut errors, mut no_stage) = (Vec::new(), 0);
         for folder in self.tied() {
             if !folder.is_dir() {
                 skipped += 1;
                 continue;
             }
+            if self.needs_stage(&folder) {
+                no_stage += 1;
+                continue;
+            }
+            let variables = match self.folder_variables(&folder) {
+                Some(Ok(variables)) => variables,
+                Some(Err(error)) => {
+                    errors.push(error);
+                    continue;
+                }
+                None => continue,
+            };
             match core::inject(&variables, &folder) {
                 Ok(injected) => {
                     if injected.change == Change::Unchanged {
@@ -590,6 +776,13 @@ impl App {
         if skipped > 0 {
             message.push_str(&tf!(" · {} missing, skipped", " · ข้าม {} ที่หาไม่พบ", skipped));
         }
+        if no_stage > 0 {
+            message.push_str(&tf!(
+                " · {} without a stage, skipped (right-click › Write from stage)",
+                " · ข้าม {} ที่ยังไม่เลือกสเตจ (คลิกขวา › เขียนจากสเตจ)",
+                count(no_stage, "folder", "folders", "โฟลเดอร์")
+            ));
+        }
         if self.settings.git_warning && !unignored.is_empty() {
             message.push_str(&tf!(
                 "\nGit does not ignore .env in {}.",
@@ -600,7 +793,10 @@ impl App {
         if !errors.is_empty() {
             message.push_str(&format!("\n{}", errors.join("\n")));
         }
-        if errors.is_empty() && (unignored.is_empty() || !self.settings.git_warning) {
+        if errors.is_empty()
+            && no_stage == 0
+            && (unignored.is_empty() || !self.settings.git_warning)
+        {
             self.ok(message);
         } else {
             self.fail(message);
@@ -610,17 +806,19 @@ impl App {
     /// Brings a just-tied folder in line with the project: writes .env when there is none, and
     /// opens the conflict resolver when its .env disagrees with the master file.
     pub fn sync_folder(&mut self, folder: &Path) {
-        let (Some(project), Some(Ok(vars))) = (self.selected.clone(), self.variables().cloned())
-        else {
-            return;
-        };
+        let project = self.target_label(self.folder_stage(folder).as_deref());
         let shown = display_path(folder);
-        match core::folder_status(&vars, folder) {
+        let vars = match self.folder_variables(folder) {
+            Some(Ok(vars)) => vars,
+            _ => Vec::new(),
+        };
+        match self.folder_status(folder) {
             FolderStatus::NoEnv => match core::inject(&vars, folder) {
                 Ok(_) => self.ok(tf!(
-                    "Tied {} and wrote its .env · {}",
-                    "ผูก {} และเขียน .env แล้ว · {}",
+                    "Tied {} and wrote its .env from {} · {}",
+                    "ผูก {} และเขียน .env จาก {} แล้ว · {}",
                     shown,
+                    project,
                     count(vars.len(), "variable", "variables", "ตัวแปร")
                 )),
                 Err(error) => self.fail(error),
@@ -638,6 +836,7 @@ impl App {
                 "ผูก {} แล้ว แต่อ่าน .env ไม่ได้ แก้ไขไฟล์แล้วค่อยแก้ความต่าง",
                 shown
             )),
+            FolderStatus::NoStage => self.fail_no_stage(folder),
         }
     }
 
@@ -655,10 +854,10 @@ impl App {
             self.fail(cloud::folder_waits_text());
             return;
         }
-        let Some(Ok(vars)) = self.variables() else {
+        let Some(Ok(vars)) = self.folder_variables(folder) else {
             return;
         };
-        match core::conflicts(vars, folder) {
+        match core::conflicts(&vars, folder) {
             Ok(found) if found.is_empty() => self.ok(t("Already in sync", "ตรงกันอยู่แล้ว")),
             Ok(found) => {
                 let items = found
@@ -717,10 +916,16 @@ impl App {
                 (item.conflict.name.clone(), value)
             })
             .collect();
-        match self
-            .home()
-            .and_then(|home| core::resolve(&home, &project, &resolver.folder, &resolved))
-        {
+        let stage = self.folder_stage(&resolver.folder);
+        match self.home().and_then(|home| {
+            core::resolve(
+                &home,
+                &project,
+                stage.as_deref(),
+                &resolver.folder,
+                &resolved,
+            )
+        }) {
             Ok(_) => {
                 self.dialog = None;
                 self.panel = Panel::None;
@@ -730,7 +935,7 @@ impl App {
                     "Synced {} with {} · {} resolved",
                     "ซิงก์ {} กับ {} แล้ว · แก้ไข {}",
                     display_path(&resolver.folder),
-                    project,
+                    self.target_label(stage.as_deref()),
                     count(resolved.len(), "variable", "variables", "ตัวแปร")
                 ));
             }
@@ -752,10 +957,14 @@ impl App {
 
     /// `keyman diff`, shown in a modal.
     pub fn diff(&mut self) {
-        let (Some(folder), Some(Ok(variables))) = (self.folder(), self.variables()) else {
+        let Some(folder) = self.folder() else { return };
+        if self.needs_stage(&folder) {
+            return self.fail_no_stage(&folder);
+        }
+        let Some(Ok(variables)) = self.folder_variables(&folder) else {
             return;
         };
-        match core::diff(variables, &folder) {
+        match core::diff(&variables, &folder) {
             Ok(lines) => {
                 self.panel = Panel::Diff(lines);
                 self.dialog = Some(Dialog::Panel);
@@ -769,10 +978,13 @@ impl App {
         let (Some(project), Some(folder)) = (self.selected.clone(), self.folder()) else {
             return;
         };
-        match self
-            .home()
-            .and_then(|home| core::save_preview(&home, &project, &folder, self.replace))
-        {
+        if self.needs_stage(&folder) {
+            return self.fail_no_stage(&folder);
+        }
+        let stage = self.folder_stage(&folder);
+        match self.home().and_then(|home| {
+            core::save_preview(&home, &project, stage.as_deref(), &folder, self.replace)
+        }) {
             Ok(preview) => {
                 self.panel = Panel::Save(preview);
                 self.dialog = Some(Dialog::Panel);
@@ -785,9 +997,13 @@ impl App {
         let (Some(project), Some(folder)) = (self.selected.clone(), self.folder()) else {
             return;
         };
-        let result = self
-            .home()
-            .and_then(|home| core::save_apply(&home, &project, &folder, self.replace));
+        if self.needs_stage(&folder) {
+            return self.fail_no_stage(&folder);
+        }
+        let stage = self.folder_stage(&folder);
+        let result = self.home().and_then(|home| {
+            core::save_apply(&home, &project, stage.as_deref(), &folder, self.replace)
+        });
         self.close_panel();
         self.reload();
         self.select(Some(project.clone()));
@@ -1142,8 +1358,13 @@ fn main() {
                 s.resolve_active();
                 if let Some(r) = &mut s.resolver {
                     r.reveal = true;
-                    r.items[0].pick = Pick::Env;
-                    r.items[1].pick = Pick::Edit;
+                    // However many conflicts the folder has: the first keeps .env, the second is typed.
+                    if let Some(item) = r.items.get_mut(0) {
+                        item.pick = Pick::Env;
+                    }
+                    if let Some(item) = r.items.get_mut(1) {
+                        item.pick = Pick::Edit;
+                    }
                 }
             }),
             ("toast", |s| {
@@ -1308,4 +1529,85 @@ fn main() {
             app
         })
         .run();
+}
+
+#[cfg(test)]
+mod pane_tests {
+    use super::*;
+
+    #[test]
+    fn dividers_resize_within_limits_and_reset() {
+        let mut s = App::for_tests();
+        s.set_pane_width(Pane::Sidebar, 9999.0);
+        assert_eq!(s.settings.sidebar_w, settings::SIDEBAR_W.2);
+        s.set_pane_width(Pane::Stages, 10.0);
+        assert_eq!(s.settings.stages_w, settings::STAGES_W.1);
+        // Variables dragged to 900 of 1000: Folders keeps its minimum.
+        s.set_pane_width(Pane::Split(1000.0), 900.0);
+        assert_eq!(
+            s.pane_width(Pane::Split(1000.0)),
+            1000.0 - settings::FOLDERS_MIN
+        );
+        for pane in [Pane::Sidebar, Pane::Stages, Pane::Split(1000.0)] {
+            s.reset_pane_width(pane);
+        }
+        let d = Settings::default();
+        assert_eq!(
+            (s.settings.sidebar_w, s.settings.stages_w, s.settings.split),
+            (d.sidebar_w, d.stages_w, d.split)
+        );
+    }
+
+    /// A folder writes its own stage, whatever stage is on show, and a folder
+    /// with no stage picked is never written.
+    #[test]
+    fn folders_write_their_own_stage_or_nothing() {
+        let root = std::env::temp_dir().join(format!("keyman-app-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, prod, loose) = (root.join("home"), root.join("prod"), root.join("loose"));
+        for dir in [&home, &prod, &loose] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let master = home.join("master.yml");
+        std::fs::write(
+            home.join(".keyman_config"),
+            master.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            &master,
+            "app:\n  LOG: \"info\"\n  production:\n    DB: \"prod\"\n  staging:\n    DB: \"stage\"\n",
+        )
+        .unwrap();
+        let mut s = App::build(None, Prefs::memory(), Some(home), CloudState::SignedOut);
+        s.reload();
+        s.select(Some("app".into()));
+        s.ties.tie("app", &prod.to_string_lossy());
+        s.ties
+            .set_stage("app", &prod.to_string_lossy(), "production");
+        s.ties.tie("app", &loose.to_string_lossy());
+
+        // Staging on show, production folder active: Write .env writes production.
+        s.show_stage("staging");
+        s.ties.set_active("app", &prod.to_string_lossy());
+        s.show_stage("staging");
+        s.inject_now();
+        let written = std::fs::read_to_string(prod.join(".env")).unwrap();
+        assert!(written.contains("DB=\"prod\""), "{written}");
+
+        // The folder without a stage is left alone, by Write .env and Write to all.
+        assert_eq!(s.folder_status(&loose), FolderStatus::NoStage);
+        s.set_active(&loose);
+        s.inject();
+        s.write_all_now();
+        assert!(!loose.join(".env").exists());
+
+        // Picking its stage makes it writable.
+        s.set_folder_stage(&loose, "staging");
+        assert_eq!(s.folder_status(&loose), FolderStatus::NoEnv);
+        s.write_all_now();
+        let written = std::fs::read_to_string(loose.join(".env")).unwrap();
+        assert!(written.contains("DB=\"stage\""), "{written}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

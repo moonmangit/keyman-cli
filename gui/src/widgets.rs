@@ -1,7 +1,7 @@
 //! Keyman's look: one palette for light and dark, and the controls built on it.
 
 use rune::tok;
-use rune::{Color, El, Icon, TextStyle, Tx, col, el, icon, oklch, row, text};
+use rune::{Color, Cursor, Drag, El, Icon, Phase, TextStyle, Tx, col, el, icon, oklch, row, text};
 
 use crate::App;
 
@@ -96,6 +96,42 @@ pub enum Kind {
 }
 
 /// A labelled button, with an optional leading icon.
+/// A page-header button: its label and icon, or only its icon (the label as
+/// a tooltip) when the page is narrow.
+pub fn action_button(
+    p: Paint,
+    key: &str,
+    label: &str,
+    glyph: &'static Icon,
+    enabled: bool,
+    f: impl Fn(&mut App, &mut Tx) + 'static,
+) -> El {
+    if !crate::views::narrow() {
+        return button(p, key, label, Some(glyph), Kind::Secondary, enabled, f);
+    }
+    let b = row()
+        .key(key)
+        .role("button")
+        .label(label)
+        .help(label)
+        .size(30.0, 30.0)
+        .center()
+        .radius(7.0)
+        .fill(p.raised)
+        .border(1.0, p.border)
+        .shadow(1.0, 1.5, p.shadow.alpha(0.25))
+        .disabled(!enabled)
+        .child(icon(glyph, 15.0).color(p.text).a11y_hidden());
+    if enabled {
+        b.focusable(true)
+            .hover(p.hover)
+            .press(p.press)
+            .on_press_tx(f)
+    } else {
+        b.opacity(0.4)
+    }
+}
+
 pub fn button(
     p: Paint,
     key: &str,
@@ -401,3 +437,51 @@ pub fn icon_tile(glyph: &'static Icon, size: f32, tint: Color, dark: bool) -> El
 pub fn dot(color: Color) -> El {
     el().size(8.0, 8.0).radius(4.0).fill(color).a11y_hidden()
 }
+
+/// A section whose width a divider changes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Pane {
+    Sidebar,
+    Stages,
+    /// Variables against Folders; the value is the width the two columns share.
+    Split(f32),
+}
+
+/// A vertical divider that resizes `pane`: drag it, or double-click it to reset
+/// the width. `line` draws a hairline in it (the borders between the side
+/// columns); without it only the hover bar shows (the gap between the cards).
+pub fn resizer(p: Paint, key: &str, pane: Pane, label: &str, line: bool) -> El {
+    let mut handle = col()
+        .key(key)
+        .role("separator")
+        .label(label)
+        .help(crate::i18n::t(
+            "Drag to resize · double-click to reset",
+            "ลากเพื่อปรับขนาด · ดับเบิลคลิกเพื่อคืนค่าเดิม",
+        ))
+        .w(RESIZER_W)
+        .h_full()
+        .center()
+        .cursor(Cursor::ResizeColumn)
+        .hover(p.accent.alpha(0.45))
+        .press(p.accent.alpha(0.7))
+        .on_drag(
+            move |s: &mut App, d: &mut Drag, _tx: &mut Tx| match d.phase {
+                Phase::Down => d.data = s.pane_width(pane),
+                Phase::Move => s.set_pane_width(pane, d.data + d.dx / s.settings.zoom),
+                Phase::Up if d.cancelled() => s.set_pane_width(pane, d.data),
+                Phase::Up => s.store_settings(),
+            },
+        )
+        .on_double_press(move |s: &mut App| {
+            s.reset_pane_width(pane);
+            s.store_settings();
+        });
+    if line {
+        handle = handle.child(el().w(1.0).h_full().fill(p.border));
+    }
+    handle
+}
+
+/// How wide a divider's grab area is.
+pub const RESIZER_W: f32 = 5.0;

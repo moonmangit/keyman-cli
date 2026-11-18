@@ -120,6 +120,34 @@ eval "$(keyman export)"
 
 On Windows, run `.cmd` and `.bat` scripts such as `npm` through the shell: `keyman run -- cmd /c npm start`.
 
+### Stages: production, staging, and more
+
+A project can have stages. Variables directly under the project are shared by every stage. A stage lists only the variables it adds or changes:
+
+```yaml
+my-app:
+  DEBUG: "false"          # shared by every stage
+  LOG_LEVEL: "info"
+  production:
+    DATABASE_URL: "postgres://prod.internal/app"
+  staging:
+    DATABASE_URL: "postgres://staging.internal/app"
+    DEBUG: "true"           # replaces the shared value
+  pre-production: {}        # only the shared variables
+```
+
+Name a stage as `project:stage` in any command that takes a project:
+
+```sh
+keyman inject my-app:staging
+keyman run my-app:production -- npm start
+keyman show my-app            # shared variables and each stage
+keyman show my-app:staging    # what staging writes
+keyman diff :staging          # in a folder named my-app
+```
+
+A project with stages needs a stage: `keyman inject my-app` stops and lists them. `keyman save my-app:staging` writes into that stage only what differs from the shared values. Add `--new` to create a stage. Inside a folder named after the project, `:staging` is short for `my-app:staging`. Stages are optional; a project without them works as before.
+
 ### Check what you have
 
 ```sh
@@ -172,7 +200,7 @@ keyman link my-app
 keyman push
 ```
 
-`keyman link` encrypts the project and sends it. Keyman remembers the link on this computer. `keyman push` sends later changes. It sends every linked project, or only the project you name. If the cloud has newer changes, Keyman stops. Run `keyman pull` first.
+`keyman link` encrypts the project, with all its stages, and sends it. Keyman remembers the link on this computer. `keyman push` sends later changes. It sends every linked project, or only the project you name. If the cloud has newer changes, Keyman stops. Run `keyman pull` first.
 
 ### Get a project from the cloud
 
@@ -186,7 +214,7 @@ Keyman adds new cloud projects to the master file. It also merges the changes of
 
 ### Conflicts
 
-Keyman merges changes variable by variable. A conflict occurs when you and another person change the same variable. Keyman then asks which value to keep. The values stay hidden unless you ask to see them.
+Keyman merges changes variable by variable, and stage by stage. A conflict occurs when you and another person change the same variable. Keyman then asks which value to keep. The values stay hidden unless you ask to see them. A stage's variable shows as `staging:DATABASE_URL`.
 
 To choose without questions, add `--keep-local` or `--keep-cloud`. If Keyman cannot ask you and you add no option, Keyman stops and changes nothing.
 
@@ -230,13 +258,13 @@ keyman cloud delete my-app  # delete the project from the cloud for all members
 | `keyman load <file>` | Use an existing `.yml` or `.yaml` master file |
 | `keyman edit` | Open the master file in your editor, then check it |
 | `keyman status` | Show every project and any problems |
-| `keyman list` | List project names |
-| `keyman show [project] [--reveal]` | Show a project's variables, masked by default |
-| `keyman inject [project] [directory]` | Write the project's variables to `.env` |
-| `keyman diff [project] [directory] [--reveal]` | Compare `.env` with the master file |
-| `keyman save [project] [directory]` | Save `.env` back into the master file (`--dry-run`, `--replace`, `--new`) |
-| `keyman export [project]` | Print `export` lines for your shell |
-| `keyman run [project] [--] <command>...` | Run a command with the project's variables |
+| `keyman list` | List project names, and `project:stage` for each stage |
+| `keyman show [project[:stage]] [--reveal]` | Show a project's variables, masked by default |
+| `keyman inject [project[:stage]] [directory]` | Write the project's variables to `.env` |
+| `keyman diff [project[:stage]] [directory] [--reveal]` | Compare `.env` with the master file |
+| `keyman save [project[:stage]] [directory]` | Save `.env` back into the master file (`--dry-run`, `--replace`, `--new`) |
+| `keyman export [project[:stage]]` | Print `export` lines for your shell |
+| `keyman run [project[:stage]] [--] <command>...` | Run a command with the project's variables |
 | `keyman login [--github] [--google]` | Sign in to Keyman Cloud |
 | `keyman logout` | Sign out and remove the keys from this computer |
 | `keyman recover [--github] [--google]` | Set a new vault password with your recovery code |
@@ -250,13 +278,14 @@ keyman cloud delete my-app  # delete the project from the cloud for all members
 | `keyman completions <shell>` | Print a shell completion script |
 | `keyman help [command]` | Show help; `keyman <command> --help` also works |
 
-`[project]` defaults to the current folder name, and `[directory]` defaults to the current directory. Mistyped commands, options, and project names get a "Did you mean" suggestion.
+`[project]` defaults to the current folder name; add `:stage` for a stage (`my-app:staging`), and `[directory]` defaults to the current directory. Mistyped commands, options, and project names get a "Did you mean" suggestion.
 
 ## Rules for the master file
 
 - Quote every value, including numbers and `true`/`false`: `PORT: "3000"`.
 - Variable names use letters, digits, and underscores, and cannot start with a digit.
 - Values cannot contain line breaks.
+- A key whose value is a mapping (or empty) is a stage. Stage names use letters, digits, `-`, `_` and `.`.
 
 `keyman edit`, `keyman load`, and `keyman status` tell you exactly which project breaks a rule.
 
@@ -334,4 +363,20 @@ mkdir -p ~/keyman-demo
 
 ### Releases
 
-Update the version in `Cargo.toml` and `npm/package.json` together, commit and push, then push a `vX.Y.Z` tag. The [release workflow](.github/workflows/release.yml) tests the Rust CLI, builds binaries for five targets, smoke tests the npm package on Linux and Windows, creates a GitHub release, and publishes the npm package through a configured npm trusted publisher. The package's version must match the tag.
+Every pull request runs [CI](.github/workflows/ci.yml):
+- the CLI's format, lint and tests on Linux, macOS and Windows
+- a shell completion check
+- the cloud end-to-end and database tests against a local Supabase stack
+- the desktop app's lint, tests and build on macOS and Windows
+
+The app builds are kept as downloadable run artifacts for 14 days.
+
+Every merge to `main` runs the [release workflow](.github/workflows/release.yml). It runs the same CI, builds the CLI for five targets, and smoke tests the npm package on Linux and Windows. When the version in `Cargo.toml` has no `vX.Y.Z` tag yet, the same run releases it: it tags the merged commit, creates the GitHub release with the notes from `CHANGELOG.md`, and publishes the npm package through the configured npm trusted publisher.
+
+To release:
+
+1. Set the new version in `Cargo.toml` and `npm/package.json`. They must match.
+2. Add a `## X.Y.Z` section to `CHANGELOG.md`.
+3. Merge to `main`.
+
+A merge that keeps the version only tests and packages. Pushing a `vX.Y.Z` tag by hand also releases. To approve each release before it is published, add required reviewers to the `release` environment in the repository settings.

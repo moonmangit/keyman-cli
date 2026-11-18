@@ -1,5 +1,12 @@
 name: Build and release
 
+# Every merge to main runs the full CI, then builds and smoke tests the npm package.
+# When the version in Cargo.toml has no tag yet, the same run starts the release:
+# it tags the merged commit, creates the GitHub release from CHANGELOG.md, and
+# publishes to npm. So releasing is: bump the version, add its changelog section,
+# merge. Pushing a vX.Y.Z tag by hand still works too.
+#
+# The npm trusted publisher is tied to this file's name: keep it release.yml.
 on:
   push:
     branches: [main]
@@ -9,19 +16,62 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  test:
+  plan:
+    name: Plan the release
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
     steps:
       - uses: actions/checkout@v7
-      - run: rustup update stable
-      - run: rustup component add rustfmt clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+        with:
+          fetch-depth: 0
+      - id: plan
+        name: Check versions and decide whether to release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          npm_version=$(node -p "require('./npm/package.json').version")
+          if [[ "$version" != "$npm_version" ]]; then
+            echo "::error::Cargo.toml has $version but npm/package.json has $npm_version. Set both to the same version."
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match version $version"
+              exit 1
+            fi
+            release=true
+          elif [[ "$GITHUB_REF" == refs/heads/main ]] && ! git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            release=true
+          else
+            release=false
+          fi
+          if [[ "$release" == true ]] && ! grep -qx "## $version" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## $version' section. Add the release notes before releasing."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          if [[ "$release" == true ]]; then
+            echo "### Releasing v$version" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### v$version is already released: testing and packaging only" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  ci:
+    name: CI
+    needs: plan
+    uses: ./.github/workflows/ci.yml
 
   build:
-    needs: test
+    needs: ci
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +104,7 @@ jobs:
           if-no-files-found: error
 
   package:
-    needs: build
+    needs: [plan, build]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -68,10 +118,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            package_version="$(node -p "require('./npm/package.json').version")"
-            test "v$package_version" = "$GITHUB_REF_NAME"
-          fi
+          test "$(node -p "require('./npm/package.json').version")" = "${{ needs.plan.outputs.version }}"
           test -f npm/bin/native/x86_64-unknown-linux-gnu/keyman
           test -f npm/bin/native/aarch64-unknown-linux-gnu/keyman
           test -f npm/bin/native/x86_64-pc-windows-msvc/keyman.exe
@@ -82,10 +129,13 @@ jobs:
           npm pack ./npm --pack-destination dist
           mkdir -p "$RUNNER_TEMP/keyman-home" "$RUNNER_TEMP/keyman-project"
           npm install --prefix "$RUNNER_TEMP/keyman-install" ./dist/*.tgz
-          printf 'smoke:\n  KEY: "ok"\n' > "$RUNNER_TEMP/keyman-master.yml"
-          HOME="$RUNNER_TEMP/keyman-home" "$RUNNER_TEMP/keyman-install/node_modules/.bin/keyman" load "$RUNNER_TEMP/keyman-master.yml"
-          HOME="$RUNNER_TEMP/keyman-home" "$RUNNER_TEMP/keyman-install/node_modules/.bin/keyman" inject smoke "$RUNNER_TEMP/keyman-project"
+          printf 'smoke:\n  KEY: "ok"\n  staging:\n    STAGE: "s"\n' > "$RUNNER_TEMP/keyman-master.yml"
+          keyman="$RUNNER_TEMP/keyman-install/node_modules/.bin/keyman"
+          HOME="$RUNNER_TEMP/keyman-home" "$keyman" --version | grep -F "${{ needs.plan.outputs.version }}"
+          HOME="$RUNNER_TEMP/keyman-home" "$keyman" load "$RUNNER_TEMP/keyman-master.yml"
+          HOME="$RUNNER_TEMP/keyman-home" "$keyman" inject smoke:staging "$RUNNER_TEMP/keyman-project"
           grep -Fx 'KEY="ok"' "$RUNNER_TEMP/keyman-project/.env"
+          grep -Fx 'STAGE="s"' "$RUNNER_TEMP/keyman-project/.env"
       - uses: actions/upload-artifact@v6
         with:
           name: npm-package
@@ -124,12 +174,16 @@ jobs:
           }
 
   github-release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [package, windows-package-smoke]
+    if: needs.plan.outputs.release == 'true'
+    needs: [plan, package, windows-package-smoke]
     runs-on: ubuntu-24.04
+    # Add required reviewers to the "release" environment (Settings › Environments)
+    # to approve each release by hand before anything is tagged or published.
+    environment: release
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: npm-package
@@ -143,8 +197,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
+          tag="v$VERSION"
+          # The changelog section for this version, without its heading.
+          awk -v heading="## $VERSION" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
           mkdir -p dist/assets
           for binary_dir in dist/native/*; do
             target="${binary_dir##*/}"
@@ -154,15 +216,17 @@ jobs:
               cp "$binary_dir/keyman" "dist/assets/keyman-$target"
             fi
           done
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/*.tgz dist/assets/* --clobber
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.tgz dist/assets/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/*.tgz dist/assets/* --generate-notes
+            # Tags the merged commit when the tag does not exist yet.
+            gh release create "$tag" dist/*.tgz dist/assets/* \
+              --target "$GITHUB_SHA" --title "Keyman $VERSION" --notes-file notes.md
           fi
 
   npm-publish:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [package, github-release]
+    if: needs.plan.outputs.release == 'true'
+    needs: [plan, package, github-release]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -178,11 +242,12 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Publish with npm trusted publishing
         shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if npm view "keyman-cli@$version" version >/dev/null 2>&1; then
-            echo "keyman-cli@$version is already published"
+          if npm view "keyman-cli@$VERSION" version >/dev/null 2>&1; then
+            echo "keyman-cli@$VERSION is already published"
           else
             npm publish ./dist/*.tgz --access public
           fi

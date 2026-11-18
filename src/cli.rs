@@ -25,7 +25,7 @@ pub const PROJECT_COMMANDS: &[&str] = &[
     "show", "inject", "save", "diff", "export", "run", "link", "unlink", "push", "pull",
 ];
 
-const PROJECT: &str = "Project name in the master file. Default: the current folder name";
+const PROJECT: &str = "Project name in the master file, or project:stage for one of its stages.\nDefault: the current folder name";
 
 const GROUPS: &[&str] = &["Set up", "Projects", "In a project folder", "More", "Cloud"];
 
@@ -88,10 +88,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "show",
         group: "Projects",
-        args: "[project] [--reveal]",
-        arguments: &[("[project]", PROJECT)],
+        args: "[project[:stage]] [--reveal]",
+        arguments: &[("[project[:stage]]", PROJECT)],
         summary: "Show a project's variables, with values masked",
-        details: "Shows each variable name. Values stay masked unless you add --reveal.",
+        details: "Shows each variable name. Values stay masked unless you add --reveal.\nFor a project with stages, it shows the shared variables and each stage's own\nvariables. Add :stage to see the variables that stage writes.",
         flags: &[("--reveal", "Show the real values")],
         min: 0,
         max: 1,
@@ -99,8 +99,8 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "inject",
         group: "In a project folder",
-        args: "[project] [directory]",
-        arguments: &[("[project]", PROJECT), ("[directory]", "Folder to write .env into. Default: the current directory")],
+        args: "[project[:stage]] [directory]",
+        arguments: &[("[project[:stage]]", PROJECT), ("[directory]", "Folder to write .env into. Default: the current directory")],
         summary: "Write a project's variables to .env",
         details: "Writes DIRECTORY/.env (default: the current directory). An existing .env is\nreplaced. On Unix the file gets 600 permissions. Keyman warns you when the\ndirectory is in a Git repository that does not ignore .env.",
         flags: &[],
@@ -110,14 +110,14 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "save",
         group: "In a project folder",
-        args: "[project] [directory] [--dry-run] [--replace] [--new]",
-        arguments: &[("[project]", PROJECT), ("[directory]", "Folder whose .env is saved. Default: the current directory")],
+        args: "[project[:stage]] [directory] [--dry-run] [--replace] [--new]",
+        arguments: &[("[project[:stage]]", PROJECT), ("[directory]", "Folder whose .env is saved. Default: the current directory")],
         summary: "Save a folder's .env back into the master file",
-        details: "Reads DIRECTORY/.env (default: the current directory) and updates the project\nin the master file: new variables are added and changed values are updated.\nVariables that are only in the master file are kept unless you add --replace.\nA project that does not exist yet is created.\n\nKeyman edits only the project's own lines, so comments and the rest of the\nfile stay as they are. It checks the result before writing, and stops if any\nother project would change.",
+        details: "Reads DIRECTORY/.env (default: the current directory) and updates the project\nin the master file: new variables are added and changed values are updated.\nVariables that are only in the master file are kept unless you add --replace.\nA project that does not exist yet is created.\n\nSaving into a stage (my-app:staging) writes what differs from the shared\nvariables into that stage only. --replace cannot remove a shared variable from\none stage, so it is kept. With --new, a missing stage is created.\n\nKeyman edits only the project's own lines, so comments and the rest of the\nfile stay as they are. It checks the result before writing, and stops if any\nother project would change.",
         flags: &[
             ("--dry-run", "Show the changes without saving them"),
             ("--replace", "Also remove variables that are not in .env"),
-            ("--new", "Create the project even if its name is close to an existing one"),
+            ("--new", "Create the project or stage even if its name is close to an existing one"),
         ],
         min: 0,
         max: 2,
@@ -125,8 +125,8 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "diff",
         group: "In a project folder",
-        args: "[project] [directory] [--reveal]",
-        arguments: &[("[project]", PROJECT), ("[directory]", "Folder whose .env is compared. Default: the current directory")],
+        args: "[project[:stage]] [directory] [--reveal]",
+        arguments: &[("[project[:stage]]", PROJECT), ("[directory]", "Folder whose .env is compared. Default: the current directory")],
         summary: "Compare a folder's .env with the master file",
         details: "Shows how DIRECTORY/.env (default: the current directory) differs from the\nproject in the master file, like git diff: red - lines are the master file,\ngreen + lines are .env, and dim lines are the same in both.\nValues stay masked unless you add --reveal.\n\nThen run 'keyman save' to copy .env into the master file, or\n'keyman inject' to overwrite .env from the master file.",
         flags: &[("--reveal", "Show the real values")],
@@ -136,8 +136,8 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "export",
         group: "In a project folder",
-        args: "[project]",
-        arguments: &[("[project]", PROJECT)],
+        args: "[project[:stage]]",
+        arguments: &[("[project[:stage]]", PROJECT)],
         summary: "Print export lines for your shell",
         details: "Prints export NAME=\"value\" lines for bash, zsh, and other POSIX shells.\nTo load them into the current shell:\n\n  eval \"$(keyman export my-app)\"",
         flags: &[],
@@ -147,8 +147,8 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "run",
         group: "In a project folder",
-        args: "[project] [--] <command>...",
-        arguments: &[("[project]", PROJECT), ("<command>...", "The command to run, with its own arguments")],
+        args: "[project[:stage]] [--] <command>...",
+        arguments: &[("[project[:stage]]", PROJECT), ("<command>...", "The command to run, with its own arguments")],
         summary: "Run a command with a project's variables",
         details: "Runs COMMAND with the project's variables in its environment. No .env file is\nwritten. Keyman exits with the command's exit code. Put -- before the command\nwhen you omit the project or when the command starts with a dash.\n\n  keyman run my-app -- npm start\n  keyman run -- python manage.py runserver\n\nOn Windows, run .cmd and .bat scripts through cmd /c:\n\n  keyman run my-app -- cmd /c npm start",
         flags: &[],
@@ -406,7 +406,7 @@ pub fn help() -> String {
             Stream::Out,
             "<argument> is required. [argument] is optional."
         )),
-        dim("Leave out [project] to use the current folder name."),
+        dim("Leave out [project] to use the current folder name. A project with stages\nneeds one: my-app:staging."),
         dim(&highlight(
             Stream::Out,
             "Run 'keyman help <command>' for details about a command."

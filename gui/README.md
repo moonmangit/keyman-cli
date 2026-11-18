@@ -2,7 +2,7 @@
 
 A native window for the `keyman` commands, built with [Rune](https://github.com/anomalyco/rune). It reads and writes the same master file as the CLI (`~/.keyman_config` → `~/.keyman.yml`) and calls the same library code, so the CLI and the app can be used side by side.
 
-The window draws its own title bar (breadcrumb, Reload, Full screen, Help, Settings) while keeping the native traffic lights on macOS and the caption buttons with snap layouts on Windows. A project's page shows its **Variables** and **Folders** side by side, and both columns grow with the window.
+The window draws its own title bar (breadcrumb, Reload, Full screen, Help, Settings) while keeping the native traffic lights on macOS and the caption buttons with snap layouts on Windows. A project's page shows its **Variables** and **Folders** side by side, and both columns grow with the window. In a narrow window they stack, and the page's buttons show only their icons. Drag any vertical divider (the project list, the stage column, or the gap between Variables and Folders) to resize; double-click it to reset. The widths are saved between launches.
 
 | In the app | CLI equivalent |
 | --- | --- |
@@ -23,6 +23,8 @@ The window draws its own title bar (breadcrumb, Reload, Full screen, Help, Setti
 | Project page: ⋯ › **Delete from cloud** | `keyman cloud delete` |
 
 **Tied folders**: a project can be tied to any number of local folders (a checkout, a worktree, a deploy copy). The Folders column draws them as a tree, master file → project → each folder, with every branch coloured by that folder's `.env`: in sync, differs, no `.env` yet, or folder missing. Click a folder to make it active. **Right-click** a folder (or press its ⋯ button) for its action panel: make active, write `.env`, compare, resolve differences, save to master, show in Finder/Explorer, copy path, or untie. Compare and Save to master open as modals. Folders tied by earlier versions (one per project) carry over.
+
+**Stages**: a project with stages (see [Stages](../README.md#stages-production-staging-and-more)) opens a second column next to the project list, with one row per stage: how many values it sets itself, and how many tied folders write from it. Pick a stage there to see its variables. A badge marks each value the stage sets itself; the others are shared by every stage. Each tied folder writes from its own stage, shown before its path in the tree. Change it in the folder's action panel under **Write from stage**. A folder tied before its project had stages, or whose stage was removed, shows **Pick a stage**: nothing is written to it until you pick one. Clicking a folder shows its stage. Writing, comparing, resolving and saving all use the folder's stage, and saving keeps what differs from the shared values in that stage only.
 
 **Sync on tie**: tying a folder syncs it straight away. A folder with no `.env` gets one written; one that already matches is left alone. When its `.env` disagrees with the master file, **Resolve differences** opens: for each variable, keep the master value (the default), keep the `.env` value, or type a new one. Applying writes the result into both the master file and the folder's `.env`, so they end in sync. The same resolver is available later from a folder's action panel and from the overwrite warning.
 
@@ -55,6 +57,14 @@ cd gui && cargo run
 ```
 
 Rune is a git dependency pinned to one `dev` revision. Its `[patch.crates-io]` entries in `Cargo.toml` must stay on the same revision; update them together.
+
+## Try stages without touching your data
+
+```bash
+gui/scripts/try-stages.sh
+```
+
+It builds the CLI and the app, makes a demo master file with a staged project and three tied folders (one in sync, one that differs, one without a `.env`), prints CLI commands to try, and opens the app on it. The demo has its own home folder and app settings, so `~/.keyman.yml` and your settings stay as they are, and Keyman Cloud points at an address that does not answer. Add `--reset` to start again, or `--cli` to skip opening the app.
 
 ## App icon and packaging
 

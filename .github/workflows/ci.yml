@@ -1,0 +1,119 @@
+name: CI
+
+# Every pull request, and every merge to main (the release workflow calls this
+# one before it builds anything). A run that fails blocks the release.
+on:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cli-lint:
+    name: CLI · format and lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable && rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  cli-test:
+    name: CLI · tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - name: Shell completion
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo build --locked
+          scripts/check-completions.sh target/debug/keyman
+
+  cloud-e2e:
+    name: Cloud · end-to-end and database tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # The local stack signs test users in with a password; the hosted project does not.
+      SUPABASE_AUTH_EMAIL_ENABLED: 'true'
+      # Placeholders so the stack starts; no test signs in with these providers.
+      SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID: ci-placeholder
+      SUPABASE_AUTH_EXTERNAL_GOOGLE_SECRET: ci-placeholder
+      SUPABASE_AUTH_EXTERNAL_GITHUB_CLIENT_ID: ci-placeholder
+      SUPABASE_AUTH_EXTERNAL_GITHUB_SECRET: ci-placeholder
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - name: Start the local Supabase stack
+        run: supabase start
+      - name: Database tests
+        run: supabase test db
+      - name: Cloud end-to-end tests
+        run: |
+          set -a; eval "$(supabase status -o env)"; set +a
+          KEYMAN_E2E=1 cargo test --locked --test cloud_e2e -- --ignored --test-threads=1
+      - name: Stop the stack
+        if: always()
+        run: supabase stop --no-backup
+
+  app:
+    name: App · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            artifact: keyman-app-macos
+          - os: windows-2022
+            artifact: keyman-app-windows
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable && rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gui
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Build Keyman.app (ad hoc signed)
+        if: runner.os == 'macOS'
+        run: |
+          scripts/bundle-macos.sh --universal
+          cd target/release/bundle && ditto -c -k --keepParent Keyman.app ../Keyman-macos.zip
+      - name: Build keyman-app.exe
+        if: runner.os == 'Windows'
+        run: cargo build --locked --release
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            gui/target/release/Keyman-macos.zip
+            gui/target/release/keyman-app.exe
+          if-no-files-found: error
+          retention-days: 14

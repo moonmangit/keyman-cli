@@ -5,7 +5,7 @@
 //! parsed again and must give exactly the expected projects and variables, or
 //! nothing is written.
 
-use crate::master::{self, Variables};
+use crate::master::{self, Project, Variables};
 
 /// Reads the variables of a .env file. Accepts `NAME=value`, an optional
 /// `export ` prefix, single or double quotes, and `#` comments. Errors name
@@ -152,11 +152,82 @@ pub fn plan(existing: &[(String, String)], incoming: &[(String, String)], replac
     Plan { edits, result }
 }
 
-/// Returns the master file text with `project` set to `plan.result`.
+/// Returns the master file text with `project`'s shared variables set to
+/// `plan.result`. The project's stages stay as they are.
 pub fn update_project(
     yaml: &str,
     project: &str,
     plan: &Plan,
+    exists: bool,
+) -> Result<String, String> {
+    let mut desired = if exists {
+        master::read_project(yaml, project)?
+    } else {
+        Project::default()
+    };
+    desired.shared = plan.result.clone();
+    write_project(yaml, project, &desired, exists)
+}
+
+/// Plans saving `incoming` (a stage's .env) into `stage`. Compares against the
+/// stage's effective variables, and writes differences as the stage's own
+/// values. A shared variable cannot be removed from one stage, so `--replace`
+/// keeps it. Returns the plan (as effective variables) and the new project.
+pub fn plan_stage(
+    project: &Project,
+    stage: &str,
+    incoming: &[(String, String)],
+    replace: bool,
+) -> (Plan, Project) {
+    let current = project
+        .effective(stage)
+        .unwrap_or_else(|| project.shared.clone());
+    let mut planned = plan(&current, incoming, replace);
+    let mut own = project.stage(stage).cloned().unwrap_or_default();
+    let shared_value = |name: &str| {
+        project
+            .shared
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value.clone())
+    };
+    for (name, edit) in &mut planned.edits {
+        match edit {
+            Edit::Added | Edit::Changed => {
+                let value = incoming
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default();
+                if shared_value(name).as_ref() == Some(&value) {
+                    own.retain(|(candidate, _)| candidate != name);
+                } else if let Some(entry) = own.iter_mut().find(|(candidate, _)| candidate == name)
+                {
+                    entry.1 = value;
+                } else {
+                    own.push((name.clone(), value));
+                }
+            }
+            Edit::Removed if shared_value(name).is_some() => *edit = Edit::Kept,
+            Edit::Removed => own.retain(|(candidate, _)| candidate != name),
+            Edit::Kept | Edit::Unchanged => {}
+        }
+    }
+    let mut updated = project.clone();
+    match updated.stages.iter_mut().find(|(name, _)| name == stage) {
+        Some(entry) => entry.1 = own,
+        None => updated.stages.push((stage.to_owned(), own)),
+    }
+    planned.result = updated.effective(stage).unwrap_or_default();
+    (planned, updated)
+}
+
+/// Returns the master file text with `project` set to `desired`, stages
+/// included. Only that project's changed lines are edited.
+pub fn write_project(
+    yaml: &str,
+    project: &str,
+    desired: &Project,
     exists: bool,
 ) -> Result<String, String> {
     let unsafe_layout = || {
@@ -168,34 +239,158 @@ pub fn update_project(
     let mut lines: Vec<String> = yaml.lines().map(str::to_owned).collect();
 
     if exists {
-        edit_block(&mut lines, project, plan).ok_or_else(unsafe_layout)?;
+        let current = master::read_project(yaml, project)?;
+        edit_block(&mut lines, project, &current, desired).ok_or_else(unsafe_layout)?;
     } else {
         if lines.last().is_some_and(|line| !line.trim().is_empty()) {
             lines.push(String::new());
         }
         lines.push(format!("{}:", yaml_key(project)));
-        for (name, value) in &plan.result {
+        for (name, value) in &desired.shared {
             lines.push(format!("  {}: {}", yaml_key(name), yaml_string(value)));
+        }
+        for (stage, variables) in &desired.stages {
+            lines.push(format!("  {}:", yaml_key(stage)));
+            for (name, value) in variables {
+                lines.push(format!("    {}: {}", yaml_key(name), yaml_string(value)));
+            }
         }
     }
 
     let mut updated = lines.join(newline);
     updated.push_str(newline);
-    verify(yaml, &updated, project, &plan.result, exists).ok_or_else(unsafe_layout)?;
+    verify(yaml, &updated, project, desired, exists).ok_or_else(unsafe_layout)?;
     Ok(updated)
+}
+
+/// A `KEY: value` line inside a project.
+struct Entry {
+    index: usize,
+    indent: String,
+    key: String,
+    name: String,
+    /// Written as `name:` or `name: {}`: a stage.
+    stage: bool,
+    inline_empty: bool,
+}
+
+fn entry(index: usize, line: &str) -> Option<Option<Entry>> {
+    let content = line.trim_start();
+    if content.is_empty() || content.starts_with('#') {
+        return Some(None);
+    }
+    let indent = line[..line.len() - content.len()].to_owned();
+    let (key, name) = split_key(content)?;
+    let rest = content[key.len()..].trim_start().strip_prefix(':')?.trim();
+    let rest = if rest.starts_with('#') {
+        ""
+    } else {
+        rest.split(" #").next().unwrap_or_default().trim()
+    };
+    Some(Some(Entry {
+        index,
+        indent,
+        key: key.to_owned(),
+        name,
+        stage: rest.is_empty() || rest == "{}",
+        inline_empty: rest == "{}",
+    }))
+}
+
+/// Line edits gathered first and applied at the end, so indexes stay valid.
+#[derive(Default)]
+struct Edits {
+    replace: Vec<(usize, String)>,
+    delete: Vec<usize>,
+    insert_after: Vec<(usize, Vec<String>)>,
+}
+
+impl Edits {
+    fn insert(&mut self, after: usize, line: String) {
+        match self
+            .insert_after
+            .iter_mut()
+            .find(|(index, _)| *index == after)
+        {
+            Some((_, lines)) => lines.push(line),
+            None => self.insert_after.push((after, vec![line])),
+        }
+    }
+
+    fn apply(self, lines: &mut Vec<String>) {
+        let mut output = Vec::with_capacity(lines.len());
+        for (index, line) in lines.drain(..).enumerate() {
+            if !self.delete.contains(&index) {
+                match self.replace.iter().find(|(at, _)| *at == index) {
+                    Some((_, new)) => output.push(new.clone()),
+                    None => output.push(line),
+                }
+            }
+            if let Some((_, added)) = self.insert_after.iter().find(|(at, _)| *at == index) {
+                output.extend(added.iter().cloned());
+            }
+        }
+        *lines = output;
+    }
+}
+
+/// Edits one list of variables written at one indent: changed values in place,
+/// removed lines deleted, new variables after the last one (or after `start`).
+fn edit_section(
+    edits: &mut Edits,
+    entries: &[&Entry],
+    start: usize,
+    indent: &str,
+    current: &[(String, String)],
+    desired: &[(String, String)],
+) {
+    let value = |list: &[(String, String)], name: &str| {
+        list.iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value.clone())
+    };
+    for entry in entries {
+        match value(desired, &entry.name) {
+            None => edits.delete.push(entry.index),
+            Some(new) if value(current, &entry.name).as_ref() != Some(&new) => {
+                edits.replace.push((
+                    entry.index,
+                    format!("{}{}: {}", entry.indent, entry.key, yaml_string(&new)),
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    let after = entries.last().map_or(start, |entry| entry.index);
+    for (name, new) in desired {
+        if value(current, name).is_none() {
+            edits.insert(
+                after,
+                format!("{indent}{}: {}", yaml_key(name), yaml_string(new)),
+            );
+        }
+    }
 }
 
 /// Edits the lines of an existing block-style project. Returns None when the
 /// project is written in a layout this function does not handle.
-fn edit_block(lines: &mut Vec<String>, project: &str, plan: &Plan) -> Option<()> {
+fn edit_block(
+    lines: &mut Vec<String>,
+    project: &str,
+    current: &Project,
+    desired: &Project,
+) -> Option<()> {
     let header = lines
         .iter()
         .position(|line| header_rest(line, project).is_some())?;
     let rest = header_rest(&lines[header], project)?.trim();
     let rest = rest.split(" #").next().unwrap_or_default().trim();
+    let mut edits = Edits::default();
     match rest {
         "" => {}
-        "{}" => lines[header] = format!("{}:", yaml_key(project)),
+        "{}" => edits
+            .replace
+            .push((header, format!("{}:", yaml_key(project)))),
         _ if rest.starts_with('#') => {}
         _ => return None,
     }
@@ -208,65 +403,119 @@ fn edit_block(lines: &mut Vec<String>, project: &str, plan: &Plan) -> Option<()>
         })
         .unwrap_or(lines.len());
 
-    let mut variable_lines = Vec::new();
+    let mut entries = Vec::new();
     for (index, line) in lines.iter().enumerate().take(end).skip(header + 1) {
-        let content = line.trim_start();
-        if content.is_empty() || content.starts_with('#') {
-            continue;
+        if let Some(found) = entry(index, line)? {
+            entries.push(found);
         }
-        let indent = &line[..line.len() - content.len()];
-        let (key, name) = split_key(content)?;
-        variable_lines.push((index, indent.to_owned(), key.to_owned(), name));
     }
-    let indent = variable_lines
+    let indent = entries
         .first()
-        .map_or_else(|| "  ".to_owned(), |(_, indent, _, _)| indent.clone());
-    if variable_lines
-        .iter()
-        .any(|(_, line_indent, _, _)| *line_indent != indent)
-    {
-        return None;
-    }
-    let insert_at = variable_lines
-        .last()
-        .map_or(header + 1, |(index, ..)| index + 1);
+        .map_or_else(|| "  ".to_owned(), |entry| entry.indent.clone());
 
-    let value_of = |name: &str| {
-        plan.result
-            .iter()
-            .find(|(candidate, _)| candidate == name)
-            .map(|(_, value)| value)
-    };
-    let added: Vec<String> = plan
-        .edits
-        .iter()
-        .filter(|(_, edit)| *edit == Edit::Added)
-        .map(|(name, _)| {
-            format!(
-                "{indent}{}: {}",
-                yaml_key(name),
-                yaml_string(value_of(name).map_or("", String::as_str))
-            )
-        })
-        .collect();
-    lines.splice(insert_at..insert_at, added);
-
-    for (index, line_indent, key, name) in variable_lines.into_iter().rev() {
-        match plan
-            .edits
-            .iter()
-            .find(|(candidate, _)| *candidate == name)?
-            .1
-        {
-            Edit::Changed => {
-                lines[index] = format!("{line_indent}{key}: {}", yaml_string(value_of(&name)?));
+    // Group the lines: shared variables at `indent`, and each stage with the
+    // deeper lines under it.
+    let mut shared: Vec<&Entry> = Vec::new();
+    let mut stages: Vec<(&Entry, Vec<&Entry>)> = Vec::new();
+    for found in &entries {
+        if found.indent == indent {
+            if found.stage && current.stage(&found.name).is_some() {
+                stages.push((found, Vec::new()));
+            } else if found.stage {
+                return None;
+            } else {
+                shared.push(found);
             }
-            Edit::Removed => {
-                lines.remove(index);
+        } else if found.indent.starts_with(&indent) && found.indent.len() > indent.len() {
+            let (stage_header, children) = stages.last_mut()?;
+            if stage_header.inline_empty
+                || shared.last().is_some_and(|s| s.index > stage_header.index)
+            {
+                return None;
             }
-            Edit::Added | Edit::Kept | Edit::Unchanged => {}
+            if children
+                .first()
+                .is_some_and(|first| first.indent != found.indent)
+                || found.stage
+            {
+                return None;
+            }
+            children.push(found);
+        } else {
+            return None;
         }
     }
+
+    edit_section(
+        &mut edits,
+        &shared,
+        header,
+        &indent,
+        &current.shared,
+        &desired.shared,
+    );
+    let deeper = |children: &[&Entry]| {
+        children
+            .first()
+            .map_or_else(|| format!("{indent}  "), |child| child.indent.clone())
+    };
+    for (stage_header, children) in &stages {
+        match desired.stage(&stage_header.name) {
+            None => {
+                edits.delete.push(stage_header.index);
+                // Its variables, and comments indented under it.
+                let next = entries
+                    .iter()
+                    .find(|e| e.index > stage_header.index && e.indent == indent)
+                    .map_or(end, |e| e.index);
+                for (index, line) in lines
+                    .iter()
+                    .enumerate()
+                    .take(next)
+                    .skip(stage_header.index + 1)
+                {
+                    let line_indent = line.len() - line.trim_start().len();
+                    if !line.trim().is_empty() && line_indent > indent.len() {
+                        edits.delete.push(index);
+                    }
+                }
+            }
+            Some(variables) => {
+                let own = current.stage(&stage_header.name)?;
+                if stage_header.inline_empty && !variables.is_empty() {
+                    edits
+                        .replace
+                        .push((stage_header.index, format!("{indent}{}:", stage_header.key)));
+                }
+                edit_section(
+                    &mut edits,
+                    children,
+                    stage_header.index,
+                    &deeper(children),
+                    own,
+                    variables,
+                );
+            }
+        }
+    }
+
+    // New stages go after the project's last indented line.
+    let last = (header + 1..end)
+        .rev()
+        .find(|&index| lines[index].starts_with([' ', '\t']) && !lines[index].trim().is_empty())
+        .unwrap_or(header);
+    for (stage, variables) in &desired.stages {
+        if current.stage(stage).is_none() {
+            edits.insert(last, format!("{indent}{}:", yaml_key(stage)));
+            for (name, value) in variables {
+                edits.insert(
+                    last,
+                    format!("{indent}  {}: {}", yaml_key(name), yaml_string(value)),
+                );
+            }
+        }
+    }
+    edits.apply(lines);
     Some(())
 }
 
@@ -301,7 +550,7 @@ fn split_key(content: &str) -> Option<(&str, String)> {
 }
 
 /// Checks that only `project` changed and that it now holds `expected`.
-fn verify(old: &str, new: &str, project: &str, expected: &Variables, existed: bool) -> Option<()> {
+fn verify(old: &str, new: &str, project: &str, expected: &Project, existed: bool) -> Option<()> {
     let old_names = master::project_names(old).ok()?;
     let mut expected_names = old_names.clone();
     if !existed {
@@ -313,8 +562,20 @@ fn verify(old: &str, new: &str, project: &str, expected: &Variables, existed: bo
     let others_unchanged = old_names
         .iter()
         .filter(|name| *name != project)
-        .all(|name| master::project_variables(old, name) == master::project_variables(new, name));
-    (others_unchanged && master::project_variables(new, project).ok()? == *expected).then_some(())
+        .all(|name| master::read_project(old, name) == master::read_project(new, name));
+    let written = master::read_project(new, project).ok()?;
+    (others_unchanged && sorted(&written) == sorted(expected)).then_some(())
+}
+
+/// A project in name order, to compare content whatever the line order.
+fn sorted(project: &Project) -> Project {
+    let mut project = project.clone();
+    project.shared.sort();
+    for (_, variables) in &mut project.stages {
+        variables.sort();
+    }
+    project.stages.sort();
+    project
 }
 
 /// A YAML double-quoted string.
@@ -462,6 +723,79 @@ mod tests {
         assert_eq!(
             update_project(yaml, "api", &changes, true).unwrap(),
             "api:\r\n  A: \"2\"\r\n"
+        );
+    }
+
+    const STAGED: &str = "# secrets\napi:\n  DEBUG: \"false\"\n  LOG: \"info\"  # shared\n  production:\n    # live\n    DB: \"prod\"\n  staging:\n    DB: \"stage\"\n    DEBUG: \"true\"\n  empty: {}\n\n# web\nweb:\n  X: \"y\"\n";
+
+    #[test]
+    fn saves_into_a_stage_as_its_own_values() {
+        let project = master::read_project(STAGED, "api").unwrap();
+        // DEBUG back to the shared value drops the override; NEW is staging-only;
+        // LOG is shared, so --replace keeps it.
+        let incoming = vars(&[("DEBUG", "false"), ("DB", "stage2"), ("NEW", "n")]);
+        let (planned, updated) = plan_stage(&project, "staging", &incoming, true);
+        assert!(planned.edits.contains(&("LOG".to_owned(), Edit::Kept)));
+        assert_eq!(
+            updated.stage("staging").unwrap(),
+            &vars(&[("DB", "stage2"), ("NEW", "n")])
+        );
+        let written = write_project(STAGED, "api", &updated, true).unwrap();
+        assert_eq!(
+            written,
+            STAGED.replace(
+                "    DB: \"stage\"\n    DEBUG: \"true\"\n",
+                "    DB: \"stage2\"\n    NEW: \"n\"\n"
+            )
+        );
+        assert_eq!(
+            master::project_variables(&written, "api:staging").unwrap(),
+            vars(&[
+                ("DEBUG", "false"),
+                ("LOG", "info"),
+                ("DB", "stage2"),
+                ("NEW", "n")
+            ])
+        );
+    }
+
+    #[test]
+    fn adds_removes_and_fills_stages() {
+        let mut project = master::read_project(STAGED, "api").unwrap();
+        project.shared.push(("TOKEN".into(), "t".into()));
+        project.stages.retain(|(name, _)| name != "production");
+        project
+            .stages
+            .iter_mut()
+            .find(|(n, _)| n == "empty")
+            .unwrap()
+            .1 = vars(&[("A", "1")]);
+        project
+            .stages
+            .push(("pre-production".into(), vars(&[("DB", "pre")])));
+        let written = write_project(STAGED, "api", &project, true).unwrap();
+        assert_eq!(
+            written,
+            "# secrets\napi:\n  DEBUG: \"false\"\n  LOG: \"info\"  # shared\n  TOKEN: \"t\"\n  staging:\n    DB: \"stage\"\n    DEBUG: \"true\"\n  empty:\n    A: \"1\"\n  pre-production:\n    DB: \"pre\"\n\n# web\nweb:\n  X: \"y\"\n"
+        );
+        // Shared-only edits through the old entry point keep the stages.
+        let changes = plan(&project.shared, &vars(&[("DEBUG", "no")]), true);
+        let shared_only = update_project(&written, "api", &changes, true).unwrap();
+        assert_eq!(
+            master::read_project(&shared_only, "api").unwrap().stages,
+            project.stages
+        );
+    }
+
+    #[test]
+    fn creates_a_project_with_stages() {
+        let project = master::Project {
+            shared: vars(&[("A", "1")]),
+            stages: vec![("prod".into(), vars(&[("B", "2")])), ("dev".into(), vec![])],
+        };
+        assert_eq!(
+            write_project("web:\n  X: \"y\"\n", "api", &project, false).unwrap(),
+            "web:\n  X: \"y\"\n\napi:\n  A: \"1\"\n  prod:\n    B: \"2\"\n  dev:\n"
         );
     }
 }

@@ -71,13 +71,10 @@ fn separator(p: Paint, key: &str) -> El {
 pub fn folder_menu(s: &App, p: Paint, at: (f32, f32), window: (f32, f32)) -> El {
     let Some(menu) = &s.menu else { return el() };
     let folder = menu.folder.clone();
-    let vars = match s.variables() {
-        Some(Ok(vars)) => vars.clone(),
-        _ => Vec::new(),
-    };
-    let status = core::folder_status(&vars, &folder);
+    let folder_stage = s.folder_stage(&folder);
+    let status = s.folder_status(&folder);
     let (tint, label) = status_look(p, status);
-    let exists = !matches!(status, FolderStatus::Missing);
+    let exists = !matches!(status, FolderStatus::Missing | FolderStatus::NoStage);
     let has_env = matches!(
         status,
         FolderStatus::InSync | FolderStatus::Differs(_) | FolderStatus::Unreadable
@@ -193,6 +190,7 @@ pub fn folder_menu(s: &App, p: Paint, at: (f32, f32), window: (f32, f32)) -> El 
             has_env,
             on(App::preview_save),
         ))
+        .children(stage_items(s, p, &folder, folder_stage.as_deref()))
         .child(separator(p, "sep-mid"))
         .child(item(
             p,
@@ -254,7 +252,11 @@ pub fn folder_menu(s: &App, p: Paint, at: (f32, f32), window: (f32, f32)) -> El 
         ));
 
     // Roughly the panel's height, to keep it on screen near the bottom edge.
-    let height = 60.0 + 8.0 * ITEM_H + 3.0 * 9.0 + 12.0;
+    let stage_rows = match s.stages().len() {
+        0 => 0.0,
+        n => n as f32 * ITEM_H + 9.0 + 22.0,
+    };
+    let height = 60.0 + 8.0 * ITEM_H + 3.0 * 9.0 + 12.0 + stage_rows;
     let (x, y) = at;
     let x = x.min(window.0 - MENU_W - 12.0).max(8.0);
     let y = if y + height > window.1 - 12.0 {
@@ -271,6 +273,61 @@ pub fn folder_menu(s: &App, p: Paint, at: (f32, f32), window: (f32, f32)) -> El 
                 .absolute(x, y)
                 .modal(true, |s: &mut App| s.menu = None),
         )
+}
+
+/// "Stage" items: the stage this folder writes, with a check on the current one.
+fn stage_items(s: &App, p: Paint, folder: &std::path::Path, current: Option<&str>) -> Vec<El> {
+    let stages = s.stages();
+    if stages.is_empty() {
+        return Vec::new();
+    }
+    let mut items = vec![
+        separator(p, "sep-stage"),
+        text(t("WRITE FROM STAGE", "เขียนจากสเตจ"))
+            .font(CAPS)
+            .color(p.faint)
+            .px(10.0)
+            .pt(4.0)
+            .pb(2.0),
+    ];
+    for stage in stages {
+        let chosen = current == Some(stage.as_str());
+        let (path, pick) = (folder.to_path_buf(), stage.clone());
+        let mut r = row()
+            .key(format!("mi-stage-{stage}"))
+            .role("menuitemradio")
+            .label(&stage)
+            .checked(chosen)
+            .w_full()
+            .h(ITEM_H)
+            .px(10.0)
+            .gap(10.0)
+            .center_y()
+            .radius(6.0)
+            .child(
+                icon(&ic::CHECK_CIRCLE, 15.0)
+                    .color(if chosen { p.accent } else { Color::TRANSPARENT })
+                    .a11y_hidden(),
+            )
+            .child(
+                text(stage.clone())
+                    .font(if chosen { BODY_STRONG } else { BODY })
+                    .color(p.text)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate()
+                    .a11y_hidden(),
+            );
+        if !chosen {
+            r = r
+                .focusable(true)
+                .hover(p.accent.alpha(if p.dark { 0.22 } else { 0.12 }))
+                .press(p.press)
+                .on_press(move |s: &mut App| s.set_folder_stage(&path, &pick));
+        }
+        items.push(r);
+    }
+    items
 }
 
 pub const PROJECT_MENU_W: f32 = 230.0;
